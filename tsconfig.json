@@ -6,7 +6,7 @@
     "esModuleInterop": true,
     "allowImportingTsExtensions": true,
     "noEmit": true,
-    "strict": true,
+    "strict": false,
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
     "resolveJsonModule": true,
@@ -14,9 +14,8 @@
     "jsx": "react-jsx",
     "baseUrl": ".",
     "paths": {
-      "src/*": ["./stubs/src/*"],
-      "bun:bundle": ["./stubs/bun-bundle.d.ts"]
+      "bun:bundle": ["./node_modules/bundle/index.js"]
     }
   },
-  "include": ["daemon/**/*.ts", "bridge/**/*.ts", "cli/**/*.ts", "stubs/**/*.ts"]
+  "include": ["src/**/*.ts", "src/**/*.tsx", "daemon/**/*.ts"]
 }

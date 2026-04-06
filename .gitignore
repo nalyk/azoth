@@ -22,3 +22,5 @@ rad.json
 TestResults.xmlnode_modules/
 bun.lock
 *.lockb
+node_modules/original_archive/
+bun.lockb
