@@ -1865,6 +1865,9 @@ async function run(): Promise<CommanderCommand> {
     // (which returns isProactiveActive()) passes and Sleep is included.
     // The later REPL-path maybeActivateProactive() calls are idempotent.
     maybeActivateProactive(options);
+    // Ensure circular-dep lazy imports are resolved before getTools()
+    const { _resolveCircularDeps } = await import('./tools.js');
+    await _resolveCircularDeps();
     let tools = getTools(toolPermissionContext);
 
     // Apply coordinator mode tool filtering for headless path

@@ -58,18 +58,24 @@ import { ExitPlanModeV2Tool } from './tools/ExitPlanModeTool/ExitPlanModeV2Tool.
 import { TestingPermissionTool } from './tools/testing/TestingPermissionTool.js'
 import { GrepTool } from './tools/GrepTool/GrepTool.js'
 import { TungstenTool } from './tools/TungstenTool/TungstenTool.js'
-// Lazy require to break circular dependency: tools.ts -> TeamCreateTool/TeamDeleteTool -> ... -> tools.ts
-/* eslint-disable @typescript-eslint/no-require-imports */
-const getTeamCreateTool = () =>
-  require('./tools/TeamCreateTool/TeamCreateTool.js')
-    .TeamCreateTool as typeof import('./tools/TeamCreateTool/TeamCreateTool.js').TeamCreateTool
-const getTeamDeleteTool = () =>
-  require('./tools/TeamDeleteTool/TeamDeleteTool.js')
-    .TeamDeleteTool as typeof import('./tools/TeamDeleteTool/TeamDeleteTool.js').TeamDeleteTool
-const getSendMessageTool = () =>
-  require('./tools/SendMessageTool/SendMessageTool.js')
-    .SendMessageTool as typeof import('./tools/SendMessageTool/SendMessageTool.js').SendMessageTool
-/* eslint-enable @typescript-eslint/no-require-imports */
+// Lazy import to break circular dependency: tools.ts -> TeamCreateTool/TeamDeleteTool -> ... -> tools.ts
+// Original code used require() but Bun ESM doesn't support require() on async modules.
+let _TeamCreateTool: any = null
+let _TeamDeleteTool: any = null
+let _SendMessageTool: any = null
+const getTeamCreateTool = () => _TeamCreateTool
+const getTeamDeleteTool = () => _TeamDeleteTool
+const getSendMessageTool = () => _SendMessageTool
+// Resolved at first getTools() call (after module graph is fully loaded)
+export const _resolveCircularDeps = async () => {
+  if (!_SendMessageTool) {
+    _TeamCreateTool = (await import('./tools/TeamCreateTool/TeamCreateTool.js')).TeamCreateTool
+    _TeamDeleteTool = (await import('./tools/TeamDeleteTool/TeamDeleteTool.js')).TeamDeleteTool
+    _SendMessageTool = (await import('./tools/SendMessageTool/SendMessageTool.js')).SendMessageTool
+  }
+}
+// Auto-resolve on module load (fire-and-forget)
+void _resolveCircularDeps()
 import { AskUserQuestionTool } from './tools/AskUserQuestionTool/AskUserQuestionTool.js'
 import { LSPTool } from './tools/LSPTool/LSPTool.js'
 import { ListMcpResourcesTool } from './tools/ListMcpResourcesTool/ListMcpResourcesTool.js'
