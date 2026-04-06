@@ -19,4 +19,6 @@ rad.json
 #License-file
 *.flf
 #Test results file
-TestResults.xml
+TestResults.xmlnode_modules/
+bun.lock
+*.lockb

@@ -1,0 +1,22 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "esModuleInterop": true,
+    "allowImportingTsExtensions": true,
+    "noEmit": true,
+    "strict": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "jsx": "react-jsx",
+    "baseUrl": ".",
+    "paths": {
+      "src/*": ["./stubs/src/*"],
+      "bun:bundle": ["./stubs/bun-bundle.d.ts"]
+    }
+  },
+  "include": ["daemon/**/*.ts", "bridge/**/*.ts", "cli/**/*.ts", "stubs/**/*.ts"]
+}
