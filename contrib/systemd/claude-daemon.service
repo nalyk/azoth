@@ -1,0 +1,26 @@
+[Unit]
+Description=Claude Code Daemon
+Documentation=https://docs.anthropic.com/claude-code
+After=network.target
+
+[Service]
+Type=notify
+ExecStart=%h/.claude/bin/claude --daemon-supervisor
+Restart=on-failure
+RestartSec=5s
+WatchdogSec=60s
+Environment=HOME=%h
+
+# Security hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.claude
+PrivateTmp=yes
+
+# Resource limits
+MemoryMax=512M
+TasksMax=256
+
+[Install]
+WantedBy=default.target

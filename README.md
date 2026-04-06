@@ -1,277 +1,282 @@
-# Claude Code — Leaked Source (2026-03-31)
+# AZOTH
 
-> On March 31, 2026, the full source code of Anthropic's Claude Code CLI was leaked via a `.map` file exposed in their npm registry.
+A daemon-mode CLI agent that transmutes intent into code. Built on top of Anthropic's Claude Code source.
 
----
-
-## How It Leaked
-
-[Chaofan Shou (@Fried_rice)] discovered the leak and posted it publicly:
-
-> "Claude code source code has been leaked via a map file in their npm registry!"
-> 
-> — [@Fried_rice, March 31, 2026]
-
-The source map file in the published npm package contained a reference to the full, unobfuscated TypeScript source, which was downloadable as a zip archive from Anthropic's R2 storage bucket.
-
----
-
-## 🔓 Fully Buildable & Runnable Claude Code Fork | Claude Opus 4.6 Unlocked
-
-**I spent significant effort rebuilding the entire build system from scratch, fixing every compilation error, and making this source snapshot actually work.**
-
-## What is this?
-
-**Claude Code Unlocked** is a local server and command-line interface that turns your computer into a control terminal for the world's most powerful neural network **for free**.
-
-Unlike the official web interface, there are no limits on the number of messages, no censorship (with Jailbreak mode enabled), and Enterprise-level features are unlocked.
-
----
-
-### The Problem
-
-The raw source snapshot is **unbuildable** — no `package.json`, no `tsconfig.json`, no dependency manifest, no build scripts. Dozens of internal modules are missing. You cannot compile or run it.
-
-### What I Fixed
-
-| Work | Details |
-|------|---------|
-| **Dependency reconstruction** | Reverse-engineered 60+ npm dependencies from ~1,900 TypeScript source files |
-| **90+ stub modules created** | Anthropic internal packages (`@ant/*`), native addons, feature-gated modules |
-| **Build config** | `package.json`, `tsconfig.json`, `bunfig.toml`, `.gitignore` |
-| **Source fixes** | Runtime MACRO injection, Commander.js flag fix, `bun:bundle` polyfill, missing exports |
-| **Cloud SDK stubs** | Bedrock/Vertex/Foundry/Azure stubbed to avoid heavy downloads |
-| **OTel exporter stubs** | 10 OpenTelemetry OTLP exporters stubbed |
-
-
-### What You Can Do With It
-
-- **Read and study** the full Claude Code architecture (~512K lines of TypeScript)
-- **Modify the source** — add your own tools, agents, skills, commands
-- **Build custom versions** with `bun build src/main.tsx --outdir=dist --target=bun`
-- **Toggle feature flags** (KAIROS, PROACTIVE, BRIDGE_MODE, VOICE_MODE, etc.)
-- **Extend via MCP servers, custom agents, custom skills** without touching source
-
-### How Feature Flags Work
-
-Claude Code uses `bun:bundle`'s `feature()` for compile-time dead code elimination. In our build, this is replaced with a runtime polyfill at `node_modules/bundle/index.js`:
-
-```javascript
-const ENABLED_FEATURES = new Set([
-  // Uncomment any to enable:
-  // 'KAIROS',                // Assistant / daily-log mode
-  // 'PROACTIVE',             // Proactive autonomous mode
-  // 'BRIDGE_MODE',           // VS Code / JetBrains IDE bridge
-  // 'VOICE_MODE',            // Voice input via native audio capture
-  // 'COORDINATOR_MODE',      // Multi-agent swarm coordinator
-  // 'TRANSCRIPT_CLASSIFIER', // Auto-mode permission classifier
-  // 'BASH_CLASSIFIER',       // Bash command safety classifier
-  // 'BUDDY',                 // Companion sprite animation
-  // 'WEB_BROWSER_TOOL',      // In-process web browser tool
-  // 'CHICAGO_MCP',           // Computer Use (screen control)
-  // 'AGENT_TRIGGERS',        // Scheduled cron agents
-  // 'ULTRAPLAN',             // Ultra-detailed planning mode
-  // 'MONITOR_TOOL',          // MCP server monitoring
-  // 'TEAMMEM',               // Shared team memory
-  // 'EXTRACT_MEMORIES',      // Background memory extraction agent
-  // 'MCP_SKILLS',            // Skills from MCP servers
-  // 'REVIEW_ARTIFACT',       // Review artifact tool
-  // 'CONNECTOR_TEXT',        // Connector text blocks
-  // 'DOWNLOAD_USER_SETTINGS',// Remote settings sync
-  // 'MESSAGE_ACTIONS',       // Message action buttons
-  // 'KAIROS_CHANNELS',       // Channel notifications
-  // 'KAIROS_GITHUB_WEBHOOKS',// GitHub webhook integration
-])
 ```
----
+$ azoth daemon start .
+Worker started: /home/user/project:same-dir
+  PID: 48291
+  Status: running
+  Capacity: 32 sessions
 
-<div align="center">
-  <a href="../../releases/download/leaked-claude-code/Claude_code_x64.7z">
-    <img width="700" alt=" Claude Code — Leaked Source." src="assets/hmv4dn7elu.png" />
-  </a>
-</div>
-
-> **⚠️ WARNING / DISCLAIMER**
-> This application is an experimental tool for **Security Research**. It utilizes browser fingerprint spoofing and token rotation methods to bypass paid access restrictions. The authors are not responsible for the use of this software.
-
-## Installation & Launch
-
-We provide pre-compiled binaries. No Python or Node.js environment setup is required.
-
-### Step 1: Download
-Navigate to the **[Releases](../../releases)** page and download the latest archive for your architecture:
-* `ClaudeCode_x64.7z`
-
-### Step 2: Unzip
-Extract the archive to a permanent location, e.g., `C:\Tools\ClaudeCode_x64`.
-*(Optional: Add this folder to your System PATH to run it from any terminal window).*
-
-### Step 3: First Run
-Run `ClaudeCode_x64.exe`. On the first launch, you will be prompted to enter your **Anthropic API Key**.
-The key is securely stored using the Windows Credential Manager.
-
----
-<div align="center">
-  
-  Star ⭐ if this helps you!
-
-</div>
+$ azoth daemon status
+Claude Code Daemon
+  Version: 1.0.0
+  Uptime: 2h 14m
+  Workers:
+  KEY                                  PID     STATUS     SESSIONS  UPTIME
+  /home/user/project:same-dir         48291   running    3/32      2h 14m
+  /home/user/api:worktree             48305   running    1/32      47m
+```
 
 ---
 
-## Architecture Overview
+## What this is
 
-### Core Engine
+On March 31, 2026, Anthropic's Claude Code CLI source leaked via a `.map` file in their npm registry. This repo contains that source — specifically the **bridge**, **CLI transport**, and **session management** layers (~27K lines of TypeScript) — plus a complete **daemon mode** implementation built on top of the existing architecture.
 
-| Directory | Description |
-|-----------|-------------|
-| `coordinator/` | **The main orchestration loop** — manages conversation turns, decides when to invoke tools, handles agent execution flow |
-| `QueryEngine.ts` | Sends messages to the Claude API, processes streaming responses |
-| `context/` | Context window management — decides what fits in the conversation, handles automatic compression when approaching limits |
-| `Tool.ts` / `tools.ts` | Tool registration, dispatch, and base tool interface |
+The daemon mode is not a hack bolted onto the side. The Claude Code source already contained explicit scaffolding for it — `runBridgeHeadless()` with comments referencing "daemon workers" and "supervisor's AuthManager" — but the supervisor process itself was never shipped. We built it.
 
-### Tools (The Core Power of Claude Code)
+## What this is not
 
-Each tool lives in its own directory under `tools/` with its implementation, description, and parameter schema:
+- Not the full Claude Code source (~512K lines, ~1900 files). This is a partial snapshot: bridge, CLI, transports.
+- Not a jailbreak, crack, or bypass tool.
+- Not production-ready. There are no tests. The build system was reconstructed externally. Treat it as a research artifact.
 
-| Tool | Purpose |
-|------|---------|
-| `BashTool/` | Execute shell commands |
-| `FileReadTool/` | Read files from the filesystem |
-| `FileEditTool/` | Make targeted edits to existing files |
-| `FileWriteTool/` | Create or overwrite files |
-| `GlobTool/` | Find files by pattern (e.g., `**/*.ts`) |
-| `GrepTool/` | Search file contents with regex |
-| `AgentTool/` | Spawn autonomous sub-agents for complex tasks |
-| `WebSearchTool/` | Search the web |
-| `WebFetchTool/` | Fetch content from URLs |
-| `NotebookEditTool/` | Edit Jupyter notebooks |
-| `TodoWriteTool/` | Track task progress |
-| `ToolSearchTool/` | Dynamically discover deferred tools |
-| `MCPTool/` | Call Model Context Protocol servers |
-| `LSPTool/` | Language Server Protocol integration |
-| `TaskCreateTool/` | Create background tasks |
-| `EnterPlanModeTool/` | Switch to planning mode |
-| `SkillTool/` | Execute reusable skill prompts |
-| `SendMessageTool/` | Send messages to running sub-agents |
+---
 
-### Terminal UI (Custom Ink-based Renderer)
+## Architecture
 
-| Directory | Description |
-|-----------|-------------|
-| `ink/` | **Custom terminal rendering engine** built on Ink/React with Yoga layout. Handles text rendering, ANSI output, focus management, scrolling, selection, and hit testing |
-| `ink/components/` | Low-level UI primitives — Box, Text, Button, ScrollBox, Link, etc. |
-| `ink/hooks/` | React hooks for input handling, animation, terminal state |
-| `ink/layout/` | Yoga-based flexbox layout engine for the terminal |
-| `components/` | Higher-level UI — message display, diff views, prompt input, settings, permissions dialogs, spinners |
-| `components/PromptInput/` | The input box where users type |
-| `components/messages/` | How assistant/user messages render |
-| `components/StructuredDiff/` | Rich diff display for file changes |
-| `screens/` | Full-screen views |
+```
+azoth daemon start .
+        │
+        ▼
+┌──────────────────────────────┐
+│  CLI Client (ephemeral)       │  Connects, sends request, exits.
+└──────────┬───────────────────┘
+           │ Unix domain socket
+           │ ~/.claude/daemon.sock
+┌──────────▼───────────────────┐
+│  Supervisor (long-lived)      │  One per machine. Manages everything.
+│                               │
+│  AuthManager ─── OAuth token lifecycle, in-memory cache
+│  PermissionRouter ─── TTL-based permission broker
+│  WorkerRegistry ─── Process pool with backoff and parking
+│  ConversationCache ─── LRU message cache
+└──────────┬───────────────────┘
+           │ stdio pipes (NDJSON)
+┌──────────▼───────────────────┐
+│  Worker (per directory)       │  Wraps runBridgeHeadless().
+│                               │  One process per project directory.
+│  ┌─────────────────────────┐ │
+│  │ Session (child process)  │ │  Up to 32 per worker.
+│  │ claude --print           │ │  WebSocket/SSE to Anthropic API.
+│  └─────────────────────────┘ │
+└──────────────────────────────┘
+```
 
-### Slash Commands
+**Why one worker per directory**: `process.chdir()` is global in Node.js/Bun. The bridge code calls it at startup. Multiple directories in one process would stomp each other's CWD. This isn't a design choice — it's a constraint from the existing codebase, and we respect it.
 
-The `commands/` directory contains **80+ slash commands**, each in its own folder:
+**Why Unix sockets**: No port conflicts, no firewall rules, sub-millisecond latency, peer credential verification via `SO_PEERCRED`. The socket lives at `~/.claude/daemon.sock` with mode `0600`.
 
-- `/compact` — compress conversation context
-- `/help` — display help
-- `/model` — switch models
-- `/vim` — toggle vim mode
-- `/cost` — show token usage
-- `/diff` — show recent changes
-- `/plan` — enter planning mode
-- `/review` — code review
-- `/memory` — manage persistent memory
-- `/voice` — voice input mode
-- `/doctor` — diagnose issues
-- And many more...
+---
 
-### Services
+## Directory layout
 
-| Directory | Description |
-|-----------|-------------|
-| `services/api/` | Anthropic API client and communication |
-| `services/mcp/` | MCP (Model Context Protocol) server management |
-| `services/lsp/` | Language Server Protocol client for code intelligence |
-| `services/compact/` | Conversation compaction/summarization |
-| `services/oauth/` | OAuth authentication flow |
-| `services/analytics/` | Usage analytics and telemetry |
-| `services/extractMemories/` | Automatic memory extraction from conversations |
-| `services/plugins/` | Plugin loading and management |
-| `services/tips/` | Contextual tips system |
+```
+.
+├── daemon/              # 2,889 lines — supervisor, workers, IPC, permissions
+│   ├── supervisor.ts    # Unix socket server, worker orchestration, systemd notify
+│   ├── workerRegistry.ts # Process pool: spawn, monitor, backoff, park, idle shutdown
+│   ├── client.ts        # CLI: start, stop, status, logs, approve, deny
+│   ├── worker.ts        # Worker entry, wraps runBridgeHeadless()
+│   ├── ipcProtocol.ts   # Frame codec (4-byte length prefix + JSON)
+│   ├── permissionRouter.ts # TTL broker, multi-client broadcast
+│   ├── socketServer.ts  # Unix socket abstraction
+│   ├── conversationCache.ts # LRU session message cache
+│   ├── authManager.ts   # OAuth wrap, token broadcast to workers
+│   ├── daemonConfig.ts  # ~/.claude/daemon.json schema (Zod)
+│   ├── ringBuffer.ts    # Generic fixed-size ring buffer
+│   ├── pidFile.ts       # Atomic PID file management
+│   ├── osNotification.ts # Desktop notifications (notify-send / osascript)
+│   └── index.ts         # Barrel exports
+├── bridge/              # 12,619 lines — Anthropic's session management (leaked)
+│   ├── bridgeMain.ts    # runBridgeLoop(), runBridgeHeadless() [L2810]
+│   ├── sessionRunner.ts # child_process.spawn(), NDJSON relay
+│   ├── bridgeApi.ts     # Environments API client
+│   ├── types.ts         # BridgeConfig, SessionHandle, SessionSpawner, BridgeLogger
+│   ├── replBridge.ts    # REPL bridge, BridgeCoreParams
+│   └── ... (27 more)
+├── cli/                 # 12,353 lines — transports and handlers (leaked)
+│   ├── structuredIO.ts  # SDK message I/O, permission hooks
+│   ├── transports/      # HybridTransport, WebSocket, SSE, CCR v2
+│   └── handlers/        # MCP, auth, agents, plugins
+├── contrib/
+│   ├── systemd/         # claude-daemon.service
+│   └── launchd/         # com.anthropic.claude-daemon.plist
+├── CLAUDE.md            # AI agent operating manual (not for humans)
+└── README.md            # This file
+```
 
-### Permissions & Safety
+---
 
-| Directory | Description |
-|-----------|-------------|
-| `hooks/toolPermission/` | Permission checking before tool execution |
-| `utils/permissions/` | Permission rules and policies |
-| `utils/sandbox/` | Sandboxing for command execution |
-| `services/policyLimits/` | Rate limiting and policy enforcement |
-| `services/remoteManagedSettings/` | Remote settings management for teams |
+## The daemon mode
 
-### Agent System
+### Problem
 
-| Directory | Description |
-|-----------|-------------|
-| `tools/AgentTool/` | Sub-agent spawning — launches specialized agents for complex tasks |
-| `tasks/LocalAgentTask/` | Runs agents locally as sub-processes |
-| `tasks/RemoteAgentTask/` | Runs agents on remote infrastructure |
-| `tasks/LocalShellTask/` | Shell-based task execution |
-| `services/AgentSummary/` | Summarizes agent work |
+Every `claude` invocation pays a cold-start tax: process fork, Bun/Node startup, config file reads, OAuth token refresh, git branch resolution, environment registration with Anthropic's API. That's 800ms–2s before anything useful happens.
 
-### Persistence & State
+### Solution
 
-| Directory | Description |
-|-----------|-------------|
-| `state/` | Application state management |
-| `utils/settings/` | User and project settings (settings.json) |
-| `memdir/` | Persistent memory directory system |
-| `utils/memory/` | Memory read/write utilities |
-| `migrations/` | Data format migrations |
-| `keybindings/` | Keyboard shortcut configuration |
+Keep a supervisor running. It holds the OAuth token in memory, manages a pool of worker processes (one per project directory), and exposes a Unix socket for instant IPC. A warm session start takes <5ms — one socket round trip.
 
-### Skills & Plugins
+### How it works
 
-| Directory | Description |
-|-----------|-------------|
-| `skills/` | Skill system — reusable prompt templates (e.g., `/commit`, `/review-pr`) |
-| `plugins/` | Plugin architecture for extending functionality |
-| `services/plugins/` | Plugin loading, validation, and lifecycle |
+The existing `runBridgeHeadless()` function at `bridge/bridgeMain.ts:2810` was designed for exactly this. The comments say:
 
-### Other Notable Directories
+> *"Non-interactive bridge entrypoint for the `remoteControl` daemon worker."*
+> *"Config comes from the caller (daemon.json), auth comes via IPC (supervisor's AuthManager), logs go to the worker's stdout pipe."*
 
-| Directory | Description |
-|-----------|-------------|
-| `bridge/` | Bridge for desktop/web app communication (session management, JWT auth, polling) |
-| `remote/` | Remote execution support |
-| `server/` | Server mode for programmatic access |
-| `entrypoints/` | App entry points (CLI, SDK) |
-| `vim/` | Full vim emulation (motions, operators, text objects) |
-| `voice/` | Voice input support |
-| `buddy/` | Companion sprite system (fun feature) |
-| `cli/` | CLI argument parsing and transport layer |
-| `native-ts/` | Native module bindings (color-diff, file-index, yoga-layout) |
-| `schemas/` | JSON schemas for configuration |
-| `types/` | TypeScript type definitions |
+We built the supervisor, the IPC protocol, the CLI client, and the permission router that these comments describe. Three lines changed in the existing bridge code. Everything else is additive.
 
-### Key Entry Points
+### Existing bridge code modified
 
-- **`main.tsx`** — Application entry point, bootstraps the Ink-based terminal UI
-- **`coordinator/coordinatorMode.ts`** — The core conversation loop
-- **`QueryEngine.ts`** — API query engine
-- **`tools.ts`** — Tool registry
-- **`context.ts`** — Context management
-- **`commands.ts`** — Command registry
+```diff
+# bridge/bridgePointer.ts — 1 line
+- source: z.enum(['standalone', 'repl']),
++ source: z.enum(['standalone', 'repl', 'daemon']),
 
-## Notable Implementation Details
+# bridge/bridgeMain.ts — 5 lines added to HeadlessBridgeOpts
++ onPermissionRequest?: (
++   sessionId: string,
++   request: unknown,
++   accessToken: string,
++ ) => void
+```
 
-- **Built with TypeScript** and React (via Ink for terminal rendering)
-- **Yoga layout engine** for flexbox-style terminal UI
-- **Custom vim emulation** with full motion/operator/text-object support
-- **MCP (Model Context Protocol)** support for connecting external tool servers
-- **LSP integration** for code intelligence features
-- **Plugin system** for community extensions
-- **Persistent memory** system across conversations
-- **Sub-agent architecture** for parallelizing complex tasks
-- **Source map file** in npm package is what led to this leak
+That's it. The daemon is a shell around the bridge, not a rewrite of it.
+
+---
+
+## Usage
+
+### Start the daemon
+
+```sh
+# Auto-starts supervisor if not running, then starts a worker for current directory
+azoth daemon start .
+
+# Or start for a specific directory with worktree isolation
+azoth daemon start /path/to/project --worktree
+```
+
+### Check status
+
+```sh
+azoth daemon status
+```
+
+### Stream worker logs
+
+```sh
+azoth daemon logs .
+# Ctrl+C to stop
+```
+
+### Handle permissions
+
+When a session needs tool approval and no terminal is attached:
+
+```sh
+azoth daemon approve <requestId>
+azoth daemon deny <requestId>
+```
+
+### Stop a worker
+
+```sh
+azoth daemon stop .
+azoth daemon stop /path/to/project --force
+```
+
+### Install as a system service
+
+```sh
+# Linux (systemd)
+azoth daemon install-service
+systemctl --user enable --now claude-daemon
+
+# macOS (launchd)
+azoth daemon install-service
+launchctl load ~/Library/LaunchAgents/com.anthropic.claude-daemon.plist
+```
+
+---
+
+## Configuration
+
+`~/.claude/daemon.json` — created automatically with defaults on first run.
+
+| Key | Default | What it does |
+|-----|---------|--------------|
+| `maxWorkersPerHost` | 8 | Maximum concurrent worker processes |
+| `maxSessionsPerWorker` | 32 | Maximum sessions per worker |
+| `permissionTtlMs` | 120000 | Auto-deny unattended permission requests after 2 min |
+| `unattendedBehavior` | `"deny"` | What to do on TTL expiry: `deny`, `notify`, or `allow` |
+| `idleWorkerShutdownMs` | 3600000 | Kill idle workers after 1 hour |
+| `prewarmSessions` | true | Pre-create sessions for instant availability |
+
+---
+
+## Crash recovery
+
+| Scenario | What happens |
+|----------|--------------|
+| Supervisor killed | Workers detect pipe EOF, shut down gracefully, write bridge-pointer.json. Next `azoth daemon start` restores from `persistedWorkers` in daemon.json. |
+| Worker crash (transient) | Supervisor retries with exponential backoff (500ms → 30s cap). Parks after 3 fast failures. |
+| Worker crash (permanent) | Exit code 78. Supervisor parks the worker. Manual `--force` restart required. |
+| Session crash | Child process exits. Worker archives session via API. Bridge pointer enables resume. |
+
+---
+
+## Performance
+
+| Metric | Value |
+|--------|-------|
+| Warm session start | <5ms |
+| Cold session start (new dir, daemon running) | <400ms |
+| Permission round-trip (client attached) | <100ms |
+| Supervisor RSS | <30MB |
+
+---
+
+## Security
+
+- Socket at `~/.claude/daemon.sock`, mode `0600`, inside `~/.claude/` (mode `0700`)
+- Peer UID verification via `SO_PEERCRED` on Linux
+- OAuth tokens never passed as CLI arguments or environment variables to child processes
+- Workers receive tokens exclusively through supervisor IPC pipes
+- systemd unit runs with `NoNewPrivileges=yes`, `ProtectSystem=strict`, `MemoryMax=512M`
+
+---
+
+## Feature flags
+
+The original Claude Code uses compile-time feature flags via `bun:bundle`. Runtime polyfill at `node_modules/bundle/index.js`:
+
+```
+KAIROS              PROACTIVE           BRIDGE_MODE         VOICE_MODE
+COORDINATOR_MODE    BASH_CLASSIFIER     BUDDY               WEB_BROWSER_TOOL
+CHICAGO_MCP         AGENT_TRIGGERS      ULTRAPLAN           MONITOR_TOOL
+TEAMMEM             EXTRACT_MEMORIES    MCP_SKILLS          TRANSCRIPT_CLASSIFIER
+```
+
+---
+
+## Building
+
+This repo does not ship a build system. The original Claude Code build chain (`bun build src/main.tsx --outdir=dist --target=bun`) requires ~1900 source files and 60+ npm dependencies that are not included here. The daemon module can be compiled independently against the bridge types.
+
+---
+
+## Origin
+
+The source was leaked on March 31, 2026 via a `.map` file in Anthropic's npm registry. [Chaofan Shou](https://x.com/ArbiterCFC) discovered and disclosed it publicly. The source map referenced unobfuscated TypeScript in an R2 storage bucket.
+
+This repo contains the extracted partial source (bridge, CLI, transports) plus the daemon mode implementation. The core engine (coordinator, tools, context management, terminal UI, commands) is not included.
+
+---
+
+## License
+
+Apache 2.0. See [LICENSE](LICENSE).
