@@ -30,6 +30,13 @@ import {
 } from './ipcProtocol.js'
 import { getDaemonConfigPath, readDaemonConfig } from './daemonConfig.js'
 import { readPidFile, isAlive } from './pidFile.js'
+import {
+  renderBanner,
+  renderStatusHeader,
+  workerTableHeader,
+  formatWorkerRow,
+  formatPermissionRequest,
+} from './banner.js'
 
 // ─── Main dispatcher ──────────────────────────────────────────────────────────
 
@@ -135,34 +142,23 @@ async function cmdStatus(): Promise<void> {
 
   if (response.type === 'status_response') {
     const status = response.payload as StatusResponse
-    console.log(`Claude Code Daemon`)
-    console.log(`  Version: ${status.version}`)
-    console.log(`  Uptime: ${formatDuration(status.uptime)}`)
-    console.log(`  Pending permissions: ${status.pendingPermissions}`)
-    console.log()
+    const totalSessions = status.workers.reduce((s, w) => s + w.activeSessions, 0)
+
+    process.stdout.write(renderStatusHeader({
+      version: status.version,
+      uptime: formatDuration(status.uptime),
+      workers: status.workers.length,
+      maxWorkers: 8,
+      sessions: totalSessions,
+      pendingPermissions: status.pendingPermissions,
+    }))
 
     if (status.workers.length === 0) {
       console.log('  No active workers.')
     } else {
-      console.log('  Workers:')
-      console.log(
-        '  ' +
-          'KEY'.padEnd(50) +
-          'PID'.padEnd(8) +
-          'STATUS'.padEnd(12) +
-          'SESSIONS'.padEnd(10) +
-          'UPTIME',
-      )
-      console.log('  ' + '-'.repeat(90))
+      console.log(workerTableHeader())
       for (const w of status.workers) {
-        console.log(
-          '  ' +
-            w.key.padEnd(50) +
-            String(w.pid).padEnd(8) +
-            w.status.padEnd(12) +
-            `${w.activeSessions}/${w.capacity}`.padEnd(10) +
-            formatDuration(w.uptimeMs),
-        )
+        console.log(formatWorkerRow(w))
       }
     }
   } else if (response.type === 'error') {
@@ -205,18 +201,12 @@ async function cmdLogs(args: string[]): Promise<void> {
       process.stdout.write(payload.message + '\n')
     } else if (msg.type === 'permission_request') {
       const payload = msg.payload as PermissionRequestPayload
-      console.log()
-      console.log(`--- Permission Request ---`)
-      console.log(`  Tool: ${payload.toolName}`)
-      console.log(`  Description: ${payload.description}`)
-      console.log(`  Request ID: ${payload.requestId}`)
-      console.log(
-        `  Run: claude daemon approve ${payload.requestId}`,
-      )
-      console.log(
-        `  Or:  claude daemon deny ${payload.requestId}`,
-      )
-      console.log()
+      process.stdout.write(formatPermissionRequest({
+        requestId: payload.requestId,
+        toolName: payload.toolName,
+        description: payload.description,
+        workerKey: payload.workerKey,
+      }))
     } else if (msg.type === 'permission_resolved') {
       const payload = msg.payload as { requestId: string; behavior: string }
       console.log(`[permission ${payload.requestId}] → ${payload.behavior}`)

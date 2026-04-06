@@ -91,6 +91,17 @@ export type { ConversationCache, CachedMessage } from './conversationCache.js'
 // OS notifications
 export { sendOsNotification } from './osNotification.js'
 
+// Banner and UI
+export {
+  renderBanner,
+  renderSupervisorBanner,
+  renderStatusHeader,
+  formatWorkerRow,
+  workerTableHeader,
+  formatPermissionRequest,
+  logPrefix,
+} from './banner.js'
+
 // Entry points (imported for side effects when --daemon-supervisor or --daemon-worker flags present)
 // import './supervisor.js'  // claude --daemon-supervisor
 // import './worker.js'      // claude --daemon-worker

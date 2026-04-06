@@ -21,6 +21,7 @@ import { homedir } from 'os'
 import { join } from 'path'
 
 import { createSocketServer, type Connection, type DaemonSocketServer } from './socketServer.js'
+import { renderSupervisorBanner } from './banner.js'
 import { createWorkerRegistry, type WorkerRegistry } from './workerRegistry.js'
 import { createAuthManager, type AuthManager } from './authManager.js'
 import {
@@ -129,6 +130,16 @@ export async function runSupervisor(): Promise<void> {
     onConnection: handleClientConnection,
   })
   await socketServer.listen()
+
+  // Print the AZOTH banner
+  process.stderr.write(renderSupervisorBanner({
+    version: process.env.CLAUDE_CODE_VERSION ?? 'dev',
+    socketPath: config.socketPath,
+    pid: process.pid,
+    workers: 0,
+    maxWorkers: config.maxWorkersPerHost,
+  }))
+
   log(`[supervisor] listening on ${config.socketPath}`)
 
   // 8. Restore persisted workers
