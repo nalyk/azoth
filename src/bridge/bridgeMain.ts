@@ -2794,6 +2794,12 @@ export type HeadlessBridgeOpts = {
   getAccessToken: () => string | undefined
   onAuth401: (failedToken: string) => Promise<boolean>
   log: (s: string) => void
+  /** Called when a session emits a permission request. Daemon workers route this to the supervisor. */
+  onPermissionRequest?: (
+    sessionId: string,
+    request: unknown,
+    accessToken: string,
+  ) => void
 }
 
 /**

@@ -7,7 +7,7 @@ console.log('=== AZOTH Daemon Component Tests ===\n')
 
 // ─── Test 1: Banner renders ──────────────────────────────────────────────────
 
-import { renderBanner, renderSupervisorBanner, renderStatusHeader, formatWorkerRow, workerTableHeader, formatPermissionRequest, logPrefix } from './daemon/banner.js'
+import { renderBanner, renderSupervisorBanner, renderStatusHeader, formatWorkerRow, workerTableHeader, formatPermissionRequest, logPrefix } from './src/daemon/banner.js'
 
 console.log('--- Test 1: Banner ---')
 process.stdout.write(renderBanner({ version: '0.1.0' }))
@@ -80,7 +80,7 @@ console.log('✓ Log prefix renders\n')
 
 // ─── Test 7: Ring Buffer ─────────────────────────────────────────────────────
 
-import { RingBuffer } from './daemon/ringBuffer.js'
+import { RingBuffer } from './src/daemon/ringBuffer.js'
 
 console.log('--- Test 7: RingBuffer ---')
 const rb = new RingBuffer<number>(3)
@@ -93,7 +93,7 @@ console.log('✓ RingBuffer works\n')
 
 // ─── Test 8: IPC Protocol ────────────────────────────────────────────────────
 
-import { frameEncode, FrameDecoder, nextRequestId, workerKey } from './daemon/ipcProtocol.js'
+import { frameEncode, FrameDecoder, nextRequestId, workerKey } from './src/daemon/ipcProtocol.js'
 
 console.log('--- Test 8: IPC Protocol ---')
 const testMsg = { type: 'ping', id: nextRequestId() }
@@ -110,7 +110,7 @@ console.log('✓ IPC Protocol works\n')
 
 // ─── Test 9: PID File ────────────────────────────────────────────────────────
 
-import { writePidFile, readPidFile, isAlive, removePidFile } from './daemon/pidFile.js'
+import { writePidFile, readPidFile, isAlive, removePidFile } from './src/daemon/pidFile.js'
 import { tmpdir } from 'os'
 import { join } from 'path'
 
@@ -129,7 +129,7 @@ console.log('✓ PID File works\n')
 
 // ─── Test 10: Daemon Config ──────────────────────────────────────────────────
 
-import { getDefaultDaemonConfig } from './daemon/daemonConfig.js'
+import { getDefaultDaemonConfig } from './src/daemon/daemonConfig.js'
 
 console.log('--- Test 10: Daemon Config ---')
 const cfg = getDefaultDaemonConfig()
@@ -140,7 +140,7 @@ console.log('✓ Daemon Config works\n')
 
 // ─── Test 11: Socket Server IPC round-trip ───────────────────────────────────
 
-import { createSocketServer, connectToSocket } from './daemon/socketServer.js'
+import { createSocketServer, connectToSocket } from './src/daemon/socketServer.js'
 
 console.log('--- Test 11: Socket IPC Round-Trip ---')
 const testSockPath = join(tmpdir(), `azoth-test-${process.pid}.sock`)

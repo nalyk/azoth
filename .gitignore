@@ -4,3 +4,4 @@ bun.lockb
 original_archive/
 .DS_Store
 *.log
+.vscode/
