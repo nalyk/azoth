@@ -39,32 +39,32 @@ const magenta = esc('35')
 // ─── The banner ───────────────────────────────────────────────────────────────
 
 const LOGO = `
-${gold('    ╔═══════════════════════════════════════════════════════╗')}
-${gold('    ║')}                                                       ${gold('║')}
-${gold('    ║')}     ${white('█████')}  ${white('██████')} ${white('██████')}  ${white('████████')} ${white('██')}  ${white('██')}            ${gold('║')}
-${gold('    ║')}    ${white('██   ██')}      ${white('██')} ${white('██    ██')}    ${white('██')}    ${white('██')}  ${white('██')}            ${gold('║')}
-${gold('    ║')}    ${white('███████')}  ${white('█████')}  ${white('██    ██')}    ${white('██')}    ${white('██████')}             ${gold('║')}
-${gold('    ║')}    ${white('██   ██')} ${white('██')}      ${white('██    ██')}    ${white('██')}    ${white('██')}  ${white('██')}            ${gold('║')}
-${gold('    ║')}    ${white('██   ██')} ${white('███████')}  ${white('██████')}     ${white('██')}    ${white('██')}  ${white('██')}            ${gold('║')}
-${gold('    ║')}                                                       ${gold('║')}
-${gold('    ║')}  ${dim('the universal solvent')}            ${dim('A·Z·O·T·H  v%VERSION%')}  ${gold('║')}
-${gold('    ╚═══════════════════════════════════════════════════════╝')}
+${gold('    ╔═════════════════════════════════════════════════════════╗')}
+${gold('    ║')}                                                         ${gold('║')}
+${gold('    ║')}    ${white('█████')}   ${white('███████')}   ${white('██████')}   ${white('████████')}  ${white('██')}   ${white('██')}         ${gold('║')}
+${gold('    ║')}   ${white('██   ██')}      ${white('██')}   ${white('██    ██')}     ${white('██')}     ${white('██')}   ${white('██')}         ${gold('║')}
+${gold('    ║')}   ${white('███████')}     ${white('██')}    ${white('██    ██')}     ${white('██')}     ${white('███████')}         ${gold('║')}
+${gold('    ║')}   ${white('██   ██')}    ${white('██')}     ${white('██    ██')}     ${white('██')}     ${white('██')}   ${white('██')}         ${gold('║')}
+${gold('    ║')}   ${white('██   ██')}   ${white('███████')}  ${white('██████')}      ${white('██')}     ${white('██')}   ${white('██')}         ${gold('║')}
+${gold('    ║')}                                                         ${gold('║')}
+${gold('    ║')}   ${dim('the universal solvent')}              ${dim('A·Z·O·T·H  v%VERSION%')} ${gold('║')}
+${gold('    ╚═════════════════════════════════════════════════════════╝')}
 `
 
 const LOGO_COMPACT = `${gold('◈')} ${bold(white('AZOTH'))} ${dim('v%VERSION%')} ${dim('— the universal solvent')}`
 
 const SUPERVISOR_BANNER = `
-${gold('    ╔═══════════════════════════════════════════════════════╗')}
-${gold('    ║')}                                                       ${gold('║')}
-${gold('    ║')}     ${white('█████')}  ${white('██████')} ${white('██████')}  ${white('████████')} ${white('██')}  ${white('██')}            ${gold('║')}
-${gold('    ║')}    ${white('██   ██')}      ${white('██')} ${white('██    ██')}    ${white('██')}    ${white('██')}  ${white('██')}            ${gold('║')}
-${gold('    ║')}    ${white('███████')}  ${white('█████')}  ${white('██    ██')}    ${white('██')}    ${white('██████')}             ${gold('║')}
-${gold('    ║')}    ${white('██   ██')} ${white('██')}      ${white('██    ██')}    ${white('██')}    ${white('██')}  ${white('██')}            ${gold('║')}
-${gold('    ║')}    ${white('██   ██')} ${white('███████')}  ${white('██████')}     ${white('██')}    ${white('██')}  ${white('██')}            ${gold('║')}
-${gold('    ║')}                                                       ${gold('║')}
-${gold('    ║')}  ${dim('daemon supervisor')}     ${dim('socket:')} ${cyan('%SOCKET%')}  ${gold('║')}
-${gold('    ║')}  ${dim('pid')} ${white('%PID%')}                ${dim('workers:')} ${green('%WORKERS%')}${dim('/%MAX%')}         ${gold('║')}
-${gold('    ╚═══════════════════════════════════════════════════════╝')}
+${gold('    ╔═════════════════════════════════════════════════════════╗')}
+${gold('    ║')}                                                         ${gold('║')}
+${gold('    ║')}    ${white('█████')}   ${white('███████')}   ${white('██████')}   ${white('████████')}  ${white('██')}   ${white('██')}         ${gold('║')}
+${gold('    ║')}   ${white('██   ██')}      ${white('██')}   ${white('██    ██')}     ${white('██')}     ${white('██')}   ${white('██')}         ${gold('║')}
+${gold('    ║')}   ${white('███████')}     ${white('██')}    ${white('██    ██')}     ${white('██')}     ${white('███████')}         ${gold('║')}
+${gold('    ║')}   ${white('██   ██')}    ${white('██')}     ${white('██    ██')}     ${white('██')}     ${white('██')}   ${white('██')}         ${gold('║')}
+${gold('    ║')}   ${white('██   ██')}   ${white('███████')}  ${white('██████')}      ${white('██')}     ${white('██')}   ${white('██')}         ${gold('║')}
+${gold('    ║')}                                                         ${gold('║')}
+${gold('    ║')}   ${dim('daemon supervisor')}       ${dim('socket:')} ${cyan('%SOCKET%')} ${gold('║')}
+${gold('    ║')}   ${dim('pid')} ${white('%PID%')}                  ${dim('workers:')} ${green('%WORKERS%')}${dim('/%MAX%')}           ${gold('║')}
+${gold('    ╚═════════════════════════════════════════════════════════╝')}
 `
 
 // ─── Status line fragments ────────────────────────────────────────────────────
