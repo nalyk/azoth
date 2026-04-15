@@ -23,13 +23,16 @@ use tokio::sync::mpsc;
 
 use azoth_core::adapter::{MockAdapter, MockScript, ProviderProfile};
 use azoth_core::artifacts::ArtifactStore;
+use azoth_core::authority::{
+    ApprovalRequestMsg, ApprovalResponse, CapabilityStore,
+};
 use azoth_core::event_store::JsonlWriter;
 use azoth_core::execution::{CancellationToken, ExecutionContext, ToolDispatcher};
 use azoth_core::schemas::{
-    CommitOutcome, ContentBlock, Message, ModelTurnResponse, RunId, SessionEvent, StopReason,
-    ToolUseId, TurnId, Usage,
+    ApprovalScope, CommitOutcome, ContentBlock, Message, ModelTurnResponse, RunId, SessionEvent,
+    StopReason, ToolUseId, TurnId, Usage,
 };
-use azoth_core::tools::RepoSearchTool;
+use azoth_core::tools::{FsWriteTool, RepoSearchTool};
 use azoth_core::turn::TurnDriver;
 
 use super::render;
@@ -48,6 +51,7 @@ pub struct AppState {
     pub dirty: bool,
     pub should_quit: bool,
     pending_user_text: Option<String>,
+    pub pending_approval: Option<ApprovalRequestMsg>,
 }
 
 impl AppState {
@@ -60,6 +64,7 @@ impl AppState {
             dirty: true,
             should_quit: false,
             pending_user_text: None,
+            pending_approval: None,
         }
     }
 
@@ -71,6 +76,37 @@ impl AppState {
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
+        if self.pending_approval.is_some() {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    if let Some(req) = self.pending_approval.take() {
+                        let _ = req.responder.send(ApprovalResponse::Grant {
+                            scope: ApprovalScope::Once,
+                        });
+                        self.transcript.push("  · approval: granted once".into());
+                        self.dirty = true;
+                    }
+                }
+                KeyCode::Char('s') | KeyCode::Char('S') => {
+                    if let Some(req) = self.pending_approval.take() {
+                        let _ = req.responder.send(ApprovalResponse::Grant {
+                            scope: ApprovalScope::Session,
+                        });
+                        self.transcript.push("  · approval: granted session".into());
+                        self.dirty = true;
+                    }
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    if let Some(req) = self.pending_approval.take() {
+                        let _ = req.responder.send(ApprovalResponse::Deny);
+                        self.transcript.push("  · approval: denied".into());
+                        self.dirty = true;
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
         match (key.code, key.modifiers) {
             (KeyCode::Char('c'), KeyModifiers::CONTROL)
             | (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
@@ -180,14 +216,17 @@ impl AppState {
 /// Build a `MockScript` that exercises the full tool-use loop for one Enter:
 /// first a `repo.search` tool_use, then an `EndTurn` text response that
 /// acknowledges the result.
-fn scripted_two_turn(query: &str) -> MockScript {
+fn scripted_fs_write(query: &str) -> MockScript {
     MockScript {
         turns: vec![
             ModelTurnResponse {
                 content: vec![ContentBlock::ToolUse {
                     id: ToolUseId::new(),
-                    name: "repo.search".into(),
-                    input: serde_json::json!({ "q": query, "limit": 3 }),
+                    name: "fs.write".into(),
+                    input: serde_json::json!({
+                        "path": ".azoth/tmp/hello.txt",
+                        "contents": format!("hello from approval path: {query}"),
+                    }),
                     call_group: None,
                 }],
                 stop_reason: StopReason::ToolUse,
@@ -195,7 +234,7 @@ fn scripted_two_turn(query: &str) -> MockScript {
             },
             ModelTurnResponse {
                 content: vec![ContentBlock::Text {
-                    text: format!("(mock) scanned repo for {query:?}"),
+                    text: format!("(mock) wrote hello for {query:?}"),
                 }],
                 stop_reason: StopReason::EndTurn,
                 usage: Usage { input_tokens: 58, output_tokens: 24, ..Default::default() },
@@ -215,6 +254,7 @@ pub async fn run_app() -> io::Result<()> {
     let (user_tx, mut user_rx) = mpsc::channel::<String>(8);
     let (session_tx, mut session_rx) = mpsc::unbounded_channel::<SessionEvent>();
     let (error_tx, mut error_rx) = mpsc::channel::<String>(8);
+    let (approval_req_tx, mut approval_req_rx) = mpsc::channel::<ApprovalRequestMsg>(8);
 
     // Dedicated input task — prevents the keyboard reader from being starved
     // by model streaming in the main select loop.
@@ -273,15 +313,17 @@ pub async fn run_app() -> io::Result<()> {
 
         let mut dispatcher = ToolDispatcher::new();
         dispatcher.register(RepoSearchTool);
+        dispatcher.register(FsWriteTool);
         let dispatcher = Arc::new(dispatcher);
 
         let mut history: Vec<Message> = Vec::new();
+        let mut caps = CapabilityStore::new();
 
         while let Some(user_text) = user_rx.recv().await {
             let turn_id = TurnId::new();
             let adapter = MockAdapter::new(
                 ProviderProfile::anthropic_default("claude-sonnet-4-6"),
-                scripted_two_turn(&user_text),
+                scripted_fs_write(&user_text),
             );
             let ctx = ExecutionContext {
                 run_id: worker_run_id.clone(),
@@ -299,6 +341,8 @@ pub async fn run_app() -> io::Result<()> {
                 dispatcher: dispatcher.as_ref(),
                 writer: &mut writer,
                 ctx: &ctx,
+                capabilities: &mut caps,
+                approval_bridge: approval_req_tx.clone(),
             };
 
             let result = driver
@@ -334,6 +378,10 @@ pub async fn run_app() -> io::Result<()> {
                 }
             }
             Some(ev) = session_rx.recv() => state.handle_session_event(ev),
+            Some(req) = approval_req_rx.recv() => {
+                state.pending_approval = Some(req);
+                state.dirty = true;
+            }
             Some(err) = error_rx.recv() => state.push_error(err),
             _ = ticker.tick() => {}
             else => break,

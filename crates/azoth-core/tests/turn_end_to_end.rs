@@ -8,6 +8,7 @@
 
 use azoth_core::adapter::{MockAdapter, MockScript, ProviderProfile};
 use azoth_core::artifacts::ArtifactStore;
+use azoth_core::authority::{ApprovalRequestMsg, CapabilityStore};
 use azoth_core::event_store::{JsonlReader, JsonlWriter};
 use azoth_core::execution::{CancellationToken, ExecutionContext, ToolDispatcher};
 use azoth_core::schemas::{
@@ -75,6 +76,8 @@ async fn tui_worker_pipeline_drives_full_turn_sequence() {
         repo_root: repo_root.clone(),
     };
 
+    let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalRequestMsg>(8);
+    let mut caps = CapabilityStore::new();
     {
         let mut driver = TurnDriver {
             run_id: run_id.clone(),
@@ -82,6 +85,8 @@ async fn tui_worker_pipeline_drives_full_turn_sequence() {
             dispatcher: &dispatcher,
             writer: &mut writer,
             ctx: &ctx,
+            capabilities: &mut caps,
+            approval_bridge: approval_tx,
         };
         let usage = driver
             .drive_turn(

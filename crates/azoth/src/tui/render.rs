@@ -1,6 +1,7 @@
 //! ratatui frame builder.
 
 use super::app::AppState;
+use super::widgets::approval_modal;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -43,4 +44,8 @@ pub fn frame(f: &mut Frame, state: &AppState) {
     let input = Paragraph::new(format!("> {}", state.input_buffer))
         .block(Block::default().borders(Borders::ALL).title(" input "));
     f.render_widget(input, chunks[2]);
+
+    if let Some(req) = state.pending_approval.as_ref() {
+        approval_modal::render(f, size, req);
+    }
 }

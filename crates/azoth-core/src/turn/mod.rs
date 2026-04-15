@@ -3,7 +3,10 @@
 //! plan → compile → invoke → dispatch → validate → commit/abort
 
 use crate::adapter::ProviderAdapter;
-use crate::authority::{Origin, Tainted};
+use crate::authority::{
+    mint_from_approval, ApprovalPolicyV1, ApprovalRequestMsg, ApprovalResponse, AuthorityDecision,
+    AuthorityEngine, CapabilityStore, Origin, Tainted,
+};
 use crate::event_store::JsonlWriter;
 use crate::execution::{ExecutionContext, ToolDispatcher, ToolError};
 use crate::schemas::{
@@ -11,6 +14,7 @@ use crate::schemas::{
     ModelTurnRequest, RequestMetadata, Role, RunId, SessionEvent, StopReason, StreamEvent,
     ToolDefinition, TurnId, Usage,
 };
+use tokio::sync::oneshot;
 use thiserror::Error;
 use tokio::sync::mpsc;
 
@@ -32,6 +36,8 @@ pub struct TurnDriver<'a> {
     pub dispatcher: &'a ToolDispatcher,
     pub writer: &'a mut JsonlWriter,
     pub ctx: &'a ExecutionContext,
+    pub capabilities: &'a mut CapabilityStore,
+    pub approval_bridge: mpsc::Sender<ApprovalRequestMsg>,
 }
 
 impl<'a> TurnDriver<'a> {
@@ -144,6 +150,104 @@ impl<'a> TurnDriver<'a> {
                     let mut tool_results: Vec<ContentBlock> = Vec::new();
                     for block in response.content.iter() {
                         if let ContentBlock::ToolUse { id, name, input, .. } = block {
+                            let effect_class = self
+                                .dispatcher
+                                .tool(name)
+                                .map(|t| t.effect_class())
+                                .unwrap_or(EffectClass::Observe);
+
+                            let path_hint = input.get("path").and_then(|v| v.as_str());
+
+                            let decision = {
+                                let engine = AuthorityEngine::new(
+                                    &*self.capabilities,
+                                    ApprovalPolicyV1,
+                                );
+                                engine.authorize(name, effect_class, path_hint)
+                            };
+
+                            match decision {
+                                AuthorityDecision::Auto | AuthorityDecision::Reuse(_) => {}
+                                AuthorityDecision::NotAvailable { hint } => {
+                                    self.record_abort(
+                                        &turn_id,
+                                        AbortReason::RuntimeError,
+                                        Some(format!("effect not available: {hint}")),
+                                        total_usage.clone(),
+                                    )?;
+                                    return Ok(total_usage);
+                                }
+                                AuthorityDecision::RequireApproval {
+                                    approval_id,
+                                    tool_name,
+                                    effect_class: ec,
+                                } => {
+                                    let summary = format!(
+                                        "{} → {}",
+                                        tool_name,
+                                        path_hint.unwrap_or("(no path)")
+                                    );
+                                    self.writer.append(&SessionEvent::ApprovalRequest {
+                                        turn_id: turn_id.clone(),
+                                        approval_id: approval_id.clone(),
+                                        effect_class: ec,
+                                        tool_name: tool_name.clone(),
+                                        summary: summary.clone(),
+                                    })?;
+
+                                    let (resp_tx, resp_rx) = oneshot::channel::<ApprovalResponse>();
+                                    let msg = ApprovalRequestMsg {
+                                        turn_id: turn_id.clone(),
+                                        approval_id: approval_id.clone(),
+                                        tool_name: tool_name.clone(),
+                                        effect_class: ec,
+                                        summary,
+                                        responder: resp_tx,
+                                    };
+                                    if self.approval_bridge.send(msg).await.is_err() {
+                                        self.writer.append(&SessionEvent::ApprovalDenied {
+                                            turn_id: turn_id.clone(),
+                                            approval_id: approval_id.clone(),
+                                        })?;
+                                        self.record_abort(
+                                            &turn_id,
+                                            AbortReason::ApprovalDenied,
+                                            Some("approval bridge closed".into()),
+                                            total_usage.clone(),
+                                        )?;
+                                        return Ok(total_usage);
+                                    }
+
+                                    match resp_rx.await {
+                                        Ok(ApprovalResponse::Grant { scope }) => {
+                                            let tok =
+                                                mint_from_approval(&tool_name, ec, scope.clone());
+                                            let tok_id = tok.id.clone();
+                                            self.capabilities.mint(tok);
+                                            self.writer.append(&SessionEvent::ApprovalGranted {
+                                                turn_id: turn_id.clone(),
+                                                approval_id: approval_id.clone(),
+                                                token: tok_id,
+                                                scope,
+                                            })?;
+                                        }
+                                        Ok(ApprovalResponse::Deny) | Err(_) => {
+                                            self.writer.append(&SessionEvent::ApprovalDenied {
+                                                turn_id: turn_id.clone(),
+                                                approval_id: approval_id.clone(),
+                                            })?;
+                                            self.record_abort(
+                                                &turn_id,
+                                                AbortReason::ApprovalDenied,
+                                                Some("user denied approval".into()),
+                                                total_usage.clone(),
+                                            )?;
+                                            return Ok(total_usage);
+                                        }
+                                    }
+                                }
+                            }
+
                             let raw = Tainted::new(Origin::ModelOutput, input.clone());
                             let result = crate::execution::dispatch_tool(
                                 self.dispatcher,
@@ -165,12 +269,6 @@ impl<'a> TurnDriver<'a> {
                                     true,
                                 ),
                             };
-
-                            let effect_class = self
-                                .dispatcher
-                                .tool(name)
-                                .map(|t| t.effect_class())
-                                .unwrap_or(EffectClass::Observe);
 
                             self.writer.append(&SessionEvent::EffectRecord {
                                 turn_id: turn_id.clone(),

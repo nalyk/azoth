@@ -2,5 +2,7 @@
 //! input struct.
 
 mod repo_search;
+mod fs_write;
 
 pub use repo_search::{RepoSearchInput, RepoSearchOutput, RepoSearchTool};
+pub use fs_write::{FsWriteInput, FsWriteOutput, FsWriteTool};
