@@ -454,6 +454,16 @@ pub async fn run_app(resume: Option<String>) -> io::Result<()> {
         let mut history: Vec<Message> = Vec::new();
         let mut caps = CapabilityStore::new();
 
+        // Per-worker ContextKernel. Reused across turns because its fields
+        // are pure config (policy_version, tokenizer family, token ceiling).
+        // The kernel is only consulted when an active contract exists — the
+        // driver branches on `(contract, kernel)`.
+        let kernel = azoth_core::context::ContextKernel {
+            policy_version: "policy_v1",
+            tokenizer: azoth_core::context::TokenizerFamily::Anthropic,
+            max_input_tokens: 0,
+        };
+
         // Stash the last accepted contract from JSONL on startup/resume.
         // The writer tap replays ContractAccepted into the UI, but the
         // driver needs its own handle — the tap is one-way and never
@@ -520,6 +530,7 @@ pub async fn run_app(resume: Option<String>) -> io::Result<()> {
                 approval_bridge: approval_req_tx.clone(),
                 contract: active_contract.as_ref(),
                 turns_completed,
+                kernel: Some(&kernel),
             };
 
             let result = driver

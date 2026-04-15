@@ -101,6 +101,7 @@ async fn drive_with_responder(
             approval_bridge: atx,
             contract: None,
             turns_completed: 0,
+            kernel: None,
         };
         let _ = driver
             .drive_turn(

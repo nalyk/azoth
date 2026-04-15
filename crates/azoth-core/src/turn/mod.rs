@@ -7,6 +7,7 @@ use crate::authority::{
     mint_from_approval, ApprovalPolicyV1, ApprovalRequestMsg, ApprovalResponse, AuthorityDecision,
     AuthorityEngine, CapabilityStore, Origin, Tainted,
 };
+use crate::context::{ContextKernel, KernelError, StepInput};
 use crate::event_store::JsonlWriter;
 use crate::execution::{ExecutionContext, ToolDispatcher, ToolError};
 use crate::schemas::{
@@ -28,6 +29,8 @@ pub enum TurnError {
     Tool(#[from] ToolError),
     #[error("context packet budget exceeded")]
     Budget,
+    #[error("kernel: {0}")]
+    Kernel(#[from] KernelError),
 }
 
 pub struct TurnDriver<'a> {
@@ -47,6 +50,15 @@ pub struct TurnDriver<'a> {
     /// The caller owns this counter and increments it after a successful
     /// `drive_turn`; the driver compares it against `contract.scope.max_turns`.
     pub turns_completed: u32,
+    /// Optional `ContextKernel` used to compile a per-turn `ContextPacket`.
+    /// When both `contract` and `kernel` are `Some`, the driver invokes
+    /// `kernel.compile` once at the start of every `drive_turn` and shadows
+    /// the caller-supplied `system` string with a constitution header derived
+    /// from `packet.constitution_lane` — binding the contract digest,
+    /// policy version, and tool-schemas digest into `ModelRequest.request_digest`.
+    /// When either is `None`, behavior is byte-for-byte identical to the
+    /// pre-kernel driver.
+    pub kernel: Option<&'a ContextKernel<'a>>,
 }
 
 impl<'a> TurnDriver<'a> {
@@ -100,6 +112,64 @@ impl<'a> TurnDriver<'a> {
             }
         }
 
+        let tools: Vec<ToolDefinition> = self.dispatcher.schemas();
+
+        // When both a contract and a kernel are attached, compile a
+        // `ContextPacket` and shadow `system` with a constitution header so
+        // the contract digest + policy version + tool-schemas digest flow
+        // into the `ModelRequest.request_digest`. Budget overflow maps to a
+        // clean TokenBudget abort; any other kernel error bubbles as
+        // `TurnError::Kernel`.
+        let system = match (self.contract, self.kernel) {
+            (Some(contract), Some(kernel)) => {
+                let tool_schemas_digest = digest(&tools);
+                let input = StepInput {
+                    contract,
+                    turn_id: turn_id.clone(),
+                    step_goal: contract.goal.clone(),
+                    rubric: contract.success_criteria.clone(),
+                    working_set: Vec::new(),
+                    evidence: Vec::new(),
+                    last_checkpoint: None,
+                    system_prompt: system,
+                    tool_schemas_digest,
+                };
+                match kernel.compile(input) {
+                    Ok(packet) => {
+                        let lane = &packet.constitution_lane;
+                        format!(
+                            "[azoth.constitution]\n\
+                             contract_digest={}\n\
+                             policy_version={}\n\
+                             tool_schemas_digest={}\n\n\
+                             {}",
+                            lane.contract_digest,
+                            lane.policy_version,
+                            lane.tool_schemas_digest,
+                            lane.system_prompt,
+                        )
+                    }
+                    Err(KernelError::OverBudget(used, max)) => {
+                        self.writer.append(&SessionEvent::TurnStarted {
+                            turn_id: turn_id.clone(),
+                            run_id: self.run_id.clone(),
+                            parent_turn: None,
+                            timestamp: now_iso(),
+                        })?;
+                        self.record_abort(
+                            &turn_id,
+                            AbortReason::TokenBudget,
+                            Some(format!("context packet over budget: {used} > {max}")),
+                            Usage::default(),
+                        )?;
+                        return Ok(Usage::default());
+                    }
+                    Err(e) => return Err(TurnError::Kernel(e)),
+                }
+            }
+            _ => system,
+        };
+
         self.writer.append(&SessionEvent::TurnStarted {
             turn_id: turn_id.clone(),
             run_id: self.run_id.clone(),
@@ -107,7 +177,6 @@ impl<'a> TurnDriver<'a> {
             timestamp: now_iso(),
         })?;
 
-        let tools: Vec<ToolDefinition> = self.dispatcher.schemas();
         let mut total_usage = Usage::default();
 
         loop {

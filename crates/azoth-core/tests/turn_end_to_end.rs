@@ -89,6 +89,7 @@ async fn tui_worker_pipeline_drives_full_turn_sequence() {
             approval_bridge: approval_tx,
             contract: None,
             turns_completed: 0,
+            kernel: None,
         };
         let usage = driver
             .drive_turn(
