@@ -1,21 +1,19 @@
 //! Native-shape adapter. Translates `ModelTurnRequest` into the Anthropic
-//! Messages wire JSON, sends it, parses the non-streaming response body, and
-//! converts it back into `ModelTurnResponse`.
-//!
-//! Streaming is intentionally simplified in v1: the adapter makes a
-//! non-streaming request and emits a single synthetic `MessageStart`/
-//! `ContentBlockStart`/`ContentBlockStop`/`MessageStop` sequence so
-//! downstream code is exercised. Real SSE parsing is a follow-up once the
-//! turn driver needs it.
+//! Messages wire JSON, opens a streaming POST, and feeds the SSE byte stream
+//! through `super::sse::consume_anthropic_sse`, which emits `StreamEvent`s
+//! onto the sink as frames arrive and returns the assembled
+//! `ModelTurnResponse` when the stream closes.
 
-use super::stream::{emit_synthetic_stream, map_http_status};
+use super::sse::consume_anthropic_sse;
+use super::stream::map_http_status;
 use super::{error::TokenCount, AdapterError, ProviderAdapter, ProviderProfile, ToolUseShape};
 use crate::authority::SecretHandle;
 use crate::schemas::{
     AdapterErrorCode, CacheHints, ContentBlock, Message, ModelTurnRequest, ModelTurnResponse, Role,
-    StopReason, StreamEvent, ToolDefinition, ToolUseId, Usage,
+    StreamEvent, ToolDefinition,
 };
 use async_trait::async_trait;
+use futures::StreamExt;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
@@ -44,6 +42,7 @@ impl AnthropicMessagesAdapter {
             "system": system_with_cache(&req.system, &req.cache_hints),
             "messages": messages,
             "max_tokens": req.max_tokens,
+            "stream": true,
         });
         if !tools.is_empty() {
             body["tools"] = Value::Array(tools);
@@ -105,74 +104,6 @@ fn tool_to_wire(tool: &ToolDefinition) -> Value {
     })
 }
 
-fn parse_response_body(body: &Value) -> Result<ModelTurnResponse, AdapterError> {
-    let content_arr = body
-        .get("content")
-        .and_then(Value::as_array)
-        .ok_or_else(|| AdapterError::invalid_request("missing `content` array"))?;
-
-    let mut content: Vec<ContentBlock> = Vec::with_capacity(content_arr.len());
-    for item in content_arr {
-        let ty = item.get("type").and_then(Value::as_str).unwrap_or("");
-        match ty {
-            "text" => {
-                let text = item.get("text").and_then(Value::as_str).unwrap_or("").to_string();
-                content.push(ContentBlock::Text { text });
-            }
-            "tool_use" => {
-                let id = item.get("id").and_then(Value::as_str).unwrap_or("").to_string();
-                let name = item.get("name").and_then(Value::as_str).unwrap_or("").to_string();
-                let input = item.get("input").cloned().unwrap_or(Value::Null);
-                content.push(ContentBlock::ToolUse {
-                    id: ToolUseId::from(id),
-                    name,
-                    input,
-                    call_group: None,
-                });
-            }
-            "thinking" => {
-                let text = item.get("thinking").and_then(Value::as_str).unwrap_or("").to_string();
-                let signature = item.get("signature").and_then(Value::as_str).map(str::to_string);
-                content.push(ContentBlock::Thinking { text, signature });
-            }
-            _ => {
-                // Unknown content types are ignored rather than failing the whole turn.
-                tracing::debug!(kind = %ty, "ignoring unknown anthropic content block");
-            }
-        }
-    }
-
-    let stop_reason = body
-        .get("stop_reason")
-        .and_then(Value::as_str)
-        .map(|s| match s {
-            "end_turn" => StopReason::EndTurn,
-            "tool_use" => StopReason::ToolUse,
-            "max_tokens" => StopReason::MaxTokens,
-            "stop_sequence" => StopReason::StopSequence,
-            _ => StopReason::EndTurn,
-        })
-        .unwrap_or(StopReason::EndTurn);
-
-    let usage = body
-        .get("usage")
-        .map(|u| Usage {
-            input_tokens: u.get("input_tokens").and_then(Value::as_u64).unwrap_or(0) as u32,
-            output_tokens: u.get("output_tokens").and_then(Value::as_u64).unwrap_or(0) as u32,
-            cache_read_tokens: u
-                .get("cache_read_input_tokens")
-                .and_then(Value::as_u64)
-                .unwrap_or(0) as u32,
-            cache_creation_tokens: u
-                .get("cache_creation_input_tokens")
-                .and_then(Value::as_u64)
-                .unwrap_or(0) as u32,
-        })
-        .unwrap_or_default();
-
-    Ok(ModelTurnResponse { content, stop_reason, usage })
-}
-
 #[async_trait]
 impl ProviderAdapter for AnthropicMessagesAdapter {
     fn profile(&self) -> &ProviderProfile {
@@ -191,20 +122,21 @@ impl ProviderAdapter for AnthropicMessagesAdapter {
             .http
             .post(&url)
             .header("x-api-key", self.api_key.expose())
+            .header("anthropic-version", "2023-06-01")
+            .header("accept", "text/event-stream")
             .header("content-type", "application/json");
         for (k, v) in &self.profile.extra_headers {
             builder = builder.header(k.as_str(), v.as_str());
         }
         builder = builder.json(&body);
 
-        let resp = builder.send().await.map_err(|e| AdapterError::network(e.to_string()))?;
-        let status = resp.status();
-        let text = resp
-            .text()
+        let resp = builder
+            .send()
             .await
             .map_err(|e| AdapterError::network(e.to_string()))?;
-
+        let status = resp.status();
         if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
             let code = map_http_status(status.as_u16());
             return Err(AdapterError {
                 code,
@@ -219,11 +151,10 @@ impl ProviderAdapter for AnthropicMessagesAdapter {
             });
         }
 
-        let json: Value = serde_json::from_str(&text)
-            .map_err(|e| AdapterError::invalid_request(format!("response not json: {e}")))?;
-        let response = parse_response_body(&json)?;
-        emit_synthetic_stream(&response, &sink).await;
-        Ok(response)
+        let byte_stream = resp
+            .bytes_stream()
+            .map(|r| r.map_err(|e| AdapterError::network(e.to_string())));
+        consume_anthropic_sse(Box::pin(byte_stream), &sink).await
     }
 
     async fn count_tokens(&self, _req: &ModelTurnRequest) -> Result<TokenCount, AdapterError> {
@@ -233,23 +164,3 @@ impl ProviderAdapter for AnthropicMessagesAdapter {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parses_minimal_anthropic_response() {
-        let body = json!({
-            "content": [
-                {"type": "text", "text": "hi"},
-                {"type": "tool_use", "id": "tu_a", "name": "repo.search", "input": {"q": "x"}}
-            ],
-            "stop_reason": "tool_use",
-            "usage": {"input_tokens": 7, "output_tokens": 3}
-        });
-        let resp = parse_response_body(&body).unwrap();
-        assert_eq!(resp.stop_reason, StopReason::ToolUse);
-        assert_eq!(resp.usage.input_tokens, 7);
-        assert_eq!(resp.content.len(), 2);
-    }
-}

@@ -5,6 +5,7 @@
 
 mod error;
 pub mod profile;
+mod sse;
 mod stream;
 mod anthropic_messages;
 mod openai_chat_completions;
