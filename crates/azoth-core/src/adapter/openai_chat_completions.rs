@@ -2,14 +2,15 @@
 //! Completions wire, and back. Preserves parallel-tool ordering via
 //! `call_group` (HIGH-3).
 
-use super::stream::{emit_synthetic_stream, map_http_status};
+use super::openai_sse::consume_openai_sse;
+use super::stream::map_http_status;
 use super::{error::TokenCount, AdapterError, ProviderAdapter, ProviderProfile, ToolUseShape};
 use crate::authority::SecretHandle;
 use crate::schemas::{
-    CallGroupId, ContentBlock, Message, ModelTurnRequest, ModelTurnResponse, Role, StopReason,
-    StreamEvent, ToolDefinition, ToolUseId, Usage,
+    ContentBlock, Message, ModelTurnRequest, ModelTurnResponse, Role, StreamEvent, ToolDefinition,
 };
 use async_trait::async_trait;
+use futures::StreamExt;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
@@ -44,6 +45,8 @@ impl OpenAiChatCompletionsAdapter {
             "model": self.profile.model_id,
             "messages": msgs,
             "max_tokens": req.max_tokens,
+            "stream": true,
+            "stream_options": {"include_usage": true},
         });
         if !tools.is_empty() {
             body["tools"] = Value::Array(tools);
@@ -146,67 +149,6 @@ fn extend_openai_messages(out: &mut Vec<Value>, msg: &Message) {
     }
 }
 
-fn parse_response_body(body: &Value) -> Result<ModelTurnResponse, AdapterError> {
-    let choice = body
-        .get("choices")
-        .and_then(Value::as_array)
-        .and_then(|a| a.first())
-        .ok_or_else(|| AdapterError::invalid_request("missing choices[0]"))?;
-
-    let message = choice
-        .get("message")
-        .ok_or_else(|| AdapterError::invalid_request("choices[0].message missing"))?;
-
-    let mut content: Vec<ContentBlock> = Vec::new();
-    if let Some(text) = message.get("content").and_then(Value::as_str) {
-        if !text.is_empty() {
-            content.push(ContentBlock::Text { text: text.to_string() });
-        }
-    }
-
-    // Parallel tool calls all share one call_group, preserving the original
-    // OpenAI batch ordering when the runtime later dispatches them.
-    if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) {
-        let group = CallGroupId::new();
-        for tc in tool_calls {
-            let id = tc.get("id").and_then(Value::as_str).unwrap_or_default().to_string();
-            let function = tc.get("function").cloned().unwrap_or(Value::Null);
-            let name = function
-                .get("name")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            let args_str = function.get("arguments").and_then(Value::as_str).unwrap_or("{}");
-            let input: Value = serde_json::from_str(args_str).unwrap_or(Value::Null);
-            content.push(ContentBlock::ToolUse {
-                id: ToolUseId::from(id),
-                name,
-                input,
-                call_group: Some(group),
-            });
-        }
-    }
-
-    let stop_reason = match choice.get("finish_reason").and_then(Value::as_str) {
-        Some("tool_calls") => StopReason::ToolUse,
-        Some("length") => StopReason::MaxTokens,
-        Some("content_filter") => StopReason::ContentFilter,
-        Some("stop") | Some("end_turn") => StopReason::EndTurn,
-        _ => StopReason::EndTurn,
-    };
-
-    let usage = body
-        .get("usage")
-        .map(|u| Usage {
-            input_tokens: u.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0) as u32,
-            output_tokens: u.get("completion_tokens").and_then(Value::as_u64).unwrap_or(0) as u32,
-            ..Default::default()
-        })
-        .unwrap_or_default();
-
-    Ok(ModelTurnResponse { content, stop_reason, usage })
-}
-
 #[async_trait]
 impl ProviderAdapter for OpenAiChatCompletionsAdapter {
     fn profile(&self) -> &ProviderProfile {
@@ -228,20 +170,20 @@ impl ProviderAdapter for OpenAiChatCompletionsAdapter {
             .http
             .post(&url)
             .bearer_auth(self.api_key.expose())
-            .header("content-type", "application/json");
+            .header("content-type", "application/json")
+            .header("accept", "text/event-stream");
         for (k, v) in &self.profile.extra_headers {
             builder = builder.header(k.as_str(), v.as_str());
         }
         builder = builder.json(&body);
 
-        let resp = builder.send().await.map_err(|e| AdapterError::network(e.to_string()))?;
-        let status = resp.status();
-        let text = resp
-            .text()
+        let resp = builder
+            .send()
             .await
             .map_err(|e| AdapterError::network(e.to_string()))?;
-
+        let status = resp.status();
         if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
             return Err(AdapterError {
                 code: map_http_status(status.as_u16()),
                 retryable: matches!(status.as_u16(), 429 | 408 | 500..=599),
@@ -250,11 +192,10 @@ impl ProviderAdapter for OpenAiChatCompletionsAdapter {
             });
         }
 
-        let json: Value = serde_json::from_str(&text)
-            .map_err(|e| AdapterError::invalid_request(format!("response not json: {e}")))?;
-        let response = parse_response_body(&json)?;
-        emit_synthetic_stream(&response, &sink).await;
-        Ok(response)
+        let byte_stream = resp
+            .bytes_stream()
+            .map(|r| r.map_err(|e| AdapterError::network(e.to_string())));
+        consume_openai_sse(Box::pin(byte_stream), &sink).await
     }
 
     async fn count_tokens(&self, _req: &ModelTurnRequest) -> Result<TokenCount, AdapterError> {
@@ -266,29 +207,7 @@ impl ProviderAdapter for OpenAiChatCompletionsAdapter {
 mod tests {
     use super::*;
 
-    #[test]
-    fn parses_parallel_tool_calls_into_one_group() {
-        let body = json!({
-            "choices": [{
-                "message": {
-                    "content": null,
-                    "tool_calls": [
-                        {"id": "tu_a", "type": "function", "function": {"name": "repo.search", "arguments": "{\"q\":\"x\"}"}},
-                        {"id": "tu_b", "type": "function", "function": {"name": "repo.read", "arguments": "{\"p\":\"/a\"}"}}
-                    ]
-                },
-                "finish_reason": "tool_calls"
-            }],
-            "usage": {"prompt_tokens": 9, "completion_tokens": 2}
-        });
-        let resp = parse_response_body(&body).unwrap();
-        assert_eq!(resp.stop_reason, StopReason::ToolUse);
-        let groups: Vec<_> = resp.content.iter().filter_map(|b| {
-            if let ContentBlock::ToolUse { call_group, .. } = b { *call_group } else { None }
-        }).collect();
-        assert_eq!(groups.len(), 2);
-        assert_eq!(groups[0], groups[1], "parallel calls must share a group");
-    }
+    use crate::schemas::ToolUseId;
 
     #[test]
     fn request_body_includes_tool_calls_for_prior_assistant_turn() {
