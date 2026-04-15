@@ -31,10 +31,12 @@ pub trait Sandbox: Send + Sync {
     fn prepare(&self) -> Result<(), SandboxError>;
 }
 
+pub mod probe;
 pub mod tier_a;
 pub mod tier_b;
 pub mod tier_cd;
 
+pub use probe::probe_unprivileged_userns;
 pub use tier_a::TierA;
 pub use tier_b::{probe_fuse_overlayfs, TierB};
 pub use tier_cd::{TierC, TierD};
