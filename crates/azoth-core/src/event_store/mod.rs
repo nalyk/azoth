@@ -5,8 +5,10 @@
 //! structurally impossible in the model's replayed context.
 
 pub mod jsonl;
+pub mod sqlite;
 
 pub use jsonl::{
     ForensicEvent, JsonlReader, JsonlWriter, ProjectionError, ReplayableEvent,
     TurnOutcomeKind,
 };
+pub use sqlite::{MirrorError, SqliteMirror};

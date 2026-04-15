@@ -14,6 +14,7 @@
 //! On load, any turn without a terminal marker is *closed* by appending a
 //! synthetic `turn_interrupted { reason: "crash" }` record.
 
+use crate::event_store::sqlite::SqliteMirror;
 use crate::schemas::{AbortReason, SessionEvent, TurnId};
 use serde::Serialize;
 use std::collections::HashMap;
@@ -41,6 +42,7 @@ pub struct JsonlWriter {
     path: PathBuf,
     file: BufWriter<File>,
     tap: Option<UnboundedSender<SessionEvent>>,
+    mirror: Option<SqliteMirror>,
 }
 
 impl JsonlWriter {
@@ -54,6 +56,7 @@ impl JsonlWriter {
             path,
             file: BufWriter::new(file),
             tap: None,
+            mirror: None,
         })
     }
 
@@ -86,6 +89,15 @@ impl JsonlWriter {
         self.tap = Some(tap);
     }
 
+    /// Attach a SQLite mirror. The mirror is updated in the same
+    /// post-fsync position as the tap, so it never observes an event
+    /// that isn't durable on disk. No-op for every variant except
+    /// `RunStarted` / `TurnCommitted` / `TurnAborted` — see
+    /// `SqliteMirror::apply`.
+    pub fn set_mirror(&mut self, mirror: SqliteMirror) {
+        self.mirror = Some(mirror);
+    }
+
     pub fn append(&mut self, event: &SessionEvent) -> io::Result<()> {
         let line = serialize_line(event)?;
         self.file.write_all(line.as_bytes())?;
@@ -94,6 +106,11 @@ impl JsonlWriter {
         self.file.get_ref().sync_data()?;
         if let Some(tap) = &self.tap {
             let _ = tap.send(event.clone());
+        }
+        if let Some(mirror) = &mut self.mirror {
+            if let Err(e) = mirror.apply(event) {
+                tracing::warn!(error = %e, "sqlite mirror apply failed");
+            }
         }
         Ok(())
     }

@@ -26,7 +26,7 @@ use azoth_core::artifacts::ArtifactStore;
 use azoth_core::authority::{
     ApprovalRequestMsg, ApprovalResponse, CapabilityStore,
 };
-use azoth_core::event_store::{JsonlReader, JsonlWriter};
+use azoth_core::event_store::{JsonlReader, JsonlWriter, SqliteMirror};
 use azoth_core::execution::{CancellationToken, ExecutionContext, ToolDispatcher};
 use azoth_core::schemas::{
     ApprovalScope, CommitOutcome, ContentBlock, Message, ModelTurnResponse, RunId, SessionEvent,
@@ -392,6 +392,17 @@ pub async fn run_app(resume: Option<String>) -> io::Result<()> {
             }
         }
         writer.set_tap(worker_session_tx.clone());
+
+        // SQLite mirror: one per repo at `.azoth/state.sqlite` (draft_plan
+        // line ~85). JSONL is authoritative — mirror failures log and
+        // continue, never block the turn.
+        let mirror_path = worker_cwd.join(".azoth").join("state.sqlite");
+        match SqliteMirror::open(&mirror_path) {
+            Ok(mirror) => writer.set_mirror(mirror),
+            Err(e) => {
+                tracing::warn!(error = %e, "sqlite mirror disabled: open failed");
+            }
+        }
 
         let artifacts = match ArtifactStore::open(&worker_artifacts_root) {
             Ok(a) => a,

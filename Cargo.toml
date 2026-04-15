@@ -43,8 +43,9 @@ ratatui = "0.30"
 crossterm = { version = "0.29", features = ["event-stream"] }
 tui-textarea = "0.7"
 
-# Storage — SQLite mirror is deferred to a later sprint; JSONL is the only
-# authoritative event store in v1.
+# Storage — SQLite mirror of committed/aborted turns. JSONL remains
+# authoritative (CRIT-1); the mirror is a rebuildable secondary index.
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 # Sandbox (Linux)
 landlock = "0.4"
