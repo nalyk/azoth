@@ -29,8 +29,8 @@ use azoth_core::authority::{
 use azoth_core::event_store::{JsonlReader, JsonlWriter, SqliteMirror};
 use azoth_core::execution::{CancellationToken, ExecutionContext, ToolDispatcher};
 use azoth_core::schemas::{
-    ApprovalScope, CommitOutcome, ContentBlock, Message, ModelTurnResponse, RunId, SessionEvent,
-    StopReason, ToolUseId, TurnId, Usage,
+    ApprovalScope, CommitOutcome, ContentBlock, Contract, ContractId, Message, ModelTurnResponse,
+    RunId, SessionEvent, StopReason, ToolUseId, TurnId, Usage,
 };
 use azoth_core::tools::{FsWriteTool, RepoSearchTool};
 use azoth_core::turn::TurnDriver;
@@ -52,10 +52,12 @@ pub struct AppState {
     pub dirty: bool,
     pub should_quit: bool,
     pending_user_text: Option<String>,
+    pending_contract: Option<Contract>,
     pub pending_approval: Option<ApprovalRequestMsg>,
     pub run_id: String,
     pub session_path: String,
     pub committed_turns: u32,
+    pub current_contract_id: Option<ContractId>,
 }
 
 impl AppState {
@@ -68,10 +70,12 @@ impl AppState {
             dirty: true,
             should_quit: false,
             pending_user_text: None,
+            pending_contract: None,
             pending_approval: None,
             run_id: String::new(),
             session_path: String::new(),
             committed_turns: 0,
+            current_contract_id: None,
         }
     }
 
@@ -82,7 +86,7 @@ impl AppState {
                 self.transcript.push("  /help              show this list".into());
                 self.transcript.push("  /status            run_id, session path, turn count".into());
                 self.transcript.push("  /context           latest compiled context packet".into());
-                self.transcript.push("  /contract          (not yet wired)".into());
+                self.transcript.push("  /contract <goal>   draft + accept a run contract".into());
                 self.transcript.push("  /approve           (not yet wired)".into());
                 self.transcript.push("  /resume <run_id>   (restart required in v1)".into());
                 self.transcript.push("  /quit              exit".into());
@@ -96,13 +100,28 @@ impl AppState {
                     if self.pending_approval.is_some() { "yes" } else { "no" }
                 ));
                 self.transcript.push(format!("  turns         {}", self.committed_turns));
+                self.transcript.push(format!(
+                    "  contract      {}",
+                    self.current_contract_id
+                        .as_ref()
+                        .map(|c| c.to_string())
+                        .unwrap_or_else(|| "(none)".to_string())
+                ));
             }
             SlashCommand::Context => {
                 self.transcript.push("· context: no packet compiled yet".into());
             }
-            SlashCommand::Contract => {
-                self.transcript.push("! /contract not yet wired".into());
-            }
+            SlashCommand::Contract(rest) => match rest {
+                None => {
+                    self.transcript.push("! usage: /contract <goal text>".into());
+                }
+                Some(goal) => {
+                    let mut c = azoth_core::contract::draft(goal.clone());
+                    c.success_criteria.push(format!("delivers: {goal}"));
+                    self.transcript.push(format!("· contract drafted: {goal}"));
+                    self.pending_contract = Some(c);
+                }
+            },
             SlashCommand::Approve => {
                 self.transcript.push("! /approve not yet wired".into());
             }
@@ -199,11 +218,23 @@ impl AppState {
         self.pending_user_text.take()
     }
 
+    /// Drain any contract the slash-command handler queued for the worker.
+    pub fn take_pending_contract(&mut self) -> Option<Contract> {
+        self.pending_contract.take()
+    }
+
     /// Render a `SessionEvent` from the TurnDriver as one or more scrollback
     /// lines. Deliberately terse: v1 wants users to see that the real event
     /// pipeline fired, not to pretty-print everything.
     pub fn handle_session_event(&mut self, ev: SessionEvent) {
         match ev {
+            SessionEvent::ContractAccepted { contract, .. } => {
+                self.transcript.push(format!(
+                    "· contract_accepted {} goal={:?}",
+                    contract.id, contract.goal
+                ));
+                self.current_contract_id = Some(contract.id);
+            }
             SessionEvent::TurnStarted { turn_id, .. } => {
                 self.transcript.push(format!("· turn_started {turn_id}"));
             }
@@ -315,6 +346,7 @@ pub async fn run_app(resume: Option<String>) -> io::Result<()> {
 
     let (input_tx, mut input_rx) = mpsc::channel::<InputEvent>(128);
     let (user_tx, mut user_rx) = mpsc::channel::<String>(8);
+    let (contract_tx, mut contract_rx) = mpsc::channel::<Contract>(8);
     let (session_tx, mut session_rx) = mpsc::unbounded_channel::<SessionEvent>();
     let (error_tx, mut error_rx) = mpsc::channel::<String>(8);
     let (approval_req_tx, mut approval_req_rx) = mpsc::channel::<ApprovalRequestMsg>(8);
@@ -422,7 +454,28 @@ pub async fn run_app(resume: Option<String>) -> io::Result<()> {
         let mut history: Vec<Message> = Vec::new();
         let mut caps = CapabilityStore::new();
 
-        while let Some(user_text) = user_rx.recv().await {
+        loop {
+            let user_text = tokio::select! {
+                biased;
+                maybe_contract = contract_rx.recv() => {
+                    let Some(contract) = maybe_contract else { break };
+                    let ts = time::OffsetDateTime::now_utc()
+                        .format(&time::format_description::well_known::Rfc3339)
+                        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string());
+                    if let Err(e) = azoth_core::contract::accept_and_persist(
+                        &mut writer, contract, ts,
+                    ) {
+                        let _ = worker_error_tx
+                            .send(format!("contract accept failed: {e}"))
+                            .await;
+                    }
+                    continue;
+                }
+                maybe_user = user_rx.recv() => {
+                    let Some(t) = maybe_user else { break };
+                    t
+                }
+            };
             let turn_id = TurnId::new();
             let adapter = MockAdapter::new(
                 ProviderProfile::anthropic_default("claude-sonnet-4-6"),
@@ -482,6 +535,11 @@ pub async fn run_app(resume: Option<String>) -> io::Result<()> {
                         state.push_error("worker channel closed");
                     }
                 }
+                if let Some(contract) = state.take_pending_contract() {
+                    if contract_tx.send(contract).await.is_err() {
+                        state.push_error("worker channel closed");
+                    }
+                }
             }
             Some(ev) = session_rx.recv() => state.handle_session_event(ev),
             Some(req) = approval_req_rx.recv() => {
@@ -505,4 +563,51 @@ pub async fn run_app(resume: Option<String>) -> io::Result<()> {
     disable_raw_mode()?;
     terminal.backend_mut().execute(LeaveAlternateScreen)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn slash_contract_with_goal_queues_draft_for_worker() {
+        let mut state = AppState::new();
+        state.handle_slash(SlashCommand::Contract(Some("fix token refresh".into())));
+        let drafted = state.take_pending_contract().expect("drafted contract");
+        assert_eq!(drafted.goal, "fix token refresh");
+        assert!(drafted
+            .success_criteria
+            .iter()
+            .any(|c| c.contains("fix token refresh")));
+        // Lints clean — the worker is about to persist it.
+        azoth_core::contract::lint(&drafted).expect("drafted contract lints clean");
+    }
+
+    #[test]
+    fn slash_contract_without_goal_prints_usage_and_queues_nothing() {
+        let mut state = AppState::new();
+        state.handle_slash(SlashCommand::Contract(None));
+        assert!(state.take_pending_contract().is_none());
+        assert!(state
+            .transcript
+            .iter()
+            .any(|l| l.contains("usage: /contract")));
+    }
+
+    #[test]
+    fn contract_accepted_event_updates_status_line() {
+        let mut state = AppState::new();
+        let contract = azoth_core::contract::accept({
+            let mut c = azoth_core::contract::draft("ship feature x");
+            c.success_criteria.push("tests pass".into());
+            c
+        })
+        .unwrap();
+        let id = contract.id.clone();
+        state.handle_session_event(SessionEvent::ContractAccepted {
+            contract,
+            timestamp: "2026-04-15T00:00:00Z".into(),
+        });
+        assert_eq!(state.current_contract_id.as_ref(), Some(&id));
+    }
 }

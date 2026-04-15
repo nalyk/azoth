@@ -10,7 +10,9 @@ pub enum SlashCommand {
     Help,
     Status,
     Context,
-    Contract,
+    /// `/contract [goal text...]` — empty argument shows usage; a non-empty
+    /// rest-of-line is treated as the contract goal.
+    Contract(Option<String>),
     Approve,
     Quit,
     /// `/resume <run_id>` — the argument is `None` when no token follows.
@@ -30,11 +32,19 @@ impl SlashCommand {
         let mut parts = trimmed.split_whitespace();
         let head = parts.next()?;
         let name = &head[1..];
+        let rest_of_line = || {
+            let after = trimmed[head.len()..].trim();
+            if after.is_empty() {
+                None
+            } else {
+                Some(after.to_string())
+            }
+        };
         Some(match name {
             "help" => Self::Help,
             "status" => Self::Status,
             "context" => Self::Context,
-            "contract" => Self::Contract,
+            "contract" => Self::Contract(rest_of_line()),
             "approve" => Self::Approve,
             "quit" => Self::Quit,
             "resume" => Self::Resume(parts.next().map(|s| s.to_string())),
@@ -84,7 +94,14 @@ mod tests {
     fn all_known_verbs_parse() {
         assert_eq!(SlashCommand::parse("/status"), Some(SlashCommand::Status));
         assert_eq!(SlashCommand::parse("/context"), Some(SlashCommand::Context));
-        assert_eq!(SlashCommand::parse("/contract"), Some(SlashCommand::Contract));
+        assert_eq!(
+            SlashCommand::parse("/contract"),
+            Some(SlashCommand::Contract(None))
+        );
+        assert_eq!(
+            SlashCommand::parse("/contract fix token refresh"),
+            Some(SlashCommand::Contract(Some("fix token refresh".to_string())))
+        );
         assert_eq!(SlashCommand::parse("/approve"), Some(SlashCommand::Approve));
         assert_eq!(SlashCommand::parse("/quit"), Some(SlashCommand::Quit));
     }
