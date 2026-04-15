@@ -1,0 +1,31 @@
+[package]
+name = "azoth"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Azoth CLI agent runtime — ratatui TUI binary."
+default-run = "azoth"
+
+[features]
+default = ["tui"]
+tui = ["dep:ratatui", "dep:crossterm", "dep:tui-textarea"]
+
+[dependencies]
+azoth-core = { path = "../azoth-core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+uuid = { workspace = true }
+time = { workspace = true }
+
+ratatui = { workspace = true, optional = true }
+crossterm = { workspace = true, optional = true }
+tui-textarea = { workspace = true, optional = true }
