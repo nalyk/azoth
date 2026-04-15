@@ -10,7 +10,9 @@
 
 mod tokenizer;
 mod kernel;
+mod evidence;
 
+pub use evidence::{EvidenceCollector, LexicalEvidenceCollector};
 pub use kernel::{ContextKernel, KernelError, StepInput};
 pub use tokenizer::count_tokens;
 // The tokenizer family flows into the kernel at packet-compile time; re-export
