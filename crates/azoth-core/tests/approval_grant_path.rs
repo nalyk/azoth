@@ -89,6 +89,7 @@ async fn drive_with_responder(
     });
 
     let mut caps = CapabilityStore::new();
+    let mut effects = azoth_core::schemas::EffectCounter::default();
     let had_any_cap;
     {
         let mut driver = TurnDriver {
@@ -103,6 +104,7 @@ async fn drive_with_responder(
             turns_completed: 0,
             kernel: None,
             validators: &[],
+            effects_consumed: &mut effects,
         };
         let _ = driver
             .drive_turn(

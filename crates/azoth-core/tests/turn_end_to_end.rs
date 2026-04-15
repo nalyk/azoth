@@ -78,6 +78,7 @@ async fn tui_worker_pipeline_drives_full_turn_sequence() {
 
     let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalRequestMsg>(8);
     let mut caps = CapabilityStore::new();
+    let mut effects = azoth_core::schemas::EffectCounter::default();
     {
         let mut driver = TurnDriver {
             run_id: run_id.clone(),
@@ -91,6 +92,7 @@ async fn tui_worker_pipeline_drives_full_turn_sequence() {
             turns_completed: 0,
             kernel: None,
             validators: &[],
+            effects_consumed: &mut effects,
         };
         let usage = driver
             .drive_turn(

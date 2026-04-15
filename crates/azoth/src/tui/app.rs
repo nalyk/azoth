@@ -483,6 +483,11 @@ pub async fn run_app(resume: Option<String>) -> io::Result<()> {
                 .ok()
                 .flatten();
         let mut turns_completed: u32 = 0;
+        // Per-run effect tally, compared against `contract.effect_budget`
+        // inside the driver. Reset to zero at worker start (matches the
+        // current `turns_completed` reset on resume; recomputing from
+        // JSONL is a follow-up).
+        let mut effects_consumed = azoth_core::schemas::EffectCounter::default();
 
         loop {
             let user_text = tokio::select! {
@@ -541,6 +546,7 @@ pub async fn run_app(resume: Option<String>) -> io::Result<()> {
                 turns_completed,
                 kernel: Some(&kernel),
                 validators,
+                effects_consumed: &mut effects_consumed,
             };
 
             let result = driver

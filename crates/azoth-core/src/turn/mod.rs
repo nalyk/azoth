@@ -11,9 +11,9 @@ use crate::context::{ContextKernel, KernelError, StepInput};
 use crate::event_store::JsonlWriter;
 use crate::execution::{ExecutionContext, ToolDispatcher, ToolError};
 use crate::schemas::{
-    AbortReason, CheckpointId, CommitOutcome, ContentBlock, Contract, EffectClass, EffectRecord,
-    EffectRecordId, Message, ModelTurnRequest, RequestMetadata, Role, RunId, SessionEvent,
-    StopReason, StreamEvent, ToolDefinition, TurnId, Usage, ValidatorStatus,
+    AbortReason, CheckpointId, CommitOutcome, ContentBlock, Contract, EffectClass, EffectCounter,
+    EffectRecord, EffectRecordId, Message, ModelTurnRequest, RequestMetadata, Role, RunId,
+    SessionEvent, StopReason, StreamEvent, ToolDefinition, TurnId, Usage, ValidatorStatus,
 };
 use crate::validators::Validator;
 use tokio::sync::oneshot;
@@ -70,6 +70,16 @@ pub struct TurnDriver<'a> {
     /// identical to the pre-validators driver when this slice is empty
     /// or when `contract` is `None` (validators need a contract to check).
     pub validators: &'a [&'a dyn Validator],
+    /// Cumulative per-run effect tally, compared against
+    /// `contract.effect_budget` before every tool dispatch. When `contract`
+    /// is `Some` and a tool's `EffectClass` maps to a budgeted counter that
+    /// has already reached its cap, the driver records a `TurnAborted`
+    /// with reason `RuntimeError` and detail `effect budget exhausted:
+    /// <class> <used>/<max>` — mirroring the existing `NotAvailable`
+    /// short-circuit path. The counter is bumped after every successful
+    /// `EffectRecord` append. When `contract` is `None`, the counter is
+    /// never read or written, so the pre-contract byte shape is preserved.
+    pub effects_consumed: &'a mut EffectCounter,
 }
 
 impl<'a> TurnDriver<'a> {
@@ -272,6 +282,39 @@ impl<'a> TurnDriver<'a> {
 
                             let path_hint = input.get("path").and_then(|v| v.as_str());
 
+                            // Effect-budget short-circuit: if a contract is
+                            // active and the projected class would push the
+                            // per-run counter past its cap, abort the turn
+                            // with RuntimeError. Classes not tracked by
+                            // `EffectBudget` (Observe, Stage, remote/*) are
+                            // left alone. A cap of 0 means "none allowed".
+                            if let Some(c) = self.contract {
+                                let (used, max, label) = match effect_class {
+                                    EffectClass::ApplyLocal => (
+                                        self.effects_consumed.apply_local,
+                                        c.effect_budget.max_apply_local,
+                                        "apply_local",
+                                    ),
+                                    EffectClass::ApplyRepo => (
+                                        self.effects_consumed.apply_repo,
+                                        c.effect_budget.max_apply_repo,
+                                        "apply_repo",
+                                    ),
+                                    _ => (0, u32::MAX, ""),
+                                };
+                                if !label.is_empty() && used >= max {
+                                    self.record_abort(
+                                        &turn_id,
+                                        AbortReason::RuntimeError,
+                                        Some(format!(
+                                            "effect budget exhausted: {label} {used}/{max}"
+                                        )),
+                                        total_usage.clone(),
+                                    )?;
+                                    return Ok(total_usage);
+                                }
+                            }
+
                             let decision = {
                                 let engine = AuthorityEngine::new(
                                     &*self.capabilities,
@@ -396,6 +439,22 @@ impl<'a> TurnDriver<'a> {
                                     error: if is_error { Some("tool error".into()) } else { None },
                                 },
                             })?;
+                            // Bump the per-run counter after the EffectRecord
+                            // is durably appended. Only the two v1-budgeted
+                            // classes are tracked; Observe/Stage are free.
+                            if self.contract.is_some() {
+                                match effect_class {
+                                    EffectClass::ApplyLocal => {
+                                        self.effects_consumed.apply_local =
+                                            self.effects_consumed.apply_local.saturating_add(1);
+                                    }
+                                    EffectClass::ApplyRepo => {
+                                        self.effects_consumed.apply_repo =
+                                            self.effects_consumed.apply_repo.saturating_add(1);
+                                    }
+                                    _ => {}
+                                }
+                            }
                             self.writer.append(&SessionEvent::ToolResult {
                                 turn_id: turn_id.clone(),
                                 tool_use_id: id.clone(),

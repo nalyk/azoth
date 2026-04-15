@@ -80,6 +80,7 @@ async fn drive_with_validators<'a>(
     };
     let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalRequestMsg>(8);
     let mut caps = CapabilityStore::new();
+    let mut effects = azoth_core::schemas::EffectCounter::default();
 
     {
         let mut driver = TurnDriver {
@@ -94,6 +95,7 @@ async fn drive_with_validators<'a>(
             turns_completed: 0,
             kernel: None,
             validators,
+            effects_consumed: &mut effects,
         };
         driver
             .drive_turn(

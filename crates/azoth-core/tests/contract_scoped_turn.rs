@@ -84,6 +84,7 @@ async fn driver_honors_persisted_contract_round_trip() {
     };
     let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalRequestMsg>(8);
     let mut caps = CapabilityStore::new();
+    let mut effects = azoth_core::schemas::EffectCounter::default();
 
     {
         let mut driver = TurnDriver {
@@ -98,6 +99,7 @@ async fn driver_honors_persisted_contract_round_trip() {
             turns_completed: 0,
             kernel: None,
             validators: &[],
+            effects_consumed: &mut effects,
         };
         // The driver observes the contract via the new field — assert the
         // round-trip before we even drive.
@@ -155,6 +157,7 @@ async fn driver_aborts_when_contract_max_turns_reached() {
     };
     let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalRequestMsg>(8);
     let mut caps = CapabilityStore::new();
+    let mut effects = azoth_core::schemas::EffectCounter::default();
 
     {
         let mut driver = TurnDriver {
@@ -170,6 +173,7 @@ async fn driver_aborts_when_contract_max_turns_reached() {
             turns_completed: 1,
             kernel: None,
             validators: &[],
+            effects_consumed: &mut effects,
         };
         let usage = driver
             .drive_turn(turn_id.clone(), "system".into(), vec![Message::user_text("go")])

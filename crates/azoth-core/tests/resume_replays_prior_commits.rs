@@ -76,6 +76,7 @@ async fn drive_one_turn(
 
     let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalRequestMsg>(8);
     let mut caps = CapabilityStore::new();
+    let mut effects = azoth_core::schemas::EffectCounter::default();
     let mut driver = TurnDriver {
         run_id: run_id.clone(),
         adapter: &adapter,
@@ -88,6 +89,7 @@ async fn drive_one_turn(
         turns_completed: 0,
         kernel: None,
         validators: &[],
+        effects_consumed: &mut effects,
     };
 
     driver
