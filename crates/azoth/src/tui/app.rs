@@ -35,6 +35,7 @@ use azoth_core::schemas::{
 use azoth_core::tools::{FsWriteTool, RepoSearchTool};
 use azoth_core::turn::TurnDriver;
 
+use super::input::SlashCommand;
 use super::render;
 
 #[derive(Debug, Clone)]
@@ -52,6 +53,9 @@ pub struct AppState {
     pub should_quit: bool,
     pending_user_text: Option<String>,
     pub pending_approval: Option<ApprovalRequestMsg>,
+    pub run_id: String,
+    pub session_path: String,
+    pub committed_turns: u32,
 }
 
 impl AppState {
@@ -65,6 +69,60 @@ impl AppState {
             should_quit: false,
             pending_user_text: None,
             pending_approval: None,
+            run_id: String::new(),
+            session_path: String::new(),
+            committed_turns: 0,
+        }
+    }
+
+    fn handle_slash(&mut self, cmd: SlashCommand) {
+        match cmd {
+            SlashCommand::Help => {
+                self.transcript.push("· help".into());
+                self.transcript.push("  /help              show this list".into());
+                self.transcript.push("  /status            run_id, session path, turn count".into());
+                self.transcript.push("  /context           latest compiled context packet".into());
+                self.transcript.push("  /contract          (not yet wired)".into());
+                self.transcript.push("  /approve           (not yet wired)".into());
+                self.transcript.push("  /resume <run_id>   (restart required in v1)".into());
+                self.transcript.push("  /quit              exit".into());
+            }
+            SlashCommand::Status => {
+                self.transcript.push("· status".into());
+                self.transcript.push(format!("  run_id        {}", self.run_id));
+                self.transcript.push(format!("  session_path  {}", self.session_path));
+                self.transcript.push(format!(
+                    "  pending_appr  {}",
+                    if self.pending_approval.is_some() { "yes" } else { "no" }
+                ));
+                self.transcript.push(format!("  turns         {}", self.committed_turns));
+            }
+            SlashCommand::Context => {
+                self.transcript.push("· context: no packet compiled yet".into());
+            }
+            SlashCommand::Contract => {
+                self.transcript.push("! /contract not yet wired".into());
+            }
+            SlashCommand::Approve => {
+                self.transcript.push("! /approve not yet wired".into());
+            }
+            SlashCommand::Quit => {
+                self.should_quit = true;
+            }
+            SlashCommand::Resume(arg) => match arg {
+                Some(id) => {
+                    self.transcript.push(format!(
+                        "! /resume not yet supported at runtime, restart with: azoth resume {id}"
+                    ));
+                    self.should_quit = true;
+                }
+                None => {
+                    self.transcript.push("! usage: /resume <run_id>".into());
+                }
+            },
+            SlashCommand::Unknown(name) => {
+                self.transcript.push(format!("! unknown command: /{name}"));
+            }
         }
     }
 
@@ -116,7 +174,11 @@ impl AppState {
                 if !self.input_buffer.is_empty() {
                     let line = std::mem::take(&mut self.input_buffer);
                     self.transcript.push(format!("> {line}"));
-                    self.pending_user_text = Some(line);
+                    if let Some(cmd) = SlashCommand::parse(&line) {
+                        self.handle_slash(cmd);
+                    } else {
+                        self.pending_user_text = Some(line);
+                    }
                     self.dirty = true;
                 }
             }
@@ -186,6 +248,7 @@ impl AppState {
                     "· turn_committed {turn_id} {tag} in={} out={}",
                     usage.input_tokens, usage.output_tokens
                 ));
+                self.committed_turns = self.committed_turns.saturating_add(1);
             }
             SessionEvent::TurnAborted { turn_id, reason, detail, .. } => {
                 let d = detail.unwrap_or_default();
@@ -389,6 +452,8 @@ pub async fn run_app(resume: Option<String>) -> io::Result<()> {
     });
 
     let mut state = AppState::new();
+    state.run_id = run_id.to_string();
+    state.session_path = session_path.display().to_string();
     let banner = if resuming { "resumed" } else { "session" };
     state
         .transcript
