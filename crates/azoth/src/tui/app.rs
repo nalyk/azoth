@@ -531,6 +531,7 @@ pub async fn run_app(resume: Option<String>) -> io::Result<()> {
                 contract: active_contract.as_ref(),
                 turns_completed,
                 kernel: Some(&kernel),
+                validators: &[],
             };
 
             let result = driver

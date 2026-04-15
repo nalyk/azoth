@@ -87,6 +87,7 @@ async fn drive_one_turn(
         contract: None,
         turns_completed: 0,
         kernel: None,
+        validators: &[],
     };
 
     driver

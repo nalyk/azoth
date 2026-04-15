@@ -11,10 +11,11 @@ use crate::context::{ContextKernel, KernelError, StepInput};
 use crate::event_store::JsonlWriter;
 use crate::execution::{ExecutionContext, ToolDispatcher, ToolError};
 use crate::schemas::{
-    AbortReason, CommitOutcome, ContentBlock, Contract, EffectClass, EffectRecord, EffectRecordId,
-    Message, ModelTurnRequest, RequestMetadata, Role, RunId, SessionEvent, StopReason, StreamEvent,
-    ToolDefinition, TurnId, Usage,
+    AbortReason, CheckpointId, CommitOutcome, ContentBlock, Contract, EffectClass, EffectRecord,
+    EffectRecordId, Message, ModelTurnRequest, RequestMetadata, Role, RunId, SessionEvent,
+    StopReason, StreamEvent, ToolDefinition, TurnId, Usage, ValidatorStatus,
 };
+use crate::validators::Validator;
 use tokio::sync::oneshot;
 use thiserror::Error;
 use tokio::sync::mpsc;
@@ -59,6 +60,16 @@ pub struct TurnDriver<'a> {
     /// When either is `None`, behavior is byte-for-byte identical to the
     /// pre-kernel driver.
     pub kernel: Option<&'a ContextKernel<'a>>,
+    /// Deterministic turn-exit validators. Each is consulted on the
+    /// `EndTurn` / `StopSequence` branch immediately before `TurnCommitted`
+    /// is written. Every validator's report emits a `ValidatorResult` event.
+    /// If any validator returns `ValidatorStatus::Fail`, the driver writes
+    /// `TurnAborted { reason: ValidatorFail }` and does NOT write a
+    /// `Checkpoint` or `TurnCommitted`. If all pass, a fresh `Checkpoint`
+    /// event is appended before `TurnCommitted`. Behavior is byte-for-byte
+    /// identical to the pre-validators driver when this slice is empty
+    /// or when `contract` is `None` (validators need a contract to check).
+    pub validators: &'a [&'a dyn Validator],
 }
 
 impl<'a> TurnDriver<'a> {
@@ -408,6 +419,47 @@ impl<'a> TurnDriver<'a> {
                     continue;
                 }
                 StopReason::EndTurn | StopReason::StopSequence => {
+                    // Run validators + emit Checkpoint on the natural-exit
+                    // path, gated on `(contract.is_some(), !validators.is_empty())`
+                    // so turns without either keep the pre-validators byte
+                    // shape exactly.
+                    if let (Some(contract), false) =
+                        (self.contract, self.validators.is_empty())
+                    {
+                        let mut failed: Option<(String, Option<String>)> = None;
+                        for v in self.validators.iter() {
+                            let report = v.check(contract);
+                            let name = report.name.to_string();
+                            self.writer.append(&SessionEvent::ValidatorResult {
+                                turn_id: turn_id.clone(),
+                                validator: name.clone(),
+                                status: report.status,
+                                detail: report.detail.clone(),
+                            })?;
+                            if matches!(report.status, ValidatorStatus::Fail)
+                                && failed.is_none()
+                            {
+                                failed = Some((name, report.detail));
+                            }
+                        }
+                        if let Some((name, detail)) = failed {
+                            let msg = match detail {
+                                Some(d) => format!("{name}: {d}"),
+                                None => name,
+                            };
+                            self.record_abort(
+                                &turn_id,
+                                AbortReason::ValidatorFail,
+                                Some(msg),
+                                total_usage.clone(),
+                            )?;
+                            return Ok(total_usage);
+                        }
+                        self.writer.append(&SessionEvent::Checkpoint {
+                            turn_id: turn_id.clone(),
+                            checkpoint_id: CheckpointId::new(),
+                        })?;
+                    }
                     self.writer.append(&SessionEvent::TurnCommitted {
                         turn_id: turn_id.clone(),
                         outcome: CommitOutcome::Success,

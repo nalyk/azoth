@@ -87,6 +87,7 @@ async fn drive_one_turn(
             contract: Some(contract_ref),
             turns_completed: 0,
             kernel,
+            validators: &[],
         };
         driver
             .drive_turn(
@@ -222,6 +223,7 @@ async fn kernel_without_contract_is_a_noop() {
                 contract: None,
                 turns_completed: 0,
                 kernel,
+                validators: &[],
             };
             driver
                 .drive_turn(

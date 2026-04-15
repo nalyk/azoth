@@ -102,6 +102,7 @@ async fn drive_with_responder(
             contract: None,
             turns_completed: 0,
             kernel: None,
+            validators: &[],
         };
         let _ = driver
             .drive_turn(
