@@ -228,11 +228,39 @@ impl<'a> TurnDriver<'a> {
                 profile_id: self.adapter.profile().id.clone(),
             })?;
 
-            // Bounded sink for stream events — drained in-loop after invoke.
+            // Bounded sink for stream events. The driver must drain this
+            // concurrently with `invoke` — otherwise an adapter that emits
+            // more than 64 events (e.g. a long response) would deadlock at
+            // channel capacity. The drain branch also turns the bounded
+            // channel into useful backpressure: the adapter's `send().await`
+            // is immediately unblocked as we pull events here.
             let (tx, mut rx) = mpsc::channel::<StreamEvent>(64);
             let invoke_fut = self.adapter.invoke(req, tx);
+            tokio::pin!(invoke_fut);
 
-            let response = match invoke_fut.await {
+            let invoke_result = loop {
+                tokio::select! {
+                    biased;
+                    // Cancellation first so a mid-stream Ctrl+C is never
+                    // starved by a flood of deltas — matches the TUI's
+                    // top-level `biased` select discipline (MED-3 fix).
+                    _ = self.ctx.cancellation.wait_cancelled() => {
+                        self.writer.append(&SessionEvent::TurnInterrupted {
+                            turn_id: turn_id.clone(),
+                            reason: AbortReason::UserCancel,
+                            partial_usage: crate::schemas::UsageDelta {
+                                input_tokens: total_usage.input_tokens,
+                                output_tokens: total_usage.output_tokens,
+                            },
+                        })?;
+                        return Ok(total_usage);
+                    }
+                    res = &mut invoke_fut => break res,
+                    Some(_ev) = rx.recv() => { /* drain, continue */ }
+                }
+            };
+
+            let response = match invoke_result {
                 Ok(r) => r,
                 Err(e) => {
                     self.record_abort(
@@ -245,9 +273,7 @@ impl<'a> TurnDriver<'a> {
                 }
             };
 
-            // Drain any remaining stream events. In v1 the adapter emits
-            // them synthetically inside `invoke`, so by the time we get here
-            // the channel is already closed by the sender going out of scope.
+            // Drain any stream events still queued after invoke returns.
             while let Ok(_ev) = rx.try_recv() {}
 
             total_usage.input_tokens = total_usage.input_tokens.saturating_add(response.usage.input_tokens);

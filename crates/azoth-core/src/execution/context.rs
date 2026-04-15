@@ -4,10 +4,21 @@ use crate::artifacts::ArtifactStore;
 use crate::schemas::{RunId, TurnId};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use tokio::sync::Notify;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct CancellationToken {
     flag: Arc<AtomicBool>,
+    notify: Arc<Notify>,
+}
+
+impl Default for CancellationToken {
+    fn default() -> Self {
+        Self {
+            flag: Arc::new(AtomicBool::new(false)),
+            notify: Arc::new(Notify::new()),
+        }
+    }
 }
 
 impl CancellationToken {
@@ -17,10 +28,30 @@ impl CancellationToken {
 
     pub fn cancel(&self) {
         self.flag.store(true, Ordering::SeqCst);
+        self.notify.notify_waiters();
     }
 
     pub fn is_cancelled(&self) -> bool {
         self.flag.load(Ordering::SeqCst)
+    }
+
+    /// Resolves as soon as `cancel` has been or is called. Safe against the
+    /// register-then-check race: we create the `Notified` future (which
+    /// registers interest) *before* the final atomic check, so any cancel
+    /// after that point is guaranteed to wake the waiter.
+    pub async fn wait_cancelled(&self) {
+        loop {
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.is_cancelled() {
+                return;
+            }
+            notified.await;
+            if self.is_cancelled() {
+                return;
+            }
+        }
     }
 }
 
