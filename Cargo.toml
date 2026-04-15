@@ -65,6 +65,7 @@ grep-matcher = "0.1"
 # Test utils
 tempfile = "3"
 pretty_assertions = "1"
+wiremock = "0.6"
 
 [profile.release]
 lto = "thin"
