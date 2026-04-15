@@ -14,7 +14,7 @@ pub use error::{AdapterError, TokenCount};
 pub use profile::{ProviderProfile, TokenizerFamily, ToolUseShape};
 pub use anthropic_messages::AnthropicMessagesAdapter;
 pub use openai_chat_completions::OpenAiChatCompletionsAdapter;
-pub use mock::MockAdapter;
+pub use mock::{MockAdapter, MockScript};
 
 use crate::schemas::{ModelTurnRequest, ModelTurnResponse, StreamEvent};
 use async_trait::async_trait;

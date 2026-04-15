@@ -21,6 +21,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
+use tokio::sync::mpsc::UnboundedSender;
 
 #[derive(Debug, Error)]
 pub enum ProjectionError {
@@ -39,6 +40,7 @@ pub enum ProjectionError {
 pub struct JsonlWriter {
     path: PathBuf,
     file: BufWriter<File>,
+    tap: Option<UnboundedSender<SessionEvent>>,
 }
 
 impl JsonlWriter {
@@ -51,11 +53,19 @@ impl JsonlWriter {
         Ok(Self {
             path,
             file: BufWriter::new(file),
+            tap: None,
         })
     }
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Attach an out-of-band listener that observes every appended event
+    /// after the line has been durably flushed to disk. Used by the TUI to
+    /// stream session events into the scrollback without reparsing the file.
+    pub fn set_tap(&mut self, tap: UnboundedSender<SessionEvent>) {
+        self.tap = Some(tap);
     }
 
     pub fn append(&mut self, event: &SessionEvent) -> io::Result<()> {
@@ -64,6 +74,9 @@ impl JsonlWriter {
         self.file.write_all(b"\n")?;
         self.file.flush()?;
         self.file.get_ref().sync_data()?;
+        if let Some(tap) = &self.tap {
+            let _ = tap.send(event.clone());
+        }
         Ok(())
     }
 }
