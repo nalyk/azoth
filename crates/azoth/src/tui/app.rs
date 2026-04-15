@@ -34,6 +34,7 @@ use azoth_core::schemas::{
 };
 use azoth_core::tools::{FsWriteTool, RepoSearchTool};
 use azoth_core::turn::TurnDriver;
+use azoth_core::validators::{ContractGoalValidator, Validator};
 
 use super::input::SlashCommand;
 use super::render;
@@ -464,6 +465,14 @@ pub async fn run_app(resume: Option<String>) -> io::Result<()> {
             max_input_tokens: 0,
         };
 
+        // Default validator set. The driver's EndTurn gate short-circuits
+        // when `contract` is None, so this slice is inert on contract-less
+        // runs — byte shape stays identical to pre-validators. When a
+        // contract is active, `ContractGoalValidator` emits one
+        // `ValidatorResult` per turn and gates the `Checkpoint`.
+        let goal_validator = ContractGoalValidator;
+        let validators: &[&dyn Validator] = &[&goal_validator];
+
         // Stash the last accepted contract from JSONL on startup/resume.
         // The writer tap replays ContractAccepted into the UI, but the
         // driver needs its own handle — the tap is one-way and never
@@ -531,7 +540,7 @@ pub async fn run_app(resume: Option<String>) -> io::Result<()> {
                 contract: active_contract.as_ref(),
                 turns_completed,
                 kernel: Some(&kernel),
-                validators: &[],
+                validators,
             };
 
             let result = driver
