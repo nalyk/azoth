@@ -215,6 +215,19 @@ impl JsonlReader {
             .collect())
     }
 
+    /// The most recently accepted contract, rehydrated from the last
+    /// `ContractAccepted` event in the log. Returns `Ok(None)` if the session
+    /// has never persisted one.
+    pub fn last_accepted_contract(
+        &self,
+    ) -> Result<Option<crate::schemas::Contract>, ProjectionError> {
+        let scan = self.scan()?;
+        Ok(scan.events.into_iter().rev().find_map(|ev| match ev {
+            SessionEvent::ContractAccepted { contract, .. } => Some(contract),
+            _ => None,
+        }))
+    }
+
     /// Crash recovery: scan for turns with no terminal marker and append a
     /// synthetic `turn_interrupted { reason: "crash" }` record for each. Idempotent.
     pub fn recover_dangling_turns(&self) -> Result<Vec<TurnId>, ProjectionError> {

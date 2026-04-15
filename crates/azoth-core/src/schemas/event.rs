@@ -3,8 +3,8 @@
 
 use super::{
     ApprovalId, ArtifactId, CallGroupId, CapabilityTokenId, CheckpointId, ContentBlock,
-    ContextPacketId, ContractId, EffectClass, EffectRecord, RunId, SandboxTier, ToolUseId, TurnId,
-    Usage, UsageDelta,
+    ContextPacketId, Contract, ContractId, EffectClass, EffectRecord, RunId, SandboxTier,
+    ToolUseId, TurnId, Usage, UsageDelta,
 };
 use serde::{Deserialize, Serialize};
 
@@ -35,6 +35,14 @@ pub enum SessionEvent {
     RunStarted {
         run_id: RunId,
         contract_id: ContractId,
+        timestamp: String,
+    },
+    /// An accepted (lint-clean) contract snapshot, persisted so a resuming
+    /// session can rehydrate the full object — not just its id. Multiple
+    /// `ContractAccepted` events may appear over a session's lifetime; the
+    /// reader treats the last one as authoritative.
+    ContractAccepted {
+        contract: Contract,
         timestamp: String,
     },
     TurnStarted {
@@ -131,7 +139,7 @@ impl SessionEvent {
     pub fn turn_id(&self) -> Option<&TurnId> {
         use SessionEvent::*;
         match self {
-            RunStarted { .. } => None,
+            RunStarted { .. } | ContractAccepted { .. } => None,
             TurnStarted { turn_id, .. }
             | ContextPacket { turn_id, .. }
             | ModelRequest { turn_id, .. }
