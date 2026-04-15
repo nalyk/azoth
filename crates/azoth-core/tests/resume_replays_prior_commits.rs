@@ -84,6 +84,8 @@ async fn drive_one_turn(
         ctx: &ctx,
         capabilities: &mut caps,
         approval_bridge: approval_tx,
+        contract: None,
+        turns_completed: 0,
     };
 
     driver

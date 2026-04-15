@@ -99,6 +99,8 @@ async fn drive_with_responder(
             ctx: &ctx,
             capabilities: &mut caps,
             approval_bridge: atx,
+            contract: None,
+            turns_completed: 0,
         };
         let _ = driver
             .drive_turn(

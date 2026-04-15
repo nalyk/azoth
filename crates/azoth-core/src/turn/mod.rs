@@ -10,8 +10,8 @@ use crate::authority::{
 use crate::event_store::JsonlWriter;
 use crate::execution::{ExecutionContext, ToolDispatcher, ToolError};
 use crate::schemas::{
-    AbortReason, CommitOutcome, ContentBlock, EffectClass, EffectRecord, EffectRecordId, Message,
-    ModelTurnRequest, RequestMetadata, Role, RunId, SessionEvent, StopReason, StreamEvent,
+    AbortReason, CommitOutcome, ContentBlock, Contract, EffectClass, EffectRecord, EffectRecordId,
+    Message, ModelTurnRequest, RequestMetadata, Role, RunId, SessionEvent, StopReason, StreamEvent,
     ToolDefinition, TurnId, Usage,
 };
 use tokio::sync::oneshot;
@@ -38,6 +38,15 @@ pub struct TurnDriver<'a> {
     pub ctx: &'a ExecutionContext,
     pub capabilities: &'a mut CapabilityStore,
     pub approval_bridge: mpsc::Sender<ApprovalRequestMsg>,
+    /// Persisted run contract, if one has been accepted. When `Some`, the
+    /// driver enforces `scope.max_turns` as an abort guard at the start of
+    /// every `drive_turn` call. When `None`, behavior is byte-for-byte
+    /// identical to the pre-contract driver.
+    pub contract: Option<&'a Contract>,
+    /// Count of turns already committed in this session prior to this call.
+    /// The caller owns this counter and increments it after a successful
+    /// `drive_turn`; the driver compares it against `contract.scope.max_turns`.
+    pub turns_completed: u32,
 }
 
 impl<'a> TurnDriver<'a> {
@@ -66,6 +75,31 @@ impl<'a> TurnDriver<'a> {
         system: String,
         mut messages: Vec<Message>,
     ) -> Result<Usage, TurnError> {
+        // Contract-scoped guard: refuse to even open the turn if the
+        // persisted contract has set a max_turns and we are at/over it.
+        if let Some(c) = self.contract {
+            if let Some(max) = c.scope.max_turns {
+                if self.turns_completed >= max {
+                    self.writer.append(&SessionEvent::TurnStarted {
+                        turn_id: turn_id.clone(),
+                        run_id: self.run_id.clone(),
+                        parent_turn: None,
+                        timestamp: now_iso(),
+                    })?;
+                    self.record_abort(
+                        &turn_id,
+                        AbortReason::TokenBudget,
+                        Some(format!(
+                            "contract max_turns {} reached (completed={})",
+                            max, self.turns_completed
+                        )),
+                        Usage::default(),
+                    )?;
+                    return Ok(Usage::default());
+                }
+            }
+        }
+
         self.writer.append(&SessionEvent::TurnStarted {
             turn_id: turn_id.clone(),
             run_id: self.run_id.clone(),

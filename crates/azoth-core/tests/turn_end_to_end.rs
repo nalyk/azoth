@@ -87,6 +87,8 @@ async fn tui_worker_pipeline_drives_full_turn_sequence() {
             ctx: &ctx,
             capabilities: &mut caps,
             approval_bridge: approval_tx,
+            contract: None,
+            turns_completed: 0,
         };
         let usage = driver
             .drive_turn(

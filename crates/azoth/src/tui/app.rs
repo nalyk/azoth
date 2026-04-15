@@ -454,6 +454,17 @@ pub async fn run_app(resume: Option<String>) -> io::Result<()> {
         let mut history: Vec<Message> = Vec::new();
         let mut caps = CapabilityStore::new();
 
+        // Stash the last accepted contract from JSONL on startup/resume.
+        // The writer tap replays ContractAccepted into the UI, but the
+        // driver needs its own handle — the tap is one-way and never
+        // loops back into the worker.
+        let mut active_contract: Option<Contract> =
+            JsonlReader::open(&worker_session_path)
+                .last_accepted_contract()
+                .ok()
+                .flatten();
+        let mut turns_completed: u32 = 0;
+
         loop {
             let user_text = tokio::select! {
                 biased;
@@ -462,12 +473,20 @@ pub async fn run_app(resume: Option<String>) -> io::Result<()> {
                     let ts = time::OffsetDateTime::now_utc()
                         .format(&time::format_description::well_known::Rfc3339)
                         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string());
-                    if let Err(e) = azoth_core::contract::accept_and_persist(
+                    match azoth_core::contract::accept_and_persist(
                         &mut writer, contract, ts,
                     ) {
-                        let _ = worker_error_tx
-                            .send(format!("contract accept failed: {e}"))
-                            .await;
+                        Ok(accepted) => {
+                            // Refresh the worker-side handle inline. The tap
+                            // already fired ContractAccepted to the UI, but
+                            // the driver reads from this local stash.
+                            active_contract = Some(accepted);
+                        }
+                        Err(e) => {
+                            let _ = worker_error_tx
+                                .send(format!("contract accept failed: {e}"))
+                                .await;
+                        }
                     }
                     continue;
                 }
@@ -499,6 +518,8 @@ pub async fn run_app(resume: Option<String>) -> io::Result<()> {
                 ctx: &ctx,
                 capabilities: &mut caps,
                 approval_bridge: approval_req_tx.clone(),
+                contract: active_contract.as_ref(),
+                turns_completed,
             };
 
             let result = driver
@@ -509,8 +530,11 @@ pub async fn run_app(resume: Option<String>) -> io::Result<()> {
                 )
                 .await;
 
-            if let Err(e) = result {
-                let _ = worker_error_tx.send(format!("turn error: {e}")).await;
+            match result {
+                Ok(_) => turns_completed = turns_completed.saturating_add(1),
+                Err(e) => {
+                    let _ = worker_error_tx.send(format!("turn error: {e}")).await;
+                }
             }
         }
     });
