@@ -477,17 +477,16 @@ pub async fn run_app(resume: Option<String>) -> io::Result<()> {
         // The writer tap replays ContractAccepted into the UI, but the
         // driver needs its own handle — the tap is one-way and never
         // loops back into the worker.
+        let resume_reader = JsonlReader::open(&worker_session_path);
         let mut active_contract: Option<Contract> =
-            JsonlReader::open(&worker_session_path)
-                .last_accepted_contract()
-                .ok()
-                .flatten();
-        let mut turns_completed: u32 = 0;
-        // Per-run effect tally, compared against `contract.effect_budget`
-        // inside the driver. Reset to zero at worker start (matches the
-        // current `turns_completed` reset on resume; recomputing from
-        // JSONL is a follow-up).
-        let mut effects_consumed = azoth_core::schemas::EffectCounter::default();
+            resume_reader.last_accepted_contract().ok().flatten();
+        // Rehydrate `turns_completed` and the per-class effect tally from the
+        // replayable projection so the contract's `max_turns` / `effect_budget`
+        // gates resume exactly where the prior session left off. Any read
+        // failure falls back to a clean slate — matching the writer's
+        // tolerance of a missing / fresh log.
+        let (mut effects_consumed, mut turns_completed) =
+            resume_reader.committed_run_progress().unwrap_or_default();
 
         loop {
             let user_text = tokio::select! {

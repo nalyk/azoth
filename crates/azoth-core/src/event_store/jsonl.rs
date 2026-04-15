@@ -15,7 +15,7 @@
 //! synthetic `turn_interrupted { reason: "crash" }` record.
 
 use crate::event_store::sqlite::SqliteMirror;
-use crate::schemas::{AbortReason, SessionEvent, TurnId};
+use crate::schemas::{AbortReason, EffectClass, EffectCounter, SessionEvent, TurnId};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
@@ -226,6 +226,40 @@ impl JsonlReader {
             SessionEvent::ContractAccepted { contract, .. } => Some(contract),
             _ => None,
         }))
+    }
+
+    /// Recompute `(EffectCounter, turns_completed)` from the replayable
+    /// projection so a resuming worker can seed the contract gates exactly
+    /// as if it had been the one driving the prior turns. Effects inside
+    /// aborted or interrupted turns are excluded — the live path bumps the
+    /// counter only after `EffectRecord` is durably appended and the turn
+    /// goes on to commit, so replay must match that accounting.
+    ///
+    /// `network_reads` stays zero: the live driver doesn't bump it either
+    /// (no v1 tool currently maps to it); recomputing it from JSONL must
+    /// not drift from the runtime path.
+    pub fn committed_run_progress(&self) -> Result<(EffectCounter, u32), ProjectionError> {
+        let replay = self.replayable()?;
+        let mut effects = EffectCounter::default();
+        let mut turns_completed: u32 = 0;
+        for ReplayableEvent(ev) in &replay {
+            match ev {
+                SessionEvent::EffectRecord { effect, .. } => match effect.class {
+                    EffectClass::ApplyLocal => {
+                        effects.apply_local = effects.apply_local.saturating_add(1);
+                    }
+                    EffectClass::ApplyRepo => {
+                        effects.apply_repo = effects.apply_repo.saturating_add(1);
+                    }
+                    _ => {}
+                },
+                SessionEvent::TurnCommitted { .. } => {
+                    turns_completed = turns_completed.saturating_add(1);
+                }
+                _ => {}
+            }
+        }
+        Ok((effects, turns_completed))
     }
 
     /// Crash recovery: scan for turns with no terminal marker and append a

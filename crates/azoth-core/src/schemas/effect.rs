@@ -53,8 +53,9 @@ impl EffectClass {
 /// Per-run tally of effects consumed, indexed by effect class. Owned by the
 /// TUI worker (or a test harness) across turns so the `TurnDriver` can short-
 /// circuit a tool call when the contract's `EffectBudget` for that class
-/// would be exceeded. Defaulted to zero at worker start; resume-time
-/// recomputation from JSONL is a follow-up.
+/// would be exceeded. On resume the worker recomputes this from the
+/// replayable JSONL projection (see
+/// [`JsonlReader::committed_run_progress`]); fresh sessions start at zero.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct EffectCounter {
     pub apply_local: u32,
