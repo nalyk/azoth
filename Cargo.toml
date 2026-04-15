@@ -55,6 +55,12 @@ rustix = { version = "0.38", features = ["process", "fs", "mount"] }
 # Tokenizer
 tiktoken-rs = "0.6"
 
+# Retrieval (in-process ripgrep stack)
+ignore = "0.4"
+grep-searcher = "0.1"
+grep-regex = "0.1"
+grep-matcher = "0.1"
+
 # Test utils
 tempfile = "3"
 pretty_assertions = "1"

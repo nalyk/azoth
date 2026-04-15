@@ -22,6 +22,10 @@ time = { workspace = true }
 reqwest = { workspace = true }
 bytes = { workspace = true }
 tiktoken-rs = { workspace = true }
+ignore = { workspace = true }
+grep-searcher = { workspace = true }
+grep-regex = { workspace = true }
+grep-matcher = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = { workspace = true }
