@@ -14,6 +14,11 @@ struct Cli {
 enum Command {
     /// Launch the interactive TUI (default).
     Tui,
+    /// Resume a prior session by `run_id` from `.azoth/sessions/<run_id>.jsonl`.
+    Resume {
+        /// The `run_id` of the session file to reopen.
+        run_id: String,
+    },
     /// Dump version + build info.
     Version,
 }
@@ -29,23 +34,27 @@ fn main() {
 
     let cli = Cli::parse();
     match cli.command.unwrap_or(Command::Tui) {
-        Command::Tui => {
-            #[cfg(feature = "tui")]
-            {
-                if let Err(e) = tui::run() {
-                    eprintln!("tui error: {e}");
-                    std::process::exit(1);
-                }
-            }
-            #[cfg(not(feature = "tui"))]
-            {
-                eprintln!("this build was compiled without the `tui` feature");
-                std::process::exit(2);
-            }
-        }
+        Command::Tui => run_tui(None),
+        Command::Resume { run_id } => run_tui(Some(run_id)),
         Command::Version => {
             println!("azoth {}", env!("CARGO_PKG_VERSION"));
         }
+    }
+}
+
+fn run_tui(resume: Option<String>) {
+    #[cfg(feature = "tui")]
+    {
+        if let Err(e) = tui::run(resume) {
+            eprintln!("tui error: {e}");
+            std::process::exit(1);
+        }
+    }
+    #[cfg(not(feature = "tui"))]
+    {
+        let _ = resume;
+        eprintln!("this build was compiled without the `tui` feature");
+        std::process::exit(2);
     }
 }
 

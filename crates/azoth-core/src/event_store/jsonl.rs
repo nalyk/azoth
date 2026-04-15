@@ -57,6 +57,24 @@ impl JsonlWriter {
         })
     }
 
+    /// Open an existing session file for resume. Errors with `NotFound` if
+    /// the file does not exist. Runs `recover_dangling_turns` exactly once
+    /// before handing back a writer positioned at EOF — idempotent on a
+    /// fully-recovered file.
+    pub fn open_existing<P: AsRef<Path>>(path: P) -> io::Result<Self> {
+        let path = path.as_ref();
+        if !path.exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("session file not found: {}", path.display()),
+            ));
+        }
+        JsonlReader::open(path)
+            .recover_dangling_turns()
+            .map_err(io::Error::other)?;
+        Self::open(path)
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -378,5 +396,57 @@ mod tests {
             &f.event,
             SessionEvent::TurnInterrupted { reason: AbortReason::Crash, .. }
         )));
+    }
+
+    #[test]
+    fn open_existing_runs_recovery_once_then_idempotent() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let mut w = JsonlWriter::open(&path).unwrap();
+
+        let run_id = RunId::from("run_resume".to_string());
+        let contract_id = ContractId::from("ctr_resume".to_string());
+        let t1 = TurnId::from("t_dangling".to_string());
+        w.append(&SessionEvent::RunStarted {
+            run_id: run_id.clone(),
+            contract_id,
+            timestamp: ts(),
+        })
+        .unwrap();
+        w.append(&SessionEvent::TurnStarted {
+            turn_id: t1,
+            run_id,
+            parent_turn: None,
+            timestamp: ts(),
+        })
+        .unwrap();
+        drop(w);
+
+        // Missing-file path: surfaces NotFound.
+        let missing = dir.path().join("nope.jsonl");
+        let err = JsonlWriter::open_existing(&missing).err().unwrap();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+
+        // First open_existing: recovery appends exactly one TurnInterrupted.
+        let w1 = JsonlWriter::open_existing(&path).unwrap();
+        drop(w1);
+        let count_after_first = JsonlReader::open(&path)
+            .forensic()
+            .unwrap()
+            .iter()
+            .filter(|f| matches!(&f.event, SessionEvent::TurnInterrupted { .. }))
+            .count();
+        assert_eq!(count_after_first, 1);
+
+        // Second open_existing on the recovered file: still exactly one.
+        let w2 = JsonlWriter::open_existing(&path).unwrap();
+        drop(w2);
+        let count_after_second = JsonlReader::open(&path)
+            .forensic()
+            .unwrap()
+            .iter()
+            .filter(|f| matches!(&f.event, SessionEvent::TurnInterrupted { .. }))
+            .count();
+        assert_eq!(count_after_second, 1);
     }
 }

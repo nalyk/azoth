@@ -26,7 +26,7 @@ use azoth_core::artifacts::ArtifactStore;
 use azoth_core::authority::{
     ApprovalRequestMsg, ApprovalResponse, CapabilityStore,
 };
-use azoth_core::event_store::JsonlWriter;
+use azoth_core::event_store::{JsonlReader, JsonlWriter};
 use azoth_core::execution::{CancellationToken, ExecutionContext, ToolDispatcher};
 use azoth_core::schemas::{
     ApprovalScope, CommitOutcome, ContentBlock, Message, ModelTurnResponse, RunId, SessionEvent,
@@ -243,7 +243,7 @@ fn scripted_fs_write(query: &str) -> MockScript {
     }
 }
 
-pub async fn run_app() -> io::Result<()> {
+pub async fn run_app(resume: Option<String>) -> io::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     stdout.execute(EnterAlternateScreen)?;
@@ -277,7 +277,11 @@ pub async fn run_app() -> io::Result<()> {
     // Worker task: owns adapter/dispatcher/writer/ctx, runs one TurnDriver
     // per user input, and streams SessionEvents out through the writer tap.
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let run_id = RunId::new();
+    let resuming = resume.is_some();
+    let run_id = match resume {
+        Some(s) => RunId::from(s),
+        None => RunId::new(),
+    };
     let session_path = cwd.join(".azoth").join("sessions").join(format!("{run_id}.jsonl"));
     let artifacts_root = cwd.join(".azoth").join("artifacts");
 
@@ -289,16 +293,41 @@ pub async fn run_app() -> io::Result<()> {
     let worker_artifacts_root = artifacts_root.clone();
 
     tokio::spawn(async move {
-        // Build long-lived subsystems once.
-        let mut writer = match JsonlWriter::open(&worker_session_path) {
+        // Build long-lived subsystems once. On resume we open the existing
+        // file (running idempotent crash recovery first), then hydrate the
+        // scrollback from the replayable projection *before* attaching the
+        // tap — historical events flow through the same UI sink as live
+        // ones, but the tap stays clean for new turns only.
+        let writer_result = if resuming {
+            JsonlWriter::open_existing(&worker_session_path)
+        } else {
+            JsonlWriter::open(&worker_session_path)
+        };
+        let mut writer = match writer_result {
             Ok(w) => w,
             Err(e) => {
+                let verb = if resuming { "resume" } else { "open" };
                 let _ = worker_error_tx
-                    .send(format!("open jsonl writer failed: {e}"))
+                    .send(format!("{verb} jsonl writer failed: {e}"))
                     .await;
                 return;
             }
         };
+        if resuming {
+            match JsonlReader::open(&worker_session_path).replayable() {
+                Ok(events) => {
+                    for ev in events {
+                        let _ = worker_session_tx.send(ev.0);
+                    }
+                }
+                Err(e) => {
+                    let _ = worker_error_tx
+                        .send(format!("hydrate replayable failed: {e}"))
+                        .await;
+                    return;
+                }
+            }
+        }
         writer.set_tap(worker_session_tx.clone());
 
         let artifacts = match ArtifactStore::open(&worker_artifacts_root) {
@@ -360,9 +389,10 @@ pub async fn run_app() -> io::Result<()> {
     });
 
     let mut state = AppState::new();
+    let banner = if resuming { "resumed" } else { "session" };
     state
         .transcript
-        .push(format!("· session {}", session_path.display()));
+        .push(format!("· {banner} {}", session_path.display()));
     let mut ticker = tokio::time::interval(std::time::Duration::from_millis(200));
 
     loop {
