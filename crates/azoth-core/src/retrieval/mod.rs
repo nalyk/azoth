@@ -2,8 +2,8 @@
 //! graph is a trait-only stub so v2 can land without touching signatures.
 
 use async_trait::async_trait;
-use thiserror::Error;
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum RetrievalError {
@@ -153,7 +153,7 @@ impl<'a> grep_searcher::Sink for Collector<'a> {
         let line_num = m.line_number().unwrap_or(0) as usize;
         let text = std::str::from_utf8(m.bytes()).unwrap_or("");
         let snippet: String = text
-            .trim_end_matches(|c| c == '\n' || c == '\r')
+            .trim_end_matches(['\n', '\r'])
             .trim()
             .chars()
             .take(200)
@@ -185,11 +185,7 @@ mod tests {
             "fn main() {}\nlet needle = 1;\nprintln!(\"bye\");\n",
         )
         .unwrap();
-        std::fs::write(
-            root.join("bar.md"),
-            "# title\n\nsome needle in markdown\n",
-        )
-        .unwrap();
+        std::fs::write(root.join("bar.md"), "# title\n\nsome needle in markdown\n").unwrap();
         std::fs::write(root.join("ignored.log"), "needle in junk\n").unwrap();
         (td, root)
     }

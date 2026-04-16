@@ -32,9 +32,15 @@ impl MockAdapter {
             profile,
             MockScript {
                 turns: vec![ModelTurnResponse {
-                    content: vec![ContentBlock::Text { text: "hello from mock".into() }],
+                    content: vec![ContentBlock::Text {
+                        text: "hello from mock".into(),
+                    }],
                     stop_reason: StopReason::EndTurn,
-                    usage: Usage { input_tokens: 1, output_tokens: 4, ..Default::default() },
+                    usage: Usage {
+                        input_tokens: 1,
+                        output_tokens: 4,
+                        ..Default::default()
+                    },
                 }],
             },
         )

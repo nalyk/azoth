@@ -80,8 +80,8 @@ impl OverlayWorkspace {
     /// temp directory. Returns a handle whose `merged` field is the path
     /// tools should use as their working directory.
     pub fn mount(lower: &Path) -> Result<Self, SandboxError> {
-        let tmpdir = tempfile::tempdir()
-            .map_err(|e| SandboxError::Syscall(format!("tmpdir: {e}")))?;
+        let tmpdir =
+            tempfile::tempdir().map_err(|e| SandboxError::Syscall(format!("tmpdir: {e}")))?;
         let upper = tmpdir.path().join("upper");
         let work = tmpdir.path().join("work");
         let merged = tmpdir.path().join("merged");
@@ -103,9 +103,11 @@ impl OverlayWorkspace {
             ))
             .arg(&merged)
             .status()
-            .map_err(|e| SandboxError::MissingDependency(
-                Box::leak(format!("fuse-overlayfs: {e}").into_boxed_str()),
-            ))?;
+            .map_err(|e| {
+                SandboxError::MissingDependency(Box::leak(
+                    format!("fuse-overlayfs: {e}").into_boxed_str(),
+                ))
+            })?;
 
         if !status.success() {
             return Err(SandboxError::Syscall(format!(
@@ -154,11 +156,7 @@ impl OverlayWorkspace {
 }
 
 #[cfg(target_os = "linux")]
-fn collect_files(
-    root: &Path,
-    dir: &Path,
-    out: &mut Vec<PathBuf>,
-) -> std::io::Result<()> {
+fn collect_files(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
     if !dir.is_dir() {
         return Ok(());
     }

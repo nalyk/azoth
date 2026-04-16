@@ -2,7 +2,7 @@
 
 use super::tokenizer::{count_tokens, TokenizerFamily};
 use crate::schemas::{
-    CheckpointSummary, ConstitutionLane, Contract, ContextPacket, ContextPacketId, EvidenceItem,
+    CheckpointSummary, ConstitutionLane, ContextPacket, ContextPacketId, Contract, EvidenceItem,
     ExitCriteria, TurnId, WorkingSetItem,
 };
 use sha2::{Digest, Sha256};

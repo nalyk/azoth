@@ -33,5 +33,5 @@ fn count_with_tiktoken(text: &str, model: &str) -> usize {
 }
 
 fn approx_chars_div_four(text: &str) -> usize {
-    (text.chars().count() + 3) / 4
+    text.chars().count().div_ceil(4)
 }

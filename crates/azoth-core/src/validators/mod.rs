@@ -28,6 +28,10 @@ impl Validator for ContractGoalValidator {
         } else {
             (ValidatorStatus::Pass, None)
         };
-        ValidatorReport { name: self.name(), status, detail }
+        ValidatorReport {
+            name: self.name(),
+            status,
+            detail,
+        }
     }
 }

@@ -32,11 +32,8 @@ use async_trait::async_trait;
 /// over-budget packet loudly, so collectors should respect `limit`.
 #[async_trait]
 pub trait EvidenceCollector: Send + Sync {
-    async fn collect(
-        &self,
-        query: &str,
-        limit: usize,
-    ) -> Result<Vec<EvidenceItem>, RetrievalError>;
+    async fn collect(&self, query: &str, limit: usize)
+        -> Result<Vec<EvidenceItem>, RetrievalError>;
 }
 
 /// `LexicalRetrieval`-backed collector. Maps each `Span` to an
@@ -173,9 +170,7 @@ mod tests {
         // real ripgrep impl clamps, but the trait doesn't forbid it),
         // every item still keeps a non-zero weight distinct from the
         // EvidenceItem default.
-        let spans: Vec<Span> = (0..4)
-            .map(|i| span("x.rs", i + 1, "s"))
-            .collect();
+        let spans: Vec<Span> = (0..4).map(|i| span("x.rs", i + 1, "s")).collect();
         let fake = Arc::new(FakeLexical { spans });
         let c = LexicalEvidenceCollector::new(fake);
         let out = c.collect("q", 2).await.unwrap();

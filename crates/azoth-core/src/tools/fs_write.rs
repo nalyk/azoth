@@ -98,9 +98,7 @@ mod tests {
     use super::*;
     use crate::artifacts::ArtifactStore;
     use crate::authority::Tainted;
-    use crate::execution::{
-        dispatch_tool, CancellationToken, ExecutionContext, ToolDispatcher,
-    };
+    use crate::execution::{dispatch_tool, CancellationToken, ExecutionContext, ToolDispatcher};
     use crate::schemas::{RunId, TurnId};
     use tempfile::tempdir;
 

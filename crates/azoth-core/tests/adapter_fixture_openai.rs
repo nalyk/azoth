@@ -91,7 +91,10 @@ async fn happy_path_parses_text_only_fixture() {
     while sink_rx.try_recv().is_ok() {
         saw_any = true;
     }
-    assert!(saw_any, "sink should have received at least one StreamEvent");
+    assert!(
+        saw_any,
+        "sink should have received at least one StreamEvent"
+    );
 }
 
 #[tokio::test]
@@ -188,9 +191,11 @@ async fn non_200_status_maps_to_adapter_error() {
 
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
-        .respond_with(ResponseTemplate::new(401).set_body_string(
-            "{\"error\":{\"type\":\"invalid_api_key\",\"message\":\"bad key\"}}",
-        ))
+        .respond_with(
+            ResponseTemplate::new(401).set_body_string(
+                "{\"error\":{\"type\":\"invalid_api_key\",\"message\":\"bad key\"}}",
+            ),
+        )
         .expect(1)
         .mount(&server)
         .await;

@@ -205,8 +205,7 @@ async fn handle_frame(
                         .and_then(Value::as_str)
                         .unwrap_or("")
                         .to_string();
-                    if let Some(BlockSlot::ToolUse { partial_json, .. }) = builder.slot_mut(index)
-                    {
+                    if let Some(BlockSlot::ToolUse { partial_json, .. }) = builder.slot_mut(index) {
                         partial_json.push_str(&partial);
                     }
                     let _ = sink
@@ -251,9 +250,7 @@ async fn handle_frame(
                     Value::Object(Map::new())
                 } else {
                     serde_json::from_str::<Value>(partial_json).map_err(|e| {
-                        AdapterError::invalid_request(format!(
-                            "tool_use input json invalid: {e}"
-                        ))
+                        AdapterError::invalid_request(format!("tool_use input json invalid: {e}"))
                     })?
                 };
                 *input = Some(parsed);
@@ -440,12 +437,9 @@ mod tests {
         (result, events)
     }
 
-    const TEXT_ONLY: &[u8] =
-        include_bytes!("../../tests/fixtures/anthropic/text_only.sse");
-    const TOOL_USE: &[u8] =
-        include_bytes!("../../tests/fixtures/anthropic/tool_use.sse");
-    const ERROR_FRAME: &[u8] =
-        include_bytes!("../../tests/fixtures/anthropic/error.sse");
+    const TEXT_ONLY: &[u8] = include_bytes!("../../tests/fixtures/anthropic/text_only.sse");
+    const TOOL_USE: &[u8] = include_bytes!("../../tests/fixtures/anthropic/tool_use.sse");
+    const ERROR_FRAME: &[u8] = include_bytes!("../../tests/fixtures/anthropic/error.sse");
 
     #[tokio::test]
     async fn parses_text_only_stream() {
@@ -478,7 +472,9 @@ mod tests {
         assert_eq!(resp.usage.output_tokens, 15);
         assert_eq!(resp.content.len(), 1);
         match &resp.content[0] {
-            ContentBlock::ToolUse { id, name, input, .. } => {
+            ContentBlock::ToolUse {
+                id, name, input, ..
+            } => {
                 assert_eq!(id.as_str(), "tu_abc");
                 assert_eq!(name, "repo.search");
                 assert_eq!(input.get("q").and_then(Value::as_str), Some("hello"));

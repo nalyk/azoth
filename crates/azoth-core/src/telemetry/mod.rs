@@ -10,7 +10,10 @@ pub fn emit_turn_started(run_id: &str, turn_id: &str) {
 }
 
 pub fn emit_turn_committed(run_id: &str, turn_id: &str, input_tokens: u32, output_tokens: u32) {
-    info!(run_id, turn_id, input_tokens, output_tokens, "turn_committed");
+    info!(
+        run_id,
+        turn_id, input_tokens, output_tokens, "turn_committed"
+    );
 }
 
 pub fn emit_turn_aborted(run_id: &str, turn_id: &str, reason: &str) {
@@ -25,12 +28,7 @@ pub fn emit_model_request(run_id: &str, turn_id: &str, profile_id: &str) {
     info!(run_id, turn_id, profile_id, "model_request");
 }
 
-pub fn emit_tool_dispatch(
-    run_id: &str,
-    turn_id: &str,
-    tool_name: &str,
-    effect_class: EffectClass,
-) {
+pub fn emit_tool_dispatch(run_id: &str, turn_id: &str, tool_name: &str, effect_class: EffectClass) {
     info!(
         run_id,
         turn_id,
@@ -49,11 +47,7 @@ pub fn emit_tool_result(
 ) {
     info!(
         run_id,
-        turn_id,
-        tool_name,
-        is_error,
-        duration_ms,
-        "tool_result",
+        turn_id, tool_name, is_error, duration_ms, "tool_result",
     );
 }
 
@@ -107,37 +101,19 @@ pub fn emit_context_compiled(
 ) {
     info!(
         run_id,
-        turn_id,
-        approximate_tokens,
-        evidence_count,
-        "context_compiled",
+        turn_id, approximate_tokens, evidence_count, "context_compiled",
     );
 }
 
 pub fn emit_session_resumed(run_id: &str, turns_recovered: u32, effects_recovered: u32) {
     info!(
         run_id,
-        turns_recovered,
-        effects_recovered,
-        "session_resumed",
+        turns_recovered, effects_recovered, "session_resumed",
     );
 }
 
-pub fn emit_effect_budget_exhausted(
-    run_id: &str,
-    turn_id: &str,
-    class: &str,
-    used: u32,
-    max: u32,
-) {
-    warn!(
-        run_id,
-        turn_id,
-        class,
-        used,
-        max,
-        "effect_budget_exhausted",
-    );
+pub fn emit_effect_budget_exhausted(run_id: &str, turn_id: &str, class: &str, used: u32, max: u32) {
+    warn!(run_id, turn_id, class, used, max, "effect_budget_exhausted",);
 }
 
 pub fn emit_sandbox_prepared(run_id: &str, turn_id: &str, tier: &str) {

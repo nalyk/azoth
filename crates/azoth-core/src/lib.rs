@@ -10,19 +10,19 @@
 //!  6. Every subsystem is eval-able.
 //!  7. Turn-scoped atomicity.
 
-pub mod schemas;
-pub mod authority;
-pub mod event_store;
-pub mod artifacts;
 pub mod adapter;
+pub mod artifacts;
+pub mod authority;
 pub mod context;
-pub mod retrieval;
+pub mod contract;
+pub mod event_store;
 pub mod execution;
-pub mod tools;
+pub mod retrieval;
 pub mod sandbox;
+pub mod schemas;
+pub mod telemetry;
+pub mod tools;
 pub mod turn;
 pub mod validators;
-pub mod telemetry;
-pub mod contract;
 
 pub use schemas::*;

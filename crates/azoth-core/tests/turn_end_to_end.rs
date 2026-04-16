@@ -50,14 +50,22 @@ async fn tui_worker_pipeline_drives_full_turn_sequence() {
                     call_group: None,
                 }],
                 stop_reason: StopReason::ToolUse,
-                usage: Usage { input_tokens: 10, output_tokens: 3, ..Default::default() },
+                usage: Usage {
+                    input_tokens: 10,
+                    output_tokens: 3,
+                    ..Default::default()
+                },
             },
             ModelTurnResponse {
                 content: vec![ContentBlock::Text {
                     text: "found sentinel".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
-                usage: Usage { input_tokens: 12, output_tokens: 5, ..Default::default() },
+                usage: Usage {
+                    input_tokens: 12,
+                    output_tokens: 5,
+                    ..Default::default()
+                },
             },
         ],
     };
@@ -119,28 +127,44 @@ async fn tui_worker_pipeline_drives_full_turn_sequence() {
         tap_events.first()
     );
 
-    let saw_tool_use = tap_events.iter().any(|e| matches!(
-        e,
-        SessionEvent::ContentBlock {
-            block: ContentBlock::ToolUse { name, .. }, ..
-        } if name == "repo.search"
-    ));
-    assert!(saw_tool_use, "expected a ContentBlock::ToolUse(repo.search)");
+    let saw_tool_use = tap_events.iter().any(|e| {
+        matches!(
+            e,
+            SessionEvent::ContentBlock {
+                block: ContentBlock::ToolUse { name, .. }, ..
+            } if name == "repo.search"
+        )
+    });
+    assert!(
+        saw_tool_use,
+        "expected a ContentBlock::ToolUse(repo.search)"
+    );
 
     let saw_effect = tap_events
         .iter()
         .any(|e| matches!(e, SessionEvent::EffectRecord { .. }));
     assert!(saw_effect, "expected an EffectRecord");
 
-    let saw_tool_result = tap_events
-        .iter()
-        .any(|e| matches!(e, SessionEvent::ToolResult { is_error: false, .. }));
+    let saw_tool_result = tap_events.iter().any(|e| {
+        matches!(
+            e,
+            SessionEvent::ToolResult {
+                is_error: false,
+                ..
+            }
+        )
+    });
     assert!(saw_tool_result, "expected a clean ToolResult");
 
-    let saw_commit = tap_events.iter().any(|e| matches!(
-        e,
-        SessionEvent::TurnCommitted { outcome: CommitOutcome::Success, .. }
-    ));
+    let saw_commit = tap_events.iter().any(|e| {
+        matches!(
+            e,
+            SessionEvent::TurnCommitted {
+                outcome: CommitOutcome::Success,
+                ..
+            }
+        )
+    });
     assert!(saw_commit, "expected a TurnCommitted(Success)");
 
     // The on-disk JSONL file must round-trip through the replayable projection

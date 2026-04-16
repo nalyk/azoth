@@ -2,7 +2,6 @@
 //!
 //! plan → compile → invoke → dispatch → validate → commit/abort
 
-use crate::telemetry;
 use crate::adapter::ProviderAdapter;
 use crate::authority::{
     mint_from_approval, ApprovalPolicyV1, ApprovalRequestMsg, ApprovalResponse, AuthorityDecision,
@@ -16,10 +15,11 @@ use crate::schemas::{
     EffectRecord, EffectRecordId, Message, ModelTurnRequest, RequestMetadata, Role, RunId,
     SessionEvent, StopReason, StreamEvent, ToolDefinition, TurnId, Usage, ValidatorStatus,
 };
+use crate::telemetry;
 use crate::validators::Validator;
-use tokio::sync::oneshot;
 use thiserror::Error;
 use tokio::sync::mpsc;
+use tokio::sync::oneshot;
 
 #[derive(Debug, Error)]
 pub enum TurnError {
@@ -156,15 +156,13 @@ impl<'a> TurnDriver<'a> {
 
                 // Collect evidence when a collector is wired in.
                 let evidence = match self.evidence_collector {
-                    Some(collector) => {
-                        match collector.collect(&contract.goal, 20).await {
-                            Ok(items) => items,
-                            Err(e) => {
-                                eprintln!("[azoth] evidence collection failed: {e}");
-                                Vec::new()
-                            }
+                    Some(collector) => match collector.collect(&contract.goal, 20).await {
+                        Ok(items) => items,
+                        Err(e) => {
+                            eprintln!("[azoth] evidence collection failed: {e}");
+                            Vec::new()
                         }
-                    }
+                    },
                     None => Vec::new(),
                 };
                 let evidence_count = evidence.len();
@@ -189,7 +187,12 @@ impl<'a> TurnDriver<'a> {
                             packet_id: packet.id.clone(),
                             packet_digest: packet.digest.clone(),
                         });
-                        telemetry::emit_context_compiled(&self.run_id.0, &turn_id.0, 0, evidence_count);
+                        telemetry::emit_context_compiled(
+                            &self.run_id.0,
+                            &turn_id.0,
+                            0,
+                            evidence_count,
+                        );
                         let lane = &packet.constitution_lane;
                         format!(
                             "[azoth.constitution]\n\
@@ -313,8 +316,12 @@ impl<'a> TurnDriver<'a> {
             // Drain any stream events still queued after invoke returns.
             while let Ok(_ev) = rx.try_recv() {}
 
-            total_usage.input_tokens = total_usage.input_tokens.saturating_add(response.usage.input_tokens);
-            total_usage.output_tokens = total_usage.output_tokens.saturating_add(response.usage.output_tokens);
+            total_usage.input_tokens = total_usage
+                .input_tokens
+                .saturating_add(response.usage.input_tokens);
+            total_usage.output_tokens = total_usage
+                .output_tokens
+                .saturating_add(response.usage.output_tokens);
 
             for (idx, block) in response.content.iter().enumerate() {
                 self.writer.append(&SessionEvent::ContentBlock {
@@ -336,7 +343,10 @@ impl<'a> TurnDriver<'a> {
                     // v1 serializes them in order.
                     let mut tool_results: Vec<ContentBlock> = Vec::new();
                     for block in response.content.iter() {
-                        if let ContentBlock::ToolUse { id, name, input, .. } = block {
+                        if let ContentBlock::ToolUse {
+                            id, name, input, ..
+                        } = block
+                        {
                             let effect_class = self
                                 .dispatcher
                                 .tool(name)
@@ -366,7 +376,13 @@ impl<'a> TurnDriver<'a> {
                                     _ => (0, u32::MAX, ""),
                                 };
                                 if !label.is_empty() && used >= max {
-                                    telemetry::emit_effect_budget_exhausted(&self.run_id.0, &turn_id.0, label, used, max);
+                                    telemetry::emit_effect_budget_exhausted(
+                                        &self.run_id.0,
+                                        &turn_id.0,
+                                        label,
+                                        used,
+                                        max,
+                                    );
                                     self.record_abort(
                                         &turn_id,
                                         AbortReason::RuntimeError,
@@ -380,10 +396,8 @@ impl<'a> TurnDriver<'a> {
                             }
 
                             let decision = {
-                                let engine = AuthorityEngine::new(
-                                    &*self.capabilities,
-                                    ApprovalPolicyV1,
-                                );
+                                let engine =
+                                    AuthorityEngine::new(&*self.capabilities, ApprovalPolicyV1);
                                 engine.authorize(name, effect_class, path_hint)
                             };
 
@@ -415,7 +429,12 @@ impl<'a> TurnDriver<'a> {
                                         tool_name: tool_name.clone(),
                                         summary: summary.clone(),
                                     })?;
-                                    telemetry::emit_approval_requested(&self.run_id.0, &turn_id.0, &tool_name, ec);
+                                    telemetry::emit_approval_requested(
+                                        &self.run_id.0,
+                                        &turn_id.0,
+                                        &tool_name,
+                                        ec,
+                                    );
 
                                     let (resp_tx, resp_rx) = oneshot::channel::<ApprovalResponse>();
                                     let msg = ApprovalRequestMsg {
@@ -452,14 +471,23 @@ impl<'a> TurnDriver<'a> {
                                                 token: tok_id,
                                                 scope: scope.clone(),
                                             })?;
-                                            telemetry::emit_approval_granted(&self.run_id.0, &turn_id.0, &tool_name, &format!("{scope:?}"));
+                                            telemetry::emit_approval_granted(
+                                                &self.run_id.0,
+                                                &turn_id.0,
+                                                &tool_name,
+                                                &format!("{scope:?}"),
+                                            );
                                         }
                                         Ok(ApprovalResponse::Deny) | Err(_) => {
                                             self.writer.append(&SessionEvent::ApprovalDenied {
                                                 turn_id: turn_id.clone(),
                                                 approval_id: approval_id.clone(),
                                             })?;
-                                            telemetry::emit_approval_denied(&self.run_id.0, &turn_id.0, &tool_name);
+                                            telemetry::emit_approval_denied(
+                                                &self.run_id.0,
+                                                &turn_id.0,
+                                                &tool_name,
+                                            );
                                             self.record_abort(
                                                 &turn_id,
                                                 AbortReason::ApprovalDenied,
@@ -472,7 +500,12 @@ impl<'a> TurnDriver<'a> {
                                 }
                             }
 
-                            telemetry::emit_tool_dispatch(&self.run_id.0, &turn_id.0, name, effect_class);
+                            telemetry::emit_tool_dispatch(
+                                &self.run_id.0,
+                                &turn_id.0,
+                                name,
+                                effect_class,
+                            );
                             let raw = Tainted::new(Origin::ModelOutput, input.clone());
                             let tool_start = std::time::Instant::now();
                             let result = crate::execution::dispatch_tool(
@@ -492,11 +525,19 @@ impl<'a> TurnDriver<'a> {
                                     false,
                                 ),
                                 Err(e) => (
-                                    vec![ContentBlock::Text { text: e.to_string() }],
+                                    vec![ContentBlock::Text {
+                                        text: e.to_string(),
+                                    }],
                                     true,
                                 ),
                             };
-                            telemetry::emit_tool_result(&self.run_id.0, &turn_id.0, name, is_error, tool_duration_ms);
+                            telemetry::emit_tool_result(
+                                &self.run_id.0,
+                                &turn_id.0,
+                                name,
+                                is_error,
+                                tool_duration_ms,
+                            );
 
                             self.writer.append(&SessionEvent::EffectRecord {
                                 turn_id: turn_id.clone(),
@@ -507,7 +548,11 @@ impl<'a> TurnDriver<'a> {
                                     tool_name: name.clone(),
                                     input_digest: Some(digest(input)),
                                     output_artifact: None,
-                                    error: if is_error { Some("tool error".into()) } else { None },
+                                    error: if is_error {
+                                        Some("tool error".into())
+                                    } else {
+                                        None
+                                    },
                                 },
                             })?;
                             // Bump the per-run counter after the EffectRecord
@@ -553,9 +598,7 @@ impl<'a> TurnDriver<'a> {
                     // path, gated on `(contract.is_some(), !validators.is_empty())`
                     // so turns without either keep the pre-validators byte
                     // shape exactly.
-                    if let (Some(contract), false) =
-                        (self.contract, self.validators.is_empty())
-                    {
+                    if let (Some(contract), false) = (self.contract, self.validators.is_empty()) {
                         let mut failed: Option<(String, Option<String>)> = None;
                         for v in self.validators.iter() {
                             let report = v.check(contract);
@@ -566,10 +609,13 @@ impl<'a> TurnDriver<'a> {
                                 status: report.status,
                                 detail: report.detail.clone(),
                             })?;
-                            telemetry::emit_validator_result(&self.run_id.0, &turn_id.0, &name, report.status);
-                            if matches!(report.status, ValidatorStatus::Fail)
-                                && failed.is_none()
-                            {
+                            telemetry::emit_validator_result(
+                                &self.run_id.0,
+                                &turn_id.0,
+                                &name,
+                                report.status,
+                            );
+                            if matches!(report.status, ValidatorStatus::Fail) && failed.is_none() {
                                 failed = Some((name, report.detail));
                             }
                         }
@@ -596,7 +642,12 @@ impl<'a> TurnDriver<'a> {
                         outcome: CommitOutcome::Success,
                         usage: total_usage.clone(),
                     })?;
-                    telemetry::emit_turn_committed(&self.run_id.0, &turn_id.0, total_usage.input_tokens, total_usage.output_tokens);
+                    telemetry::emit_turn_committed(
+                        &self.run_id.0,
+                        &turn_id.0,
+                        total_usage.input_tokens,
+                        total_usage.output_tokens,
+                    );
                     return Ok(total_usage);
                 }
                 StopReason::MaxTokens => {

@@ -158,9 +158,6 @@ pub enum StreamEvent {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentBlockStub {
     Text,
-    ToolUse {
-        id: super::ToolUseId,
-        name: String,
-    },
+    ToolUse { id: super::ToolUseId, name: String },
     Thinking,
 }

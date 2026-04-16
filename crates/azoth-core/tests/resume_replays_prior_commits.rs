@@ -32,12 +32,22 @@ fn scripted_search(query: &str) -> MockScript {
                     call_group: None,
                 }],
                 stop_reason: StopReason::ToolUse,
-                usage: Usage { input_tokens: 10, output_tokens: 3, ..Default::default() },
+                usage: Usage {
+                    input_tokens: 10,
+                    output_tokens: 3,
+                    ..Default::default()
+                },
             },
             ModelTurnResponse {
-                content: vec![ContentBlock::Text { text: format!("found {query}") }],
+                content: vec![ContentBlock::Text {
+                    text: format!("found {query}"),
+                }],
                 stop_reason: StopReason::EndTurn,
-                usage: Usage { input_tokens: 12, output_tokens: 5, ..Default::default() },
+                usage: Usage {
+                    input_tokens: 12,
+                    output_tokens: 5,
+                    ..Default::default()
+                },
             },
         ],
     }
@@ -164,5 +174,8 @@ async fn resume_replays_prior_commits() {
         .iter()
         .filter(|f| matches!(&f.event, SessionEvent::TurnInterrupted { .. }))
         .count();
-    assert_eq!(interrupted, 0, "clean reopen must not synthesize crash markers");
+    assert_eq!(
+        interrupted, 0,
+        "clean reopen must not synthesize crash markers"
+    );
 }

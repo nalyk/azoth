@@ -3,7 +3,7 @@
 //! calling `Tool::execute`.
 
 use super::context::ExecutionContext;
-use crate::authority::{Extractor, ExtractionError, JsonExtractor, Origin, Tainted};
+use crate::authority::{ExtractionError, Extractor, JsonExtractor, Origin, Tainted};
 use crate::schemas::EffectClass;
 use async_trait::async_trait;
 use futures::future::BoxFuture;
@@ -85,9 +85,10 @@ impl<T: Tool + 'static> ErasedTool for T {
             // since it wants a 'static slice, so we check manually here.
             let permitted = T::permitted_origins(self);
             if !permitted.contains(&raw.origin()) {
-                return Err(ToolError::Extraction(
-                    ExtractionError::OriginNotPermitted(raw.origin(), Tool::name(self)),
-                ));
+                return Err(ToolError::Extraction(ExtractionError::OriginNotPermitted(
+                    raw.origin(),
+                    Tool::name(self),
+                )));
             }
             let input: T::Input = {
                 let ex: JsonExtractor<T::Input> = JsonExtractor::new(permitted);

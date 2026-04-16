@@ -115,9 +115,7 @@ mod tests {
     use super::*;
     use crate::artifacts::ArtifactStore;
     use crate::authority::{Origin, Tainted};
-    use crate::execution::{
-        dispatch_tool, CancellationToken, ExecutionContext, ToolDispatcher,
-    };
+    use crate::execution::{dispatch_tool, CancellationToken, ExecutionContext, ToolDispatcher};
     use crate::schemas::{RunId, TurnId};
     use tempfile::tempdir;
     use tokio::fs;
@@ -158,7 +156,10 @@ mod tests {
     async fn reads_line_range() {
         let dir = tempdir().unwrap();
         let root = fs::canonicalize(dir.path()).await.unwrap();
-        let body = (1..=20).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        let body = (1..=20)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         fs::write(root.join("big.txt"), &body).await.unwrap();
         let ctx = ctx_for(root);
 
@@ -188,10 +189,7 @@ mod tests {
 
         let mut disp = ToolDispatcher::new();
         disp.register(RepoReadFileTool);
-        let raw = Tainted::new(
-            Origin::ModelOutput,
-            json!({ "path": "../../etc/passwd" }),
-        );
+        let raw = Tainted::new(Origin::ModelOutput, json!({ "path": "../../etc/passwd" }));
         let err = dispatch_tool(&disp, "repo.read_file", raw, &ctx)
             .await
             .expect_err("traversal must fail");

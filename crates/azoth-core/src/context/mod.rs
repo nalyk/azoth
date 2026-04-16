@@ -8,9 +8,9 @@
 //! 4. long payloads stay as artifact refs, never inline
 //! 5. transcript is never copied verbatim
 
-mod tokenizer;
-mod kernel;
 mod evidence;
+mod kernel;
+mod tokenizer;
 
 pub use evidence::{EvidenceCollector, LexicalEvidenceCollector};
 pub use kernel::{ContextKernel, KernelError, StepInput};
