@@ -190,7 +190,7 @@ async fn driver_aborts_when_contract_max_turns_reached() {
             .await
             .expect("abort returns Ok with empty usage");
         assert_eq!(
-            usage.output_tokens, 0,
+            usage.usage.output_tokens, 0,
             "no adapter call should have happened"
         );
     }

@@ -697,6 +697,22 @@ pub async fn run_app(resume: Option<String>) -> io::Result<()> {
         let (mut effects_consumed, mut turns_completed) =
             resume_reader.committed_run_progress().unwrap_or_default();
 
+        // Has a `RunStarted` event already been appended to this session's
+        // JSONL? The TUI worker emits one just before the first
+        // `ContractAccepted` — which is either the user's first
+        // `/contract <goal>` OR an auto-drafted contract on their first
+        // message. Tracked as a single bool so resume doesn't double-emit
+        // and so the auto-draft path shares the same gate as the slash
+        // path.
+        let mut run_started_emitted = resume_reader
+            .replayable()
+            .map(|events| {
+                events
+                    .iter()
+                    .any(|e| matches!(e.0, SessionEvent::RunStarted { .. }))
+            })
+            .unwrap_or(false);
+
         loop {
             let user_text = tokio::select! {
                 biased;
@@ -705,6 +721,24 @@ pub async fn run_app(resume: Option<String>) -> io::Result<()> {
                     let ts = time::OffsetDateTime::now_utc()
                         .format(&time::format_description::well_known::Rfc3339)
                         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string());
+
+                    // Emit RunStarted once per session, right before the
+                    // first ContractAccepted. Before this, new sessions
+                    // started writing mid-stream with no run-level marker.
+                    if !run_started_emitted {
+                        if let Err(e) = writer.append(&SessionEvent::RunStarted {
+                            run_id: worker_run_id.clone(),
+                            contract_id: contract.id.clone(),
+                            timestamp: ts.clone(),
+                        }) {
+                            let _ = worker_error_tx
+                                .send(format!("run_started append failed: {e}"))
+                                .await;
+                        } else {
+                            run_started_emitted = true;
+                        }
+                    }
+
                     match azoth_core::contract::accept_and_persist(
                         &mut writer, contract, ts,
                     ) {
@@ -752,6 +786,60 @@ pub async fn run_app(resume: Option<String>) -> io::Result<()> {
                     t
                 }
             };
+            // Auto-draft a contract on the user's first message if none has
+            // been accepted yet. Without this, a session runs contract-less:
+            // validators never fire, checkpoints never land, and the context
+            // kernel has no durable state to compile from — observed as total
+            // cross-turn amnesia in dogfood run_f465299c1a5e (turn 4 said
+            // "I don't have any source code provided yet" after turn 3
+            // analyzed the whole repo). The explicit `/contract <goal>` path
+            // is still honored; this is only the fallback for users who just
+            // start typing.
+            if active_contract.is_none() {
+                let goal = {
+                    let one_line: String = user_text
+                        .chars()
+                        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+                        .collect();
+                    if one_line.chars().count() <= 200 {
+                        one_line
+                    } else {
+                        let head: String = one_line.chars().take(200).collect();
+                        format!("{head}…")
+                    }
+                };
+                let mut draft = azoth_core::contract::draft(goal.clone());
+                draft.success_criteria.push(format!("delivers: {goal}"));
+                let ts = time::OffsetDateTime::now_utc()
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string());
+
+                if !run_started_emitted {
+                    if let Err(e) = writer.append(&SessionEvent::RunStarted {
+                        run_id: worker_run_id.clone(),
+                        contract_id: draft.id.clone(),
+                        timestamp: ts.clone(),
+                    }) {
+                        let _ = worker_error_tx
+                            .send(format!("run_started append failed: {e}"))
+                            .await;
+                    } else {
+                        run_started_emitted = true;
+                    }
+                }
+
+                match azoth_core::contract::accept_and_persist(&mut writer, draft, ts) {
+                    Ok(accepted) => {
+                        active_contract = Some(accepted);
+                    }
+                    Err(e) => {
+                        let _ = worker_error_tx
+                            .send(format!("auto-draft contract failed: {e}"))
+                            .await;
+                    }
+                }
+            }
+
             let turn_id = TurnId::new();
             let ctx = ExecutionContext {
                 run_id: worker_run_id.clone(),
@@ -788,7 +876,21 @@ pub async fn run_app(resume: Option<String>) -> io::Result<()> {
                 .await;
 
             match result {
-                Ok(_) => turns_completed = turns_completed.saturating_add(1),
+                Ok(outcome) => {
+                    turns_completed = turns_completed.saturating_add(1);
+                    // Cross-turn memory: fold the model's final response back
+                    // into `history` so the next turn's model_request carries
+                    // the full prior conversation, not just user messages.
+                    // Before this, the TUI worker's history was user-only and
+                    // the model had total amnesia across turns — a no-contract
+                    // session (dogfood run_f465299c1a5e) hit this hard.
+                    if let Some(assistant_content) = outcome.final_assistant {
+                        history.push(Message {
+                            role: azoth_core::schemas::Role::Assistant,
+                            content: assistant_content,
+                        });
+                    }
+                }
                 Err(e) => {
                     let _ = worker_error_tx.send(format!("turn error: {e}")).await;
                 }

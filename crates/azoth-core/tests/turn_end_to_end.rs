@@ -111,7 +111,7 @@ async fn tui_worker_pipeline_drives_full_turn_sequence() {
             )
             .await
             .expect("turn drives cleanly");
-        assert!(usage.output_tokens >= 5);
+        assert!(usage.usage.output_tokens >= 5);
     }
     drop(writer);
 

@@ -21,6 +21,35 @@ use thiserror::Error;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 
+/// Result of a single `drive_turn` invocation.
+///
+/// `final_assistant` carries the content blocks of the last model response
+/// (the one that stopped with `EndTurn`/`StopSequence`), so the caller can
+/// feed them back as cross-turn memory on the next call. It is deliberately
+/// `None` for any non-committing outcome — the caller should never push
+/// content from an aborted or interrupted turn into a subsequent conversation.
+#[derive(Debug, Clone)]
+pub struct TurnOutcome {
+    pub usage: Usage,
+    pub final_assistant: Option<Vec<ContentBlock>>,
+}
+
+impl TurnOutcome {
+    fn aborted(usage: Usage) -> Self {
+        Self {
+            usage,
+            final_assistant: None,
+        }
+    }
+
+    fn committed(usage: Usage, final_assistant: Vec<ContentBlock>) -> Self {
+        Self {
+            usage,
+            final_assistant: Some(final_assistant),
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum TurnError {
     #[error("io: {0}")]
@@ -111,12 +140,19 @@ impl<'a> TurnDriver<'a> {
     /// Drive a single turn. `messages` is the conversation tail the Context
     /// Kernel has already compiled for this step; the driver appends assistant
     /// + tool_result blocks as it goes.
+    ///
+    /// The returned `TurnOutcome::final_assistant` is populated with the
+    /// assistant content blocks from the final `EndTurn` / `StopSequence`
+    /// model response, so the caller can fold them back into the next turn's
+    /// `messages` argument and give the model cross-turn memory. It stays
+    /// `None` for any non-committing outcome (aborted / interrupted /
+    /// validator-failed).
     pub async fn drive_turn(
         &mut self,
         turn_id: TurnId,
         system: String,
         mut messages: Vec<Message>,
-    ) -> Result<Usage, TurnError> {
+    ) -> Result<TurnOutcome, TurnError> {
         // Contract-scoped guard: refuse to even open the turn if the
         // persisted contract has set a max_turns and we are at/over it.
         if let Some(c) = self.contract {
@@ -137,7 +173,7 @@ impl<'a> TurnDriver<'a> {
                         )),
                         Usage::default(),
                     )?;
-                    return Ok(Usage::default());
+                    return Ok(TurnOutcome::aborted(Usage::default()));
                 }
             }
         }
@@ -219,7 +255,7 @@ impl<'a> TurnDriver<'a> {
                             Some(format!("context packet over budget: {used} > {max}")),
                             Usage::default(),
                         )?;
-                        return Ok(Usage::default());
+                        return Ok(TurnOutcome::aborted(Usage::default()));
                     }
                     Err(e) => return Err(TurnError::Kernel(e)),
                 }
@@ -245,7 +281,7 @@ impl<'a> TurnDriver<'a> {
                     partial_usage: Default::default(),
                 })?;
                 telemetry::emit_turn_interrupted(&self.run_id.0, &turn_id.0, "user_cancel");
-                return Ok(total_usage);
+                return Ok(TurnOutcome::aborted(total_usage));
             }
 
             let req = ModelTurnRequest {
@@ -293,7 +329,7 @@ impl<'a> TurnDriver<'a> {
                             },
                         })?;
                         telemetry::emit_turn_interrupted(&self.run_id.0, &turn_id.0, "user_cancel");
-                        return Ok(total_usage);
+                        return Ok(TurnOutcome::aborted(total_usage));
                     }
                     res = &mut invoke_fut => break res,
                     Some(_ev) = rx.recv() => { /* drain, continue */ }
@@ -391,7 +427,7 @@ impl<'a> TurnDriver<'a> {
                                         )),
                                         total_usage.clone(),
                                     )?;
-                                    return Ok(total_usage);
+                                    return Ok(TurnOutcome::aborted(total_usage));
                                 }
                             }
 
@@ -410,7 +446,7 @@ impl<'a> TurnDriver<'a> {
                                         Some(format!("effect not available: {hint}")),
                                         total_usage.clone(),
                                     )?;
-                                    return Ok(total_usage);
+                                    return Ok(TurnOutcome::aborted(total_usage));
                                 }
                                 AuthorityDecision::RequireApproval {
                                     approval_id,
@@ -456,7 +492,7 @@ impl<'a> TurnDriver<'a> {
                                             Some("approval bridge closed".into()),
                                             total_usage.clone(),
                                         )?;
-                                        return Ok(total_usage);
+                                        return Ok(TurnOutcome::aborted(total_usage));
                                     }
 
                                     match resp_rx.await {
@@ -494,7 +530,7 @@ impl<'a> TurnDriver<'a> {
                                                 Some("user denied approval".into()),
                                                 total_usage.clone(),
                                             )?;
-                                            return Ok(total_usage);
+                                            return Ok(TurnOutcome::aborted(total_usage));
                                         }
                                     }
                                 }
@@ -632,7 +668,7 @@ impl<'a> TurnDriver<'a> {
                                 Some(msg),
                                 total_usage.clone(),
                             )?;
-                            return Ok(total_usage);
+                            return Ok(TurnOutcome::aborted(total_usage));
                         }
                         self.writer.append(&SessionEvent::Checkpoint {
                             turn_id: turn_id.clone(),
@@ -650,7 +686,7 @@ impl<'a> TurnDriver<'a> {
                         total_usage.input_tokens,
                         total_usage.output_tokens,
                     );
-                    return Ok(total_usage);
+                    return Ok(TurnOutcome::committed(total_usage, response.content));
                 }
                 StopReason::MaxTokens => {
                     self.record_abort(
@@ -659,7 +695,7 @@ impl<'a> TurnDriver<'a> {
                         Some("model hit max_tokens".into()),
                         total_usage.clone(),
                     )?;
-                    return Ok(total_usage);
+                    return Ok(TurnOutcome::aborted(total_usage));
                 }
                 StopReason::ContentFilter => {
                     self.record_abort(
@@ -668,7 +704,7 @@ impl<'a> TurnDriver<'a> {
                         Some("content filter".into()),
                         total_usage.clone(),
                     )?;
-                    return Ok(total_usage);
+                    return Ok(TurnOutcome::aborted(total_usage));
                 }
             }
         }
