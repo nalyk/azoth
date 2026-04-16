@@ -96,6 +96,7 @@ async fn drive_with_validators<'a>(
             kernel: None,
             validators,
             effects_consumed: &mut effects,
+            evidence_collector: None,
         };
         driver
             .drive_turn(

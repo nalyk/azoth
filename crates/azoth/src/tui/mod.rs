@@ -1,8 +1,9 @@
 //! TUI scaffold. A `biased` `tokio::select!` loop over bounded channels
-//! feeding a ratatui frame builder. v1 runs against the MockAdapter so the
-//! render + input paths can be smoke-tested without API keys.
+//! feeding a ratatui frame builder. The active provider is selected via
+//! `AZOTH_PROFILE` (default: `ollama-qwen-anthropic`).
 
 pub mod app;
+pub mod config;
 pub mod render;
 pub mod widgets;
 pub mod input;

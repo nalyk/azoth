@@ -27,6 +27,7 @@ grep-searcher = { workspace = true }
 grep-regex = { workspace = true }
 grep-matcher = { workspace = true }
 rusqlite = { workspace = true }
+tempfile = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = { workspace = true }

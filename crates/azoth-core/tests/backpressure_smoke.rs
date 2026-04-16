@@ -109,6 +109,7 @@ async fn cancel_during_flood_writes_turn_interrupted_under_100ms() {
             kernel: None,
             validators: &[],
             effects_consumed: &mut effects,
+            evidence_collector: None,
         };
         driver
             .drive_turn(

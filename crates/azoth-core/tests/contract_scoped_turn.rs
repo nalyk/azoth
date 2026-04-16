@@ -100,6 +100,7 @@ async fn driver_honors_persisted_contract_round_trip() {
             kernel: None,
             validators: &[],
             effects_consumed: &mut effects,
+            evidence_collector: None,
         };
         // The driver observes the contract via the new field — assert the
         // round-trip before we even drive.
@@ -174,6 +175,7 @@ async fn driver_aborts_when_contract_max_turns_reached() {
             kernel: None,
             validators: &[],
             effects_consumed: &mut effects,
+            evidence_collector: None,
         };
         let usage = driver
             .drive_turn(turn_id.clone(), "system".into(), vec![Message::user_text("go")])

@@ -105,6 +105,7 @@ async fn drive_with_responder(
             kernel: None,
             validators: &[],
             effects_consumed: &mut effects,
+            evidence_collector: None,
         };
         let _ = driver
             .drive_turn(

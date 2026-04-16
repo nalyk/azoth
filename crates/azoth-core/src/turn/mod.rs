@@ -2,12 +2,13 @@
 //!
 //! plan → compile → invoke → dispatch → validate → commit/abort
 
+use crate::telemetry;
 use crate::adapter::ProviderAdapter;
 use crate::authority::{
     mint_from_approval, ApprovalPolicyV1, ApprovalRequestMsg, ApprovalResponse, AuthorityDecision,
     AuthorityEngine, CapabilityStore, Origin, Tainted,
 };
-use crate::context::{ContextKernel, KernelError, StepInput};
+use crate::context::{ContextKernel, EvidenceCollector, KernelError, StepInput};
 use crate::event_store::JsonlWriter;
 use crate::execution::{ExecutionContext, ToolDispatcher, ToolError};
 use crate::schemas::{
@@ -80,6 +81,11 @@ pub struct TurnDriver<'a> {
     /// `EffectRecord` append. When `contract` is `None`, the counter is
     /// never read or written, so the pre-contract byte shape is preserved.
     pub effects_consumed: &'a mut EffectCounter,
+    /// Optional evidence collector. When both `contract` and `kernel` are
+    /// `Some`, the driver calls `collector.collect(contract.goal, 20)` to
+    /// populate `StepInput.evidence`. When `None`, evidence stays
+    /// `Vec::new()` — byte-for-byte compatible with the pre-evidence driver.
+    pub evidence_collector: Option<&'a dyn EvidenceCollector>,
 }
 
 impl<'a> TurnDriver<'a> {
@@ -91,12 +97,15 @@ impl<'a> TurnDriver<'a> {
         detail: Option<String>,
         usage: Usage,
     ) -> Result<(), std::io::Error> {
+        let reason_label = format!("{reason:?}");
         self.writer.append(&SessionEvent::TurnAborted {
             turn_id: turn_id.clone(),
             reason,
             detail,
             usage,
-        })
+        })?;
+        telemetry::emit_turn_aborted(&self.run_id.0, &turn_id.0, &reason_label);
+        Ok(())
     }
 
     /// Drive a single turn. `messages` is the conversation tail the Context
@@ -144,19 +153,43 @@ impl<'a> TurnDriver<'a> {
         let system = match (self.contract, self.kernel) {
             (Some(contract), Some(kernel)) => {
                 let tool_schemas_digest = digest(&tools);
+
+                // Collect evidence when a collector is wired in.
+                let evidence = match self.evidence_collector {
+                    Some(collector) => {
+                        match collector.collect(&contract.goal, 20).await {
+                            Ok(items) => items,
+                            Err(e) => {
+                                eprintln!("[azoth] evidence collection failed: {e}");
+                                Vec::new()
+                            }
+                        }
+                    }
+                    None => Vec::new(),
+                };
+                let evidence_count = evidence.len();
+
                 let input = StepInput {
                     contract,
                     turn_id: turn_id.clone(),
                     step_goal: contract.goal.clone(),
                     rubric: contract.success_criteria.clone(),
                     working_set: Vec::new(),
-                    evidence: Vec::new(),
+                    evidence,
                     last_checkpoint: None,
                     system_prompt: system,
                     tool_schemas_digest,
                 };
                 match kernel.compile(input) {
                     Ok(packet) => {
+                        // Emit a ContextPacket event so the TUI can show
+                        // the last compiled packet via `/context`.
+                        let _ = self.writer.append(&SessionEvent::ContextPacket {
+                            turn_id: turn_id.clone(),
+                            packet_id: packet.id.clone(),
+                            packet_digest: packet.digest.clone(),
+                        });
+                        telemetry::emit_context_compiled(&self.run_id.0, &turn_id.0, 0, evidence_count);
                         let lane = &packet.constitution_lane;
                         format!(
                             "[azoth.constitution]\n\
@@ -197,6 +230,7 @@ impl<'a> TurnDriver<'a> {
             parent_turn: None,
             timestamp: now_iso(),
         })?;
+        telemetry::emit_turn_started(&self.run_id.0, &turn_id.0);
 
         let mut total_usage = Usage::default();
 
@@ -207,6 +241,7 @@ impl<'a> TurnDriver<'a> {
                     reason: AbortReason::UserCancel,
                     partial_usage: Default::default(),
                 })?;
+                telemetry::emit_turn_interrupted(&self.run_id.0, &turn_id.0, "user_cancel");
                 return Ok(total_usage);
             }
 
@@ -227,6 +262,7 @@ impl<'a> TurnDriver<'a> {
                 request_digest: digest(&req),
                 profile_id: self.adapter.profile().id.clone(),
             })?;
+            telemetry::emit_model_request(&self.run_id.0, &turn_id.0, &self.adapter.profile().id);
 
             // Bounded sink for stream events. The driver must drain this
             // concurrently with `invoke` — otherwise an adapter that emits
@@ -253,6 +289,7 @@ impl<'a> TurnDriver<'a> {
                                 output_tokens: total_usage.output_tokens,
                             },
                         })?;
+                        telemetry::emit_turn_interrupted(&self.run_id.0, &turn_id.0, "user_cancel");
                         return Ok(total_usage);
                     }
                     res = &mut invoke_fut => break res,
@@ -329,6 +366,7 @@ impl<'a> TurnDriver<'a> {
                                     _ => (0, u32::MAX, ""),
                                 };
                                 if !label.is_empty() && used >= max {
+                                    telemetry::emit_effect_budget_exhausted(&self.run_id.0, &turn_id.0, label, used, max);
                                     self.record_abort(
                                         &turn_id,
                                         AbortReason::RuntimeError,
@@ -377,6 +415,7 @@ impl<'a> TurnDriver<'a> {
                                         tool_name: tool_name.clone(),
                                         summary: summary.clone(),
                                     })?;
+                                    telemetry::emit_approval_requested(&self.run_id.0, &turn_id.0, &tool_name, ec);
 
                                     let (resp_tx, resp_rx) = oneshot::channel::<ApprovalResponse>();
                                     let msg = ApprovalRequestMsg {
@@ -411,14 +450,16 @@ impl<'a> TurnDriver<'a> {
                                                 turn_id: turn_id.clone(),
                                                 approval_id: approval_id.clone(),
                                                 token: tok_id,
-                                                scope,
+                                                scope: scope.clone(),
                                             })?;
+                                            telemetry::emit_approval_granted(&self.run_id.0, &turn_id.0, &tool_name, &format!("{scope:?}"));
                                         }
                                         Ok(ApprovalResponse::Deny) | Err(_) => {
                                             self.writer.append(&SessionEvent::ApprovalDenied {
                                                 turn_id: turn_id.clone(),
                                                 approval_id: approval_id.clone(),
                                             })?;
+                                            telemetry::emit_approval_denied(&self.run_id.0, &turn_id.0, &tool_name);
                                             self.record_abort(
                                                 &turn_id,
                                                 AbortReason::ApprovalDenied,
@@ -431,7 +472,9 @@ impl<'a> TurnDriver<'a> {
                                 }
                             }
 
+                            telemetry::emit_tool_dispatch(&self.run_id.0, &turn_id.0, name, effect_class);
                             let raw = Tainted::new(Origin::ModelOutput, input.clone());
+                            let tool_start = std::time::Instant::now();
                             let result = crate::execution::dispatch_tool(
                                 self.dispatcher,
                                 name,
@@ -439,6 +482,7 @@ impl<'a> TurnDriver<'a> {
                                 self.ctx,
                             )
                             .await;
+                            let tool_duration_ms = tool_start.elapsed().as_millis() as u64;
 
                             let (content, is_error) = match result {
                                 Ok(v) => (
@@ -452,6 +496,7 @@ impl<'a> TurnDriver<'a> {
                                     true,
                                 ),
                             };
+                            telemetry::emit_tool_result(&self.run_id.0, &turn_id.0, name, is_error, tool_duration_ms);
 
                             self.writer.append(&SessionEvent::EffectRecord {
                                 turn_id: turn_id.clone(),
@@ -521,6 +566,7 @@ impl<'a> TurnDriver<'a> {
                                 status: report.status,
                                 detail: report.detail.clone(),
                             })?;
+                            telemetry::emit_validator_result(&self.run_id.0, &turn_id.0, &name, report.status);
                             if matches!(report.status, ValidatorStatus::Fail)
                                 && failed.is_none()
                             {
@@ -550,6 +596,7 @@ impl<'a> TurnDriver<'a> {
                         outcome: CommitOutcome::Success,
                         usage: total_usage.clone(),
                     })?;
+                    telemetry::emit_turn_committed(&self.run_id.0, &turn_id.0, total_usage.input_tokens, total_usage.output_tokens);
                     return Ok(total_usage);
                 }
                 StopReason::MaxTokens => {

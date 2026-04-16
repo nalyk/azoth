@@ -122,6 +122,7 @@ async fn over_budget_apply_local_aborts_turn_with_runtime_error() {
             kernel: None,
             validators: &[],
             effects_consumed: &mut effects,
+            evidence_collector: None,
         };
         driver
             .drive_turn(
@@ -239,6 +240,7 @@ async fn first_apply_local_under_cap_succeeds_and_bumps_counter() {
             kernel: None,
             validators: &[],
             effects_consumed: &mut effects,
+            evidence_collector: None,
         };
         driver
             .drive_turn(

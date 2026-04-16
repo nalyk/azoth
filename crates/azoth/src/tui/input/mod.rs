@@ -13,7 +13,9 @@ pub enum SlashCommand {
     /// `/contract [goal text...]` — empty argument shows usage; a non-empty
     /// rest-of-line is treated as the contract goal.
     Contract(Option<String>),
-    Approve,
+    /// `/approve [tool_name]` — no argument lists active capability tokens;
+    /// a tool name pre-grants a session-scoped token for that tool.
+    Approve(Option<String>),
     Quit,
     /// `/resume <run_id>` — the argument is `None` when no token follows.
     Resume(Option<String>),
@@ -45,7 +47,7 @@ impl SlashCommand {
             "status" => Self::Status,
             "context" => Self::Context,
             "contract" => Self::Contract(rest_of_line()),
-            "approve" => Self::Approve,
+            "approve" => Self::Approve(rest_of_line()),
             "quit" => Self::Quit,
             "resume" => Self::Resume(parts.next().map(|s| s.to_string())),
             other => Self::Unknown(other.to_string()),
@@ -102,7 +104,11 @@ mod tests {
             SlashCommand::parse("/contract fix token refresh"),
             Some(SlashCommand::Contract(Some("fix token refresh".to_string())))
         );
-        assert_eq!(SlashCommand::parse("/approve"), Some(SlashCommand::Approve));
+        assert_eq!(SlashCommand::parse("/approve"), Some(SlashCommand::Approve(None)));
+        assert_eq!(
+            SlashCommand::parse("/approve fs.write"),
+            Some(SlashCommand::Approve(Some("fs.write".to_string())))
+        );
         assert_eq!(SlashCommand::parse("/quit"), Some(SlashCommand::Quit));
     }
 }

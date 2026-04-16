@@ -90,6 +90,7 @@ async fn drive_one_turn(
             kernel,
             validators: &[],
             effects_consumed: &mut effects,
+            evidence_collector: None,
         };
         driver
             .drive_turn(
@@ -228,6 +229,7 @@ async fn kernel_without_contract_is_a_noop() {
                 kernel,
                 validators: &[],
                 effects_consumed: &mut effects,
+                evidence_collector: None,
             };
             driver
                 .drive_turn(

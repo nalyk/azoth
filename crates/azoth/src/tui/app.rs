@@ -12,6 +12,7 @@
 //! turn_committed sequence renders into the transcript in real time.
 
 use crossterm::event::{Event as TermEvent, EventStream, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{EnableMouseCapture, DisableMouseCapture};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::ExecutableCommand;
 use futures::StreamExt;
@@ -19,20 +20,22 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use std::io;
 use std::sync::Arc;
+use tui_textarea::{Input as TaInput, TextArea};
 use tokio::sync::mpsc;
 
-use azoth_core::adapter::{MockAdapter, MockScript, ProviderProfile};
 use azoth_core::artifacts::ArtifactStore;
 use azoth_core::authority::{
     ApprovalRequestMsg, ApprovalResponse, CapabilityStore,
 };
+use azoth_core::context::LexicalEvidenceCollector;
+use azoth_core::retrieval::RipgrepLexicalRetrieval;
 use azoth_core::event_store::{JsonlReader, JsonlWriter, SqliteMirror};
 use azoth_core::execution::{CancellationToken, ExecutionContext, ToolDispatcher};
 use azoth_core::schemas::{
-    ApprovalScope, CommitOutcome, ContentBlock, Contract, ContractId, Message, ModelTurnResponse,
-    RunId, SessionEvent, StopReason, ToolUseId, TurnId, Usage,
+    ApprovalId, ApprovalScope, CapabilityTokenId, ContentBlock, Contract,
+    ContractId, Message, RunId, SessionEvent, TurnId,
 };
-use azoth_core::tools::{FsWriteTool, RepoSearchTool};
+use azoth_core::tools::{BashTool, FsWriteTool, RepoReadFileTool, RepoReadSpansTool, RepoSearchTool};
 use azoth_core::turn::TurnDriver;
 use azoth_core::validators::{ContractGoalValidator, Validator};
 
@@ -42,11 +45,12 @@ use super::render;
 #[derive(Debug, Clone)]
 pub enum InputEvent {
     Key(KeyEvent),
+    Mouse(crossterm::event::MouseEvent),
     Resize,
 }
 
 pub struct AppState {
-    pub input_buffer: String,
+    pub textarea: TextArea<'static>,
     pub transcript: Vec<String>,
     pub status: String,
     pub ctx_pct: u8,
@@ -59,14 +63,28 @@ pub struct AppState {
     pub session_path: String,
     pub committed_turns: u32,
     pub current_contract_id: Option<ContractId>,
+    pub last_context_summary: Option<String>,
+    pending_approve: Option<String>,
+    input_history: Vec<String>,
+    history_cursor: usize,
+    /// Last turn's input token count — the real context window pressure.
+    pub last_input_tokens: u32,
+    /// Max context window from the active profile. Set once at startup.
+    pub max_context_tokens: u32,
+    /// Scroll offset for the transcript (0 = pinned to bottom).
+    pub scroll_offset: u16,
+    /// Whether the user has manually scrolled up (disables auto-scroll).
+    pub scroll_locked: bool,
 }
 
 impl AppState {
     pub fn new() -> Self {
+        let mut textarea = TextArea::default();
+        textarea.set_placeholder_text("type a message or /command…");
         Self {
-            input_buffer: String::new(),
+            textarea,
             transcript: vec!["azoth · ready".to_string()],
-            status: "mock adapter".to_string(),
+            status: "ready".to_string(),
             ctx_pct: 0,
             dirty: true,
             should_quit: false,
@@ -77,7 +95,19 @@ impl AppState {
             session_path: String::new(),
             committed_turns: 0,
             current_contract_id: None,
+            last_context_summary: None,
+            pending_approve: None,
+            input_history: Vec::new(),
+            history_cursor: 0,
+            last_input_tokens: 0,
+            max_context_tokens: 0,
+            scroll_offset: 0,
+            scroll_locked: false,
         }
+    }
+
+    fn textarea_content(&self) -> String {
+        self.textarea.lines().join("\n")
     }
 
     fn handle_slash(&mut self, cmd: SlashCommand) {
@@ -88,7 +118,7 @@ impl AppState {
                 self.transcript.push("  /status            run_id, session path, turn count".into());
                 self.transcript.push("  /context           latest compiled context packet".into());
                 self.transcript.push("  /contract <goal>   draft + accept a run contract".into());
-                self.transcript.push("  /approve           (not yet wired)".into());
+                self.transcript.push("  /approve [tool]    pre-approve a tool for the session".into());
                 self.transcript.push("  /resume <run_id>   (restart required in v1)".into());
                 self.transcript.push("  /quit              exit".into());
             }
@@ -109,9 +139,17 @@ impl AppState {
                         .unwrap_or_else(|| "(none)".to_string())
                 ));
             }
-            SlashCommand::Context => {
-                self.transcript.push("· context: no packet compiled yet".into());
-            }
+            SlashCommand::Context => match &self.last_context_summary {
+                Some(summary) => {
+                    self.transcript.push("· context".into());
+                    for line in summary.lines() {
+                        self.transcript.push(format!("  {line}"));
+                    }
+                }
+                None => {
+                    self.transcript.push("· context: no packet compiled yet".into());
+                }
+            },
             SlashCommand::Contract(rest) => match rest {
                 None => {
                     self.transcript.push("! usage: /contract <goal text>".into());
@@ -123,9 +161,21 @@ impl AppState {
                     self.pending_contract = Some(c);
                 }
             },
-            SlashCommand::Approve => {
-                self.transcript.push("! /approve not yet wired".into());
-            }
+            SlashCommand::Approve(arg) => match arg {
+                Some(tool_name) => {
+                    self.transcript.push(format!(
+                        "· approve: queuing session-scoped pre-approval for {tool_name}"
+                    ));
+                    self.pending_approve = Some(tool_name);
+                }
+                None => {
+                    self.transcript.push("· approve".into());
+                    self.transcript.push("  usage: /approve <tool_name>".into());
+                    self.transcript.push("  pre-grants a session-scoped capability token".into());
+                    self.transcript.push("  so the tool will not prompt for approval.".into());
+                    self.transcript.push("  registered tools: fs.write, bash, repo.search, repo.read_file, repo.read_spans".into());
+                }
+            },
             SlashCommand::Quit => {
                 self.should_quit = true;
             }
@@ -149,7 +199,27 @@ impl AppState {
     pub fn handle_input(&mut self, ev: InputEvent) {
         match ev {
             InputEvent::Key(key) => self.handle_key(key),
+            InputEvent::Mouse(me) => self.handle_mouse(me),
             InputEvent::Resize => self.dirty = true,
+        }
+    }
+
+    fn handle_mouse(&mut self, me: crossterm::event::MouseEvent) {
+        use crossterm::event::MouseEventKind;
+        match me.kind {
+            MouseEventKind::ScrollUp => {
+                self.scroll_offset = self.scroll_offset.saturating_add(3);
+                self.scroll_locked = true;
+                self.dirty = true;
+            }
+            MouseEventKind::ScrollDown => {
+                self.scroll_offset = self.scroll_offset.saturating_sub(3);
+                if self.scroll_offset == 0 {
+                    self.scroll_locked = false;
+                }
+                self.dirty = true;
+            }
+            _ => {}
         }
     }
 
@@ -189,28 +259,109 @@ impl AppState {
             (KeyCode::Char('c'), KeyModifiers::CONTROL)
             | (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
                 self.should_quit = true;
+                return;
             }
-            (KeyCode::Enter, _) => {
-                if !self.input_buffer.is_empty() {
-                    let line = std::mem::take(&mut self.input_buffer);
-                    self.transcript.push(format!("> {line}"));
-                    if let Some(cmd) = SlashCommand::parse(&line) {
+            (KeyCode::Enter, m) if !m.contains(KeyModifiers::ALT) => {
+                let content = self.textarea_content();
+                if !content.is_empty() {
+                    self.input_history.push(content.clone());
+                    self.history_cursor = self.input_history.len();
+                    self.textarea = TextArea::default();
+                    self.textarea.set_placeholder_text("type a message or /command…");
+                    self.transcript.push(format!("> {content}"));
+                    if let Some(cmd) = SlashCommand::parse(&content) {
                         self.handle_slash(cmd);
                     } else {
-                        self.pending_user_text = Some(line);
+                        self.pending_user_text = Some(content);
                     }
                     self.dirty = true;
                 }
+                return;
             }
-            (KeyCode::Backspace, _) => {
-                self.input_buffer.pop();
+            (KeyCode::Up, _)
+                if self.textarea.lines().len() == 1
+                    && self.textarea.lines()[0].is_empty()
+                    && self.history_cursor > 0 =>
+            {
+                self.history_cursor -= 1;
+                let prev = self.input_history[self.history_cursor].clone();
+                self.textarea = TextArea::from(prev.lines().map(String::from).collect::<Vec<_>>());
+                self.textarea.set_placeholder_text("type a message or /command…");
                 self.dirty = true;
+                return;
             }
-            (KeyCode::Char(c), _) => {
-                self.input_buffer.push(c);
+            (KeyCode::Down, _)
+                if self.textarea.lines().len() == 1
+                    && self.textarea.lines()[0].is_empty()
+                    && self.history_cursor < self.input_history.len() =>
+            {
+                self.history_cursor += 1;
+                if self.history_cursor < self.input_history.len() {
+                    let next = self.input_history[self.history_cursor].clone();
+                    self.textarea =
+                        TextArea::from(next.lines().map(String::from).collect::<Vec<_>>());
+                } else {
+                    self.textarea = TextArea::default();
+                }
+                self.textarea.set_placeholder_text("type a message or /command…");
                 self.dirty = true;
+                return;
+            }
+            (KeyCode::PageUp, _) => {
+                self.scroll_offset = self.scroll_offset.saturating_add(10);
+                self.scroll_locked = true;
+                self.dirty = true;
+                return;
+            }
+            (KeyCode::PageDown, _) => {
+                self.scroll_offset = self.scroll_offset.saturating_sub(10);
+                if self.scroll_offset == 0 {
+                    self.scroll_locked = false;
+                }
+                self.dirty = true;
+                return;
+            }
+            (KeyCode::Up, KeyModifiers::SHIFT) => {
+                self.scroll_offset = self.scroll_offset.saturating_add(1);
+                self.scroll_locked = true;
+                self.dirty = true;
+                return;
+            }
+            (KeyCode::Down, KeyModifiers::SHIFT) => {
+                self.scroll_offset = self.scroll_offset.saturating_sub(1);
+                if self.scroll_offset == 0 {
+                    self.scroll_locked = false;
+                }
+                self.dirty = true;
+                return;
+            }
+            (KeyCode::Up, KeyModifiers::CONTROL) => {
+                self.scroll_offset = self.scroll_offset.saturating_add(5);
+                self.scroll_locked = true;
+                self.dirty = true;
+                return;
+            }
+            (KeyCode::Down, KeyModifiers::CONTROL) => {
+                self.scroll_offset = self.scroll_offset.saturating_sub(5);
+                if self.scroll_offset == 0 {
+                    self.scroll_locked = false;
+                }
+                self.dirty = true;
+                return;
+            }
+            (KeyCode::End, KeyModifiers::CONTROL) | (KeyCode::Home, KeyModifiers::CONTROL) => {
+                self.scroll_offset = 0;
+                self.scroll_locked = false;
+                self.dirty = true;
+                return;
             }
             _ => {}
+        }
+        // All other keys route to tui-textarea's built-in handling
+        // (cursor movement, Alt+Enter for newline, Home/End, etc.)
+        let ta_input: TaInput = key.into();
+        if self.textarea.input(ta_input) {
+            self.dirty = true;
         }
     }
 
@@ -224,80 +375,114 @@ impl AppState {
         self.pending_contract.take()
     }
 
-    /// Render a `SessionEvent` from the TurnDriver as one or more scrollback
-    /// lines. Deliberately terse: v1 wants users to see that the real event
-    /// pipeline fired, not to pretty-print everything.
+    /// Drain any tool name the `/approve` handler queued for pre-approval.
+    pub fn take_pending_approve(&mut self) -> Option<String> {
+        self.pending_approve.take()
+    }
+
+    /// Render a `SessionEvent` into the transcript. Model text is shown
+    /// prominently; internal lifecycle events are suppressed or shown as
+    /// compact one-liners so the conversation is readable.
     pub fn handle_session_event(&mut self, ev: SessionEvent) {
         match ev {
             SessionEvent::ContractAccepted { contract, .. } => {
                 self.transcript.push(format!(
-                    "· contract_accepted {} goal={:?}",
-                    contract.id, contract.goal
+                    "  [contract accepted] {}",
+                    contract.goal
                 ));
                 self.current_contract_id = Some(contract.id);
             }
-            SessionEvent::TurnStarted { turn_id, .. } => {
-                self.transcript.push(format!("· turn_started {turn_id}"));
+            // Suppress noisy lifecycle events — they go to .azoth/azoth.log
+            SessionEvent::TurnStarted { .. }
+            | SessionEvent::ModelRequest { .. } => {}
+            SessionEvent::ContextPacket {
+                turn_id,
+                packet_id,
+                packet_digest,
+            } => {
+                self.last_context_summary = Some(format!(
+                    "packet_id  {packet_id}\nturn_id    {turn_id}\ndigest     {packet_digest}"
+                ));
             }
-            SessionEvent::ModelRequest { profile_id, .. } => {
-                self.transcript.push(format!("· model_request profile={profile_id}"));
-            }
-            SessionEvent::ContentBlock { index, block, .. } => match block {
+            SessionEvent::ContentBlock { block, .. } => match block {
                 ContentBlock::Text { text } => {
-                    self.transcript.push(format!("  ◂ text[{index}] {text}"));
+                    // Model text — the main content the user wants to read.
+                    for line in text.lines() {
+                        self.transcript.push(format!("  {line}"));
+                    }
                 }
-                ContentBlock::ToolUse { id, name, input, .. } => {
-                    self.transcript.push(format!(
-                        "  ▸ tool_use[{index}] {name}({input}) id={id}"
-                    ));
+                ContentBlock::ToolUse { name, input, .. } => {
+                    let summary = input
+                        .get("command")
+                        .or_else(|| input.get("path"))
+                        .or_else(|| input.get("q"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("...");
+                    self.transcript.push(format!("  [{name}] {summary}"));
                 }
-                ContentBlock::ToolResult { tool_use_id, is_error, .. } => {
-                    let tag = if is_error { "error" } else { "ok" };
-                    self.transcript.push(format!(
-                        "  ◂ tool_result[{index}] {tag} id={tool_use_id}"
-                    ));
+                ContentBlock::ToolResult { is_error, content, .. } => {
+                    if is_error {
+                        let msg = content
+                            .first()
+                            .and_then(|b| match b {
+                                ContentBlock::Text { text } => Some(text.as_str()),
+                                _ => None,
+                            })
+                            .unwrap_or("error");
+                        self.transcript.push(format!("  [error] {msg}"));
+                    }
                 }
                 ContentBlock::Thinking { .. } => {
-                    self.transcript.push(format!("  ◂ thinking[{index}]"));
+                    self.transcript.push("  [thinking...]".into());
                 }
             },
             SessionEvent::EffectRecord { effect, .. } => {
-                self.transcript.push(format!(
-                    "  ⚙ effect_record class={:?} tool={}",
-                    effect.class, effect.tool_name
-                ));
+                if effect.error.is_some() {
+                    self.transcript.push(format!(
+                        "  [effect error] {} {:?}",
+                        effect.tool_name, effect.error
+                    ));
+                }
             }
             SessionEvent::ToolResult { tool_use_id, is_error, .. } => {
-                let tag = if is_error { "error" } else { "ok" };
-                self.transcript.push(format!("  ✓ tool_result {tag} id={tool_use_id}"));
+                if is_error {
+                    self.transcript.push(format!("  [tool error] id={tool_use_id}"));
+                }
             }
-            SessionEvent::TurnCommitted { turn_id, outcome, usage } => {
-                let tag = match outcome {
-                    CommitOutcome::Success => "success",
-                    CommitOutcome::PartialSuccess => "partial",
+            SessionEvent::ApprovalGranted { scope, .. } => {
+                let scope_label = match &scope {
+                    ApprovalScope::Once => "once",
+                    ApprovalScope::Session => "session",
+                    ApprovalScope::ScopedPaths { .. } => "scoped-paths",
                 };
                 self.transcript.push(format!(
-                    "· turn_committed {turn_id} {tag} in={} out={}",
+                    "  [approved {scope_label}]"
+                ));
+            }
+            SessionEvent::TurnCommitted { usage, .. } => {
+                self.last_input_tokens = usage.input_tokens;
+                if self.max_context_tokens > 0 {
+                    self.ctx_pct = ((usage.input_tokens as u64 * 100)
+                        / self.max_context_tokens as u64)
+                        .min(100) as u8;
+                }
+                self.transcript.push(format!(
+                    "  [done] {} in / {} out tokens",
                     usage.input_tokens, usage.output_tokens
                 ));
                 self.committed_turns = self.committed_turns.saturating_add(1);
             }
-            SessionEvent::TurnAborted { turn_id, reason, detail, .. } => {
+            SessionEvent::TurnAborted { reason, detail, .. } => {
                 let d = detail.unwrap_or_default();
-                self.transcript.push(format!(
-                    "✗ turn_aborted {turn_id} reason={reason:?} {d}"
-                ));
+                self.transcript.push(format!("  [aborted] {reason:?}: {d}"));
             }
-            SessionEvent::TurnInterrupted { turn_id, reason, .. } => {
-                self.transcript.push(format!(
-                    "✗ turn_interrupted {turn_id} reason={reason:?}"
-                ));
+            SessionEvent::TurnInterrupted { reason, .. } => {
+                self.transcript.push(format!("  [interrupted] {reason:?}"));
             }
-            other => {
-                if let Some(tid) = other.turn_id() {
-                    self.transcript.push(format!("· event ({tid})"));
-                }
-            }
+            // Suppress all other internal events (ApprovalRequest,
+            // ApprovalDenied, SandboxEntered, Checkpoint, ValidatorResult,
+            // RunStarted). They're in the JSONL + log file.
+            _ => {}
         }
         self.dirty = true;
     }
@@ -308,40 +493,11 @@ impl AppState {
     }
 }
 
-/// Build a `MockScript` that exercises the full tool-use loop for one Enter:
-/// first a `repo.search` tool_use, then an `EndTurn` text response that
-/// acknowledges the result.
-fn scripted_fs_write(query: &str) -> MockScript {
-    MockScript {
-        turns: vec![
-            ModelTurnResponse {
-                content: vec![ContentBlock::ToolUse {
-                    id: ToolUseId::new(),
-                    name: "fs.write".into(),
-                    input: serde_json::json!({
-                        "path": ".azoth/tmp/hello.txt",
-                        "contents": format!("hello from approval path: {query}"),
-                    }),
-                    call_group: None,
-                }],
-                stop_reason: StopReason::ToolUse,
-                usage: Usage { input_tokens: 42, output_tokens: 16, ..Default::default() },
-            },
-            ModelTurnResponse {
-                content: vec![ContentBlock::Text {
-                    text: format!("(mock) wrote hello for {query:?}"),
-                }],
-                stop_reason: StopReason::EndTurn,
-                usage: Usage { input_tokens: 58, output_tokens: 24, ..Default::default() },
-            },
-        ],
-    }
-}
-
 pub async fn run_app(resume: Option<String>) -> io::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     stdout.execute(EnterAlternateScreen)?;
+    stdout.execute(EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -351,6 +507,7 @@ pub async fn run_app(resume: Option<String>) -> io::Result<()> {
     let (session_tx, mut session_rx) = mpsc::unbounded_channel::<SessionEvent>();
     let (error_tx, mut error_rx) = mpsc::channel::<String>(8);
     let (approval_req_tx, mut approval_req_rx) = mpsc::channel::<ApprovalRequestMsg>(8);
+    let (approve_tx, mut approve_rx) = mpsc::channel::<String>(8);
 
     // Dedicated input task — prevents the keyboard reader from being starved
     // by model streaming in the main select loop.
@@ -359,6 +516,7 @@ pub async fn run_app(resume: Option<String>) -> io::Result<()> {
         while let Some(Ok(ev)) = events.next().await {
             let to_send = match ev {
                 TermEvent::Key(k) => Some(InputEvent::Key(k)),
+                TermEvent::Mouse(m) => Some(InputEvent::Mouse(m)),
                 TermEvent::Resize(_, _) => Some(InputEvent::Resize),
                 _ => None,
             };
@@ -380,6 +538,12 @@ pub async fn run_app(resume: Option<String>) -> io::Result<()> {
     };
     let session_path = cwd.join(".azoth").join("sessions").join(format!("{run_id}.jsonl"));
     let artifacts_root = cwd.join(".azoth").join("artifacts");
+
+    // Resolve the provider profile on the main thread so we can read
+    // max_context_tokens for the status line before spawning the worker.
+    let provider_profile = super::config::resolve_profile();
+    let profile_max_ctx = provider_profile.max_context_tokens;
+    let profile_status = format!("{} · {}", provider_profile.name, provider_profile.model_id);
 
     let worker_session_tx = session_tx.clone();
     let worker_error_tx = error_tx.clone();
@@ -449,7 +613,10 @@ pub async fn run_app(resume: Option<String>) -> io::Result<()> {
 
         let mut dispatcher = ToolDispatcher::new();
         dispatcher.register(RepoSearchTool);
+        dispatcher.register(RepoReadFileTool);
+        dispatcher.register(RepoReadSpansTool);
         dispatcher.register(FsWriteTool);
+        dispatcher.register(BashTool);
         let dispatcher = Arc::new(dispatcher);
 
         let mut history: Vec<Message> = Vec::new();
@@ -472,6 +639,21 @@ pub async fn run_app(resume: Option<String>) -> io::Result<()> {
         // `ValidatorResult` per turn and gates the `Checkpoint`.
         let goal_validator = ContractGoalValidator;
         let validators: &[&dyn Validator] = &[&goal_validator];
+
+        // Build the real adapter from the profile resolved on the main thread.
+        tracing::info!(
+            profile = %provider_profile.name,
+            base_url = %provider_profile.base_url,
+            model = %provider_profile.model_id,
+            "resolved provider profile"
+        );
+        let adapter = super::config::build_adapter(&provider_profile);
+
+        // Evidence collector backed by ripgrep search over the repo root.
+        let retrieval = Arc::new(RipgrepLexicalRetrieval {
+            root: worker_cwd.clone(),
+        });
+        let evidence_collector = LexicalEvidenceCollector::new(retrieval);
 
         // Stash the last accepted contract from JSONL on startup/resume.
         // The writer tap replays ContractAccepted into the UI, but the
@@ -513,16 +695,37 @@ pub async fn run_app(resume: Option<String>) -> io::Result<()> {
                     }
                     continue;
                 }
+                maybe_approve = approve_rx.recv() => {
+                    let Some(tool_name) = maybe_approve else { break };
+                    // Look up the tool's effect class so we mint the right
+                    // token. Unknown tools get a warning but no token.
+                    if let Some(tool) = dispatcher.tool(&tool_name) {
+                        let ec = tool.effect_class();
+                        let tok = azoth_core::authority::mint_from_approval(
+                            &tool_name,
+                            ec,
+                            ApprovalScope::Session,
+                        );
+                        caps.mint(tok);
+                        let _ = worker_session_tx.send(SessionEvent::ApprovalGranted {
+                            turn_id: TurnId::from("pre-approve".to_string()),
+                            approval_id: ApprovalId::new(),
+                            token: CapabilityTokenId::new(),
+                            scope: ApprovalScope::Session,
+                        });
+                    } else {
+                        let _ = worker_error_tx
+                            .send(format!("approve: unknown tool {tool_name:?}"))
+                            .await;
+                    }
+                    continue;
+                }
                 maybe_user = user_rx.recv() => {
                     let Some(t) = maybe_user else { break };
                     t
                 }
             };
             let turn_id = TurnId::new();
-            let adapter = MockAdapter::new(
-                ProviderProfile::anthropic_default("claude-sonnet-4-6"),
-                scripted_fs_write(&user_text),
-            );
             let ctx = ExecutionContext {
                 run_id: worker_run_id.clone(),
                 turn_id: turn_id.clone(),
@@ -535,7 +738,7 @@ pub async fn run_app(resume: Option<String>) -> io::Result<()> {
 
             let mut driver = TurnDriver {
                 run_id: worker_run_id.clone(),
-                adapter: &adapter,
+                adapter: adapter.as_ref(),
                 dispatcher: dispatcher.as_ref(),
                 writer: &mut writer,
                 ctx: &ctx,
@@ -546,6 +749,7 @@ pub async fn run_app(resume: Option<String>) -> io::Result<()> {
                 kernel: Some(&kernel),
                 validators,
                 effects_consumed: &mut effects_consumed,
+                evidence_collector: Some(&evidence_collector),
             };
 
             let result = driver
@@ -568,6 +772,8 @@ pub async fn run_app(resume: Option<String>) -> io::Result<()> {
     let mut state = AppState::new();
     state.run_id = run_id.to_string();
     state.session_path = session_path.display().to_string();
+    state.max_context_tokens = profile_max_ctx;
+    state.status = profile_status;
     let banner = if resuming { "resumed" } else { "session" };
     state
         .transcript
@@ -590,6 +796,11 @@ pub async fn run_app(resume: Option<String>) -> io::Result<()> {
                         state.push_error("worker channel closed");
                     }
                 }
+                if let Some(tool_name) = state.take_pending_approve() {
+                    if approve_tx.send(tool_name).await.is_err() {
+                        state.push_error("worker channel closed");
+                    }
+                }
             }
             Some(ev) = session_rx.recv() => state.handle_session_event(ev),
             Some(req) = approval_req_rx.recv() => {
@@ -602,7 +813,7 @@ pub async fn run_app(resume: Option<String>) -> io::Result<()> {
         }
 
         if state.dirty {
-            terminal.draw(|f| render::frame(f, &state))?;
+            terminal.draw(|f| render::frame(f, &mut state))?;
             state.dirty = false;
         }
         if state.should_quit {
@@ -611,6 +822,7 @@ pub async fn run_app(resume: Option<String>) -> io::Result<()> {
     }
 
     disable_raw_mode()?;
+    terminal.backend_mut().execute(DisableMouseCapture)?;
     terminal.backend_mut().execute(LeaveAlternateScreen)?;
     Ok(())
 }
@@ -618,6 +830,7 @@ pub async fn run_app(resume: Option<String>) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use azoth_core::schemas::ContextPacketId;
 
     #[test]
     fn slash_contract_with_goal_queues_draft_for_worker() {
@@ -659,5 +872,53 @@ mod tests {
             timestamp: "2026-04-15T00:00:00Z".into(),
         });
         assert_eq!(state.current_contract_id.as_ref(), Some(&id));
+    }
+
+    #[test]
+    fn context_packet_event_populates_last_context_summary() {
+        let mut state = AppState::new();
+        assert!(state.last_context_summary.is_none());
+
+        state.handle_session_event(SessionEvent::ContextPacket {
+            turn_id: TurnId::new(),
+            packet_id: ContextPacketId::new(),
+            packet_digest: "sha256:abc123".into(),
+        });
+
+        let summary = state.last_context_summary.as_ref().expect("summary set");
+        assert!(summary.contains("sha256:abc123"));
+    }
+
+    #[test]
+    fn slash_context_shows_summary_when_present() {
+        let mut state = AppState::new();
+        state.last_context_summary = Some("packet_id  ctx_test\ndigest  sha256:ff".into());
+        state.handle_slash(SlashCommand::Context);
+        assert!(state.transcript.iter().any(|l| l.contains("ctx_test")));
+        assert!(!state.transcript.iter().any(|l| l.contains("no packet compiled yet")));
+    }
+
+    #[test]
+    fn slash_context_shows_stub_when_no_packet() {
+        let mut state = AppState::new();
+        state.handle_slash(SlashCommand::Context);
+        assert!(state.transcript.iter().any(|l| l.contains("no packet compiled yet")));
+    }
+
+    #[test]
+    fn slash_approve_with_arg_queues_tool_name() {
+        let mut state = AppState::new();
+        state.handle_slash(SlashCommand::Approve(Some("fs.write".into())));
+        let tool = state.take_pending_approve().expect("pending approve");
+        assert_eq!(tool, "fs.write");
+        assert!(state.transcript.iter().any(|l| l.contains("fs.write")));
+    }
+
+    #[test]
+    fn slash_approve_without_arg_shows_usage() {
+        let mut state = AppState::new();
+        state.handle_slash(SlashCommand::Approve(None));
+        assert!(state.take_pending_approve().is_none());
+        assert!(state.transcript.iter().any(|l| l.contains("usage: /approve")));
     }
 }

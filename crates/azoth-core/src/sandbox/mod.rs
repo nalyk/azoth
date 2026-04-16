@@ -39,6 +39,8 @@ pub mod tier_cd;
 pub use probe::probe_unprivileged_userns;
 pub use tier_a::TierA;
 pub use tier_b::{probe_fuse_overlayfs, TierB};
+#[cfg(target_os = "linux")]
+pub use tier_b::OverlayWorkspace;
 pub use tier_cd::{TierC, TierD};
 
 /// Pick a concrete sandbox for an effect class. Tiers C and D return
