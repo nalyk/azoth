@@ -117,6 +117,19 @@ pub enum SessionEvent {
         turn_id: TurnId,
         outcome: CommitOutcome,
         usage: Usage,
+        /// User message that triggered this turn, captured at turn-start.
+        /// Enables JSONL-only replay of the cross-turn history without
+        /// treating intermediate `ContentBlock` events as user-visible text.
+        /// `None` for turns written by pre-v1.5 driver versions.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        user_input: Option<Vec<ContentBlock>>,
+        /// Final assistant content (the `EndTurn`/`StopSequence` response,
+        /// with no unpaired `ToolUse` blocks). This is what the caller folds
+        /// back into the next turn's history for cross-turn memory; persisting
+        /// it lets a restarted worker rebuild that same history from JSONL.
+        /// `None` for turns written by pre-v1.5 driver versions.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        final_assistant: Option<Vec<ContentBlock>>,
     },
     TurnAborted {
         turn_id: TurnId,

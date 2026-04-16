@@ -15,7 +15,9 @@
 //! synthetic `turn_interrupted { reason: "crash" }` record.
 
 use crate::event_store::sqlite::SqliteMirror;
-use crate::schemas::{AbortReason, EffectClass, EffectCounter, SessionEvent, TurnId};
+use crate::schemas::{
+    AbortReason, EffectClass, EffectCounter, Message, Role, SessionEvent, TurnId,
+};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
@@ -38,9 +40,14 @@ pub enum ProjectionError {
 
 /// Append-only writer. Each `append` flushes the line to disk and fsyncs the
 /// file descriptor so replay is durable across crashes.
+///
+/// The on-disk file is opened lazily on the first `append` to avoid leaving
+/// 0-byte orphans when a worker aborts at startup (e.g. ArtifactStore open
+/// fails) before emitting any events — a bug observed in `.azoth/sessions/`
+/// after failed TUI startups.
 pub struct JsonlWriter {
     path: PathBuf,
-    file: BufWriter<File>,
+    file: Option<BufWriter<File>>,
     tap: Option<UnboundedSender<SessionEvent>>,
     mirror: Option<SqliteMirror>,
 }
@@ -51,10 +58,9 @@ impl JsonlWriter {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let file = OpenOptions::new().create(true).append(true).open(&path)?;
         Ok(Self {
             path,
-            file: BufWriter::new(file),
+            file: None,
             tap: None,
             mirror: None,
         })
@@ -100,10 +106,21 @@ impl JsonlWriter {
 
     pub fn append(&mut self, event: &SessionEvent) -> io::Result<()> {
         let line = serialize_line(event)?;
-        self.file.write_all(line.as_bytes())?;
-        self.file.write_all(b"\n")?;
-        self.file.flush()?;
-        self.file.get_ref().sync_data()?;
+        let file = match &mut self.file {
+            Some(f) => f,
+            None => {
+                let f = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&self.path)?;
+                self.file = Some(BufWriter::new(f));
+                self.file.as_mut().expect("just set")
+            }
+        };
+        file.write_all(line.as_bytes())?;
+        file.write_all(b"\n")?;
+        file.flush()?;
+        file.get_ref().sync_data()?;
         if let Some(tap) = &self.tap {
             let _ = tap.send(event.clone());
         }
@@ -268,6 +285,41 @@ impl JsonlReader {
         Ok((effects, turns_completed))
     }
 
+    /// Rebuild the cross-turn `Vec<Message>` a live worker would have in
+    /// memory after the prior session's committed turns, reading *only* from
+    /// the replayable projection. For each `TurnCommitted` that carries the
+    /// `user_input` + `final_assistant` rehydrate fields (introduced in v1.5),
+    /// pushes a `Role::User` message followed by a `Role::Assistant` message.
+    /// Turns committed before v1.5 — or with either field absent — are
+    /// skipped whole so a restarted worker never feeds a partial exchange
+    /// back to the model.
+    ///
+    /// The live worker path in v1.5 pushes `(user, assistant)` into history
+    /// after every `TurnCommitted`; this method is the replay mirror of that
+    /// same sequence and is what keeps `/resume` from hitting total amnesia.
+    pub fn rebuild_history(&self) -> Result<Vec<Message>, ProjectionError> {
+        let replay = self.replayable()?;
+        let mut history: Vec<Message> = Vec::new();
+        for ReplayableEvent(ev) in replay {
+            if let SessionEvent::TurnCommitted {
+                user_input: Some(user),
+                final_assistant: Some(assistant),
+                ..
+            } = ev
+            {
+                history.push(Message {
+                    role: Role::User,
+                    content: user,
+                });
+                history.push(Message {
+                    role: Role::Assistant,
+                    content: assistant,
+                });
+            }
+        }
+        Ok(history)
+    }
+
     /// Crash recovery: scan for turns with no terminal marker and append a
     /// synthetic `turn_interrupted { reason: "crash" }` record for each. Idempotent.
     pub fn recover_dangling_turns(&self) -> Result<Vec<TurnId>, ProjectionError> {
@@ -375,6 +427,8 @@ mod tests {
             turn_id: t1.clone(),
             outcome: CommitOutcome::Success,
             usage: Usage::default(),
+            user_input: None,
+            final_assistant: None,
         })
         .unwrap();
 
@@ -479,6 +533,43 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn open_without_append_does_not_create_file() {
+        // A worker that aborts at startup (e.g. ArtifactStore::open fails)
+        // before emitting any event must not leave a 0-byte orphan in
+        // .azoth/sessions/. Observed previously as run_7df1b3bf6cd5.jsonl
+        // at 0 bytes after a crashed TUI startup.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("deeper").join("session.jsonl");
+        let w = JsonlWriter::open(&path).unwrap();
+        assert!(
+            !path.exists(),
+            "open() must not touch disk; file created only on first append"
+        );
+        // Parent dir is still created eagerly — it's idempotent and cheap,
+        // and ensures the subsequent append() can't fail for that reason.
+        assert!(path.parent().unwrap().is_dir());
+        drop(w);
+        assert!(!path.exists(), "drop without append still leaves no file");
+    }
+
+    #[test]
+    fn first_append_creates_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let mut w = JsonlWriter::open(&path).unwrap();
+        assert!(!path.exists());
+        w.append(&SessionEvent::RunStarted {
+            run_id: RunId::from("run_x".to_string()),
+            contract_id: ContractId::from("ctr_x".to_string()),
+            timestamp: ts(),
+        })
+        .unwrap();
+        assert!(path.exists(), "first append creates the file");
+        let bytes = std::fs::metadata(&path).unwrap().len();
+        assert!(bytes > 0);
     }
 
     #[test]

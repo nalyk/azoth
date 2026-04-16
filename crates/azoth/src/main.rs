@@ -5,6 +5,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
+mod export;
 mod replay;
 
 #[derive(Parser, Debug)]
@@ -37,6 +38,22 @@ enum Command {
         /// Directory containing `<run_id>.jsonl`. Defaults to `.azoth/sessions`.
         #[arg(long)]
         sessions_dir: Option<PathBuf>,
+    },
+    /// Render a committed-only conversation transcript from a prior session.
+    /// Markdown by default (human-shareable); `--format json` passes through
+    /// the replayable `SessionEvent` stream as line-delimited JSON.
+    Export {
+        /// The `run_id` of the session file to read.
+        run_id: String,
+        /// Output format.
+        #[arg(long, value_enum, default_value_t = export::Format::Markdown)]
+        format: export::Format,
+        /// Directory containing `<run_id>.jsonl`. Defaults to `.azoth/sessions`.
+        #[arg(long)]
+        sessions_dir: Option<PathBuf>,
+        /// Write to this file instead of stdout.
+        #[arg(long)]
+        output: Option<PathBuf>,
     },
     /// Dump version + build info.
     Version,
@@ -99,6 +116,38 @@ fn main() {
             let mut lock = stdout.lock();
             if let Err(e) = replay::run(args, &mut lock) {
                 eprintln!("replay error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Command::Export {
+            run_id,
+            format,
+            sessions_dir,
+            output,
+        } => {
+            let sessions_dir =
+                sessions_dir.unwrap_or_else(|| PathBuf::from(".azoth").join("sessions"));
+            let args = export::Args {
+                run_id,
+                sessions_dir,
+                format,
+            };
+            let result = match output {
+                Some(path) => match std::fs::File::create(&path) {
+                    Ok(mut f) => export::run(args, &mut f),
+                    Err(e) => {
+                        eprintln!("export: create {}: {e}", path.display());
+                        std::process::exit(1);
+                    }
+                },
+                None => {
+                    let stdout = std::io::stdout();
+                    let mut lock = stdout.lock();
+                    export::run(args, &mut lock)
+                }
+            };
+            if let Err(e) = result {
+                eprintln!("export error: {e}");
                 std::process::exit(1);
             }
         }

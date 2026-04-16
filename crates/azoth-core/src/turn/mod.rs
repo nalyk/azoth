@@ -153,6 +153,13 @@ impl<'a> TurnDriver<'a> {
         system: String,
         mut messages: Vec<Message>,
     ) -> Result<TurnOutcome, TurnError> {
+        // Capture the triggering user input before tool-loop pushes any
+        // tool_result User messages. Persisted on TurnCommitted so a
+        // restarted worker can rebuild the full history from JSONL alone.
+        let user_input_content: Option<Vec<ContentBlock>> = messages
+            .last()
+            .filter(|m| matches!(m.role, Role::User))
+            .map(|m| m.content.clone());
         // Contract-scoped guard: refuse to even open the turn if the
         // persisted contract has set a max_turns and we are at/over it.
         if let Some(c) = self.contract {
@@ -632,11 +639,15 @@ impl<'a> TurnDriver<'a> {
                     continue;
                 }
                 StopReason::EndTurn | StopReason::StopSequence => {
-                    // Run validators + emit Checkpoint on the natural-exit
-                    // path, gated on `(contract.is_some(), !validators.is_empty())`
-                    // so turns without either keep the pre-validators byte
-                    // shape exactly.
-                    if let (Some(contract), false) = (self.contract, self.validators.is_empty()) {
+                    // Contract-scoped commit gate. Validators run if any are
+                    // wired; Checkpoint emits on every successful contract
+                    // turn regardless of validator count, because invariant
+                    // #5 calls for a checkpoint per committed turn — the
+                    // per-turn attestation shouldn't require a validator to
+                    // exist, just a contract to attest against. Contract-less
+                    // runs still skip both branches and keep the pre-contract
+                    // byte shape (no Checkpoint, no ValidatorResult).
+                    if let Some(contract) = self.contract {
                         let mut failed: Option<(String, Option<String>)> = None;
                         for v in self.validators.iter() {
                             let report = v.check(contract);
@@ -679,6 +690,8 @@ impl<'a> TurnDriver<'a> {
                         turn_id: turn_id.clone(),
                         outcome: CommitOutcome::Success,
                         usage: total_usage.clone(),
+                        user_input: user_input_content.clone(),
+                        final_assistant: Some(response.content.clone()),
                     })?;
                     telemetry::emit_turn_committed(
                         &self.run_id.0,
