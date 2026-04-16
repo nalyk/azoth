@@ -178,7 +178,10 @@ mod tests {
     #[test]
     fn ollama_anthropic_profile_uses_correct_adapter() {
         let profiles = built_in_profiles();
-        let p = profiles.iter().find(|p| p.name == "ollama-qwen-anthropic").unwrap();
+        let p = profiles
+            .iter()
+            .find(|p| p.name == "ollama-qwen-anthropic")
+            .unwrap();
         assert_eq!(p.adapter_kind, AdapterKind::AnthropicMessages);
         assert_eq!(p.base_url, "http://localhost:11434");
         assert_eq!(p.model_id, "nalyk-qwen35-opus-9b");
@@ -188,7 +191,10 @@ mod tests {
     #[test]
     fn ollama_openai_profile_uses_correct_adapter() {
         let profiles = built_in_profiles();
-        let p = profiles.iter().find(|p| p.name == "ollama-qwen-openai").unwrap();
+        let p = profiles
+            .iter()
+            .find(|p| p.name == "ollama-qwen-openai")
+            .unwrap();
         assert_eq!(p.adapter_kind, AdapterKind::OpenAiChatCompletions);
         assert_eq!(p.base_url, "http://localhost:11434/v1");
     }
@@ -225,6 +231,9 @@ mod tests {
         };
         let adapter = build_adapter(&entry);
         assert_eq!(adapter.profile().base_url, "http://test:5678/v1");
-        assert_eq!(adapter.profile().tool_use_shape, ToolUseShape::FlatToolCalls);
+        assert_eq!(
+            adapter.profile().tool_use_shape,
+            ToolUseShape::FlatToolCalls
+        );
     }
 }

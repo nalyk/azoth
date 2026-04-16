@@ -11,31 +11,33 @@
 //! turn_started → content_block → effect_record → tool_result →
 //! turn_committed sequence renders into the transcript in real time.
 
+use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use crossterm::event::{Event as TermEvent, EventStream, KeyCode, KeyEvent, KeyModifiers};
-use crossterm::event::{EnableMouseCapture, DisableMouseCapture};
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
 use crossterm::ExecutableCommand;
 use futures::StreamExt;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use std::io;
 use std::sync::Arc;
-use tui_textarea::{Input as TaInput, TextArea};
 use tokio::sync::mpsc;
+use tui_textarea::{Input as TaInput, TextArea};
 
 use azoth_core::artifacts::ArtifactStore;
-use azoth_core::authority::{
-    ApprovalRequestMsg, ApprovalResponse, CapabilityStore,
-};
+use azoth_core::authority::{ApprovalRequestMsg, ApprovalResponse, CapabilityStore};
 use azoth_core::context::LexicalEvidenceCollector;
-use azoth_core::retrieval::RipgrepLexicalRetrieval;
 use azoth_core::event_store::{JsonlReader, JsonlWriter, SqliteMirror};
 use azoth_core::execution::{CancellationToken, ExecutionContext, ToolDispatcher};
+use azoth_core::retrieval::RipgrepLexicalRetrieval;
 use azoth_core::schemas::{
-    ApprovalId, ApprovalScope, CapabilityTokenId, ContentBlock, Contract,
-    ContractId, Message, RunId, SessionEvent, TurnId,
+    ApprovalId, ApprovalScope, CapabilityTokenId, ContentBlock, Contract, ContractId, Message,
+    RunId, SessionEvent, TurnId,
 };
-use azoth_core::tools::{BashTool, FsWriteTool, RepoReadFileTool, RepoReadSpansTool, RepoSearchTool};
+use azoth_core::tools::{
+    BashTool, FsWriteTool, RepoReadFileTool, RepoReadSpansTool, RepoSearchTool,
+};
 use azoth_core::turn::TurnDriver;
 use azoth_core::validators::{ContractGoalValidator, Validator};
 
@@ -114,23 +116,36 @@ impl AppState {
         match cmd {
             SlashCommand::Help => {
                 self.transcript.push("· help".into());
-                self.transcript.push("  /help              show this list".into());
-                self.transcript.push("  /status            run_id, session path, turn count".into());
-                self.transcript.push("  /context           latest compiled context packet".into());
-                self.transcript.push("  /contract <goal>   draft + accept a run contract".into());
-                self.transcript.push("  /approve [tool]    pre-approve a tool for the session".into());
-                self.transcript.push("  /resume <run_id>   (restart required in v1)".into());
+                self.transcript
+                    .push("  /help              show this list".into());
+                self.transcript
+                    .push("  /status            run_id, session path, turn count".into());
+                self.transcript
+                    .push("  /context           latest compiled context packet".into());
+                self.transcript
+                    .push("  /contract <goal>   draft + accept a run contract".into());
+                self.transcript
+                    .push("  /approve [tool]    pre-approve a tool for the session".into());
+                self.transcript
+                    .push("  /resume <run_id>   (restart required in v1)".into());
                 self.transcript.push("  /quit              exit".into());
             }
             SlashCommand::Status => {
                 self.transcript.push("· status".into());
-                self.transcript.push(format!("  run_id        {}", self.run_id));
-                self.transcript.push(format!("  session_path  {}", self.session_path));
+                self.transcript
+                    .push(format!("  run_id        {}", self.run_id));
+                self.transcript
+                    .push(format!("  session_path  {}", self.session_path));
                 self.transcript.push(format!(
                     "  pending_appr  {}",
-                    if self.pending_approval.is_some() { "yes" } else { "no" }
+                    if self.pending_approval.is_some() {
+                        "yes"
+                    } else {
+                        "no"
+                    }
                 ));
-                self.transcript.push(format!("  turns         {}", self.committed_turns));
+                self.transcript
+                    .push(format!("  turns         {}", self.committed_turns));
                 self.transcript.push(format!(
                     "  contract      {}",
                     self.current_contract_id
@@ -147,12 +162,14 @@ impl AppState {
                     }
                 }
                 None => {
-                    self.transcript.push("· context: no packet compiled yet".into());
+                    self.transcript
+                        .push("· context: no packet compiled yet".into());
                 }
             },
             SlashCommand::Contract(rest) => match rest {
                 None => {
-                    self.transcript.push("! usage: /contract <goal text>".into());
+                    self.transcript
+                        .push("! usage: /contract <goal text>".into());
                 }
                 Some(goal) => {
                     let mut c = azoth_core::contract::draft(goal.clone());
@@ -171,8 +188,10 @@ impl AppState {
                 None => {
                     self.transcript.push("· approve".into());
                     self.transcript.push("  usage: /approve <tool_name>".into());
-                    self.transcript.push("  pre-grants a session-scoped capability token".into());
-                    self.transcript.push("  so the tool will not prompt for approval.".into());
+                    self.transcript
+                        .push("  pre-grants a session-scoped capability token".into());
+                    self.transcript
+                        .push("  so the tool will not prompt for approval.".into());
                     self.transcript.push("  registered tools: fs.write, bash, repo.search, repo.read_file, repo.read_spans".into());
                 }
             },
@@ -267,7 +286,8 @@ impl AppState {
                     self.input_history.push(content.clone());
                     self.history_cursor = self.input_history.len();
                     self.textarea = TextArea::default();
-                    self.textarea.set_placeholder_text("type a message or /command…");
+                    self.textarea
+                        .set_placeholder_text("type a message or /command…");
                     self.transcript.push(format!("> {content}"));
                     if let Some(cmd) = SlashCommand::parse(&content) {
                         self.handle_slash(cmd);
@@ -286,7 +306,8 @@ impl AppState {
                 self.history_cursor -= 1;
                 let prev = self.input_history[self.history_cursor].clone();
                 self.textarea = TextArea::from(prev.lines().map(String::from).collect::<Vec<_>>());
-                self.textarea.set_placeholder_text("type a message or /command…");
+                self.textarea
+                    .set_placeholder_text("type a message or /command…");
                 self.dirty = true;
                 return;
             }
@@ -303,7 +324,8 @@ impl AppState {
                 } else {
                     self.textarea = TextArea::default();
                 }
-                self.textarea.set_placeholder_text("type a message or /command…");
+                self.textarea
+                    .set_placeholder_text("type a message or /command…");
                 self.dirty = true;
                 return;
             }
@@ -386,15 +408,12 @@ impl AppState {
     pub fn handle_session_event(&mut self, ev: SessionEvent) {
         match ev {
             SessionEvent::ContractAccepted { contract, .. } => {
-                self.transcript.push(format!(
-                    "  [contract accepted] {}",
-                    contract.goal
-                ));
+                self.transcript
+                    .push(format!("  [contract accepted] {}", contract.goal));
                 self.current_contract_id = Some(contract.id);
             }
             // Suppress noisy lifecycle events — they go to .azoth/azoth.log
-            SessionEvent::TurnStarted { .. }
-            | SessionEvent::ModelRequest { .. } => {}
+            SessionEvent::TurnStarted { .. } | SessionEvent::ModelRequest { .. } => {}
             SessionEvent::ContextPacket {
                 turn_id,
                 packet_id,
@@ -420,7 +439,9 @@ impl AppState {
                         .unwrap_or("...");
                     self.transcript.push(format!("  [{name}] {summary}"));
                 }
-                ContentBlock::ToolResult { is_error, content, .. } => {
+                ContentBlock::ToolResult {
+                    is_error, content, ..
+                } => {
                     if is_error {
                         let msg = content
                             .first()
@@ -444,9 +465,14 @@ impl AppState {
                     ));
                 }
             }
-            SessionEvent::ToolResult { tool_use_id, is_error, .. } => {
+            SessionEvent::ToolResult {
+                tool_use_id,
+                is_error,
+                ..
+            } => {
                 if is_error {
-                    self.transcript.push(format!("  [tool error] id={tool_use_id}"));
+                    self.transcript
+                        .push(format!("  [tool error] id={tool_use_id}"));
                 }
             }
             SessionEvent::ApprovalGranted { scope, .. } => {
@@ -455,9 +481,7 @@ impl AppState {
                     ApprovalScope::Session => "session",
                     ApprovalScope::ScopedPaths { .. } => "scoped-paths",
                 };
-                self.transcript.push(format!(
-                    "  [approved {scope_label}]"
-                ));
+                self.transcript.push(format!("  [approved {scope_label}]"));
             }
             SessionEvent::TurnCommitted { usage, .. } => {
                 self.last_input_tokens = usage.input_tokens;
@@ -536,7 +560,10 @@ pub async fn run_app(resume: Option<String>) -> io::Result<()> {
         Some(s) => RunId::from(s),
         None => RunId::new(),
     };
-    let session_path = cwd.join(".azoth").join("sessions").join(format!("{run_id}.jsonl"));
+    let session_path = cwd
+        .join(".azoth")
+        .join("sessions")
+        .join(format!("{run_id}.jsonl"));
     let artifacts_root = cwd.join(".azoth").join("artifacts");
 
     // Resolve the provider profile on the main thread so we can read
@@ -895,14 +922,20 @@ mod tests {
         state.last_context_summary = Some("packet_id  ctx_test\ndigest  sha256:ff".into());
         state.handle_slash(SlashCommand::Context);
         assert!(state.transcript.iter().any(|l| l.contains("ctx_test")));
-        assert!(!state.transcript.iter().any(|l| l.contains("no packet compiled yet")));
+        assert!(!state
+            .transcript
+            .iter()
+            .any(|l| l.contains("no packet compiled yet")));
     }
 
     #[test]
     fn slash_context_shows_stub_when_no_packet() {
         let mut state = AppState::new();
         state.handle_slash(SlashCommand::Context);
-        assert!(state.transcript.iter().any(|l| l.contains("no packet compiled yet")));
+        assert!(state
+            .transcript
+            .iter()
+            .any(|l| l.contains("no packet compiled yet")));
     }
 
     #[test]
@@ -919,6 +952,9 @@ mod tests {
         let mut state = AppState::new();
         state.handle_slash(SlashCommand::Approve(None));
         assert!(state.take_pending_approve().is_none());
-        assert!(state.transcript.iter().any(|l| l.contains("usage: /approve")));
+        assert!(state
+            .transcript
+            .iter()
+            .any(|l| l.contains("usage: /approve")));
     }
 }

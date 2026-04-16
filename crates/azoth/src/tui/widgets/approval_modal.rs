@@ -35,7 +35,9 @@ pub fn render(f: &mut Frame, area: Rect, req: &ApprovalRequestMsg) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" approval required ");
-    let body = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
+    let body = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false });
     f.render_widget(body, rect);
 }
 

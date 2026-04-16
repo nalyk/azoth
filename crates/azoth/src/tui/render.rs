@@ -5,7 +5,9 @@ use super::widgets::approval_modal;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap};
+use ratatui::widgets::{
+    Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
+};
 use ratatui::Frame;
 
 pub fn frame(f: &mut Frame, state: &mut AppState) {
@@ -26,7 +28,11 @@ pub fn frame(f: &mut Frame, state: &mut AppState) {
         Span::raw("  ctx "),
         Span::styled(
             format!("{}%", state.ctx_pct),
-            Style::default().fg(if state.ctx_pct >= 80 { Color::Red } else { Color::Cyan }),
+            Style::default().fg(if state.ctx_pct >= 80 {
+                Color::Red
+            } else {
+                Color::Cyan
+            }),
         ),
     ]);
     f.render_widget(Paragraph::new(status), chunks[0]);
@@ -43,7 +49,9 @@ pub fn frame(f: &mut Frame, state: &mut AppState) {
     // Compute the scroll position: when not locked, pin to bottom.
     let max_scroll = total_lines.saturating_sub(visible_height);
     let scroll_pos = if state.scroll_locked {
-        max_scroll.saturating_sub(state.scroll_offset).min(max_scroll)
+        max_scroll
+            .saturating_sub(state.scroll_offset)
+            .min(max_scroll)
     } else {
         // Auto-scroll: always show the latest lines.
         state.scroll_offset = 0;
@@ -58,8 +66,8 @@ pub fn frame(f: &mut Frame, state: &mut AppState) {
 
     // Scrollbar indicator.
     if total_lines > visible_height {
-        let mut scrollbar_state = ScrollbarState::new(max_scroll as usize)
-            .position(scroll_pos as usize);
+        let mut scrollbar_state =
+            ScrollbarState::new(max_scroll as usize).position(scroll_pos as usize);
         f.render_stateful_widget(
             Scrollbar::new(ScrollbarOrientation::VerticalRight),
             chunks[1],

@@ -4,9 +4,9 @@
 
 pub mod app;
 pub mod config;
+pub mod input;
 pub mod render;
 pub mod widgets;
-pub mod input;
 
 pub fn run(resume: Option<String>) -> std::io::Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()
