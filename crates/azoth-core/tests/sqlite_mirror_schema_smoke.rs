@@ -36,6 +36,8 @@ fn committed(tid: &str) -> SessionEvent {
             output_tokens: 4,
             ..Default::default()
         },
+        user_input: None,
+        final_assistant: None,
     }
 }
 

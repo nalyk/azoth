@@ -646,7 +646,25 @@ pub async fn run_app(resume: Option<String>) -> io::Result<()> {
         dispatcher.register(BashTool);
         let dispatcher = Arc::new(dispatcher);
 
-        let mut history: Vec<Message> = Vec::new();
+        // Resume amnesia fix: if we're opening an existing session, rebuild
+        // the cross-turn `Vec<Message>` the prior worker had in memory from
+        // the replayable JSONL projection. Fresh sessions start empty (no
+        // TurnCommitted events exist yet, so `rebuild_history` would return
+        // an empty Vec anyway — but skipping the read avoids a spurious
+        // file-open on the brand-new path). Any read error falls back to an
+        // empty history so the session at least starts cleanly instead of
+        // aborting the worker.
+        let mut history: Vec<Message> = if resuming {
+            match JsonlReader::open(&worker_session_path).rebuild_history() {
+                Ok(h) => h,
+                Err(e) => {
+                    tracing::warn!(error = %e, "rebuild history failed, starting empty");
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
+        };
         let mut caps = CapabilityStore::new();
 
         // Per-worker ContextKernel. Reused across turns because its fields

@@ -112,6 +112,7 @@ impl SqliteMirror {
                 turn_id,
                 outcome,
                 usage,
+                ..
             } => {
                 let run_id = self.run_id_for_upsert();
                 self.upsert_turn(
@@ -265,6 +266,8 @@ mod tests {
                 output_tokens: output,
                 ..Default::default()
             },
+            user_input: None,
+            final_assistant: None,
         }
     }
 

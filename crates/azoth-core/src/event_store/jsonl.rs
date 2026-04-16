@@ -15,7 +15,9 @@
 //! synthetic `turn_interrupted { reason: "crash" }` record.
 
 use crate::event_store::sqlite::SqliteMirror;
-use crate::schemas::{AbortReason, EffectClass, EffectCounter, SessionEvent, TurnId};
+use crate::schemas::{
+    AbortReason, EffectClass, EffectCounter, Message, Role, SessionEvent, TurnId,
+};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
@@ -268,6 +270,41 @@ impl JsonlReader {
         Ok((effects, turns_completed))
     }
 
+    /// Rebuild the cross-turn `Vec<Message>` a live worker would have in
+    /// memory after the prior session's committed turns, reading *only* from
+    /// the replayable projection. For each `TurnCommitted` that carries the
+    /// `user_input` + `final_assistant` rehydrate fields (introduced in v1.5),
+    /// pushes a `Role::User` message followed by a `Role::Assistant` message.
+    /// Turns committed before v1.5 — or with either field absent — are
+    /// skipped whole so a restarted worker never feeds a partial exchange
+    /// back to the model.
+    ///
+    /// The live worker path in v1.5 pushes `(user, assistant)` into history
+    /// after every `TurnCommitted`; this method is the replay mirror of that
+    /// same sequence and is what keeps `/resume` from hitting total amnesia.
+    pub fn rebuild_history(&self) -> Result<Vec<Message>, ProjectionError> {
+        let replay = self.replayable()?;
+        let mut history: Vec<Message> = Vec::new();
+        for ReplayableEvent(ev) in replay {
+            if let SessionEvent::TurnCommitted {
+                user_input: Some(user),
+                final_assistant: Some(assistant),
+                ..
+            } = ev
+            {
+                history.push(Message {
+                    role: Role::User,
+                    content: user,
+                });
+                history.push(Message {
+                    role: Role::Assistant,
+                    content: assistant,
+                });
+            }
+        }
+        Ok(history)
+    }
+
     /// Crash recovery: scan for turns with no terminal marker and append a
     /// synthetic `turn_interrupted { reason: "crash" }` record for each. Idempotent.
     pub fn recover_dangling_turns(&self) -> Result<Vec<TurnId>, ProjectionError> {
@@ -375,6 +412,8 @@ mod tests {
             turn_id: t1.clone(),
             outcome: CommitOutcome::Success,
             usage: Usage::default(),
+            user_input: None,
+            final_assistant: None,
         })
         .unwrap();
 

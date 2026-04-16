@@ -325,6 +325,8 @@ mod tests {
                     output_tokens: 5,
                     ..Default::default()
                 },
+                user_input: None,
+                final_assistant: None,
             },
             SessionEvent::TurnStarted {
                 turn_id: t2.clone(),

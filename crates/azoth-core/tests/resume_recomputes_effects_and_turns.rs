@@ -77,6 +77,8 @@ fn committed_run_progress_counts_only_committed_turn_effects() {
         turn_id: t1.clone(),
         outcome: CommitOutcome::Success,
         usage: Usage::default(),
+        user_input: None,
+        final_assistant: None,
     })
     .unwrap();
 
@@ -133,6 +135,8 @@ fn committed_run_progress_counts_only_committed_turn_effects() {
         turn_id: t3,
         outcome: CommitOutcome::Success,
         usage: Usage::default(),
+        user_input: None,
+        final_assistant: None,
     })
     .unwrap();
 
