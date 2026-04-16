@@ -250,9 +250,18 @@ async fn failing_validator_writes_abort_and_no_checkpoint_or_commit() {
 }
 
 #[tokio::test]
-async fn empty_validators_slice_keeps_pre_validators_byte_shape() {
-    // A driver with `validators: &[]` must skip the validator/checkpoint
-    // block entirely — no ValidatorResult, no Checkpoint, just TurnCommitted.
+async fn empty_validators_slice_still_emits_checkpoint_per_invariant_5() {
+    // With a contract but no validators wired, the driver must still emit
+    // a Checkpoint on each committed turn — invariant #5 ("every run
+    // leaves structured evidence including checkpoints") applies even when
+    // no validator is there to attest. This was a latent is_some() gate
+    // (see .claude memory: graceful-degradation-bypasses-invariants) that
+    // had previously been locked in as "pre-validators byte shape" — but
+    // the invariant takes precedence over the byte-shape preservation.
+    //
+    // Still no ValidatorResult (nothing to report) and, of course, the
+    // commit marker. Contract-less runs keep the no-Checkpoint path —
+    // that's tested in other integration tests.
     let dir = tempdir().unwrap();
     let repo_root = dir.path().to_path_buf();
     let artifacts_root = repo_root.join(".azoth/artifacts");
@@ -270,10 +279,10 @@ async fn empty_validators_slice_keeps_pre_validators_byte_shape() {
         "empty validators slice must not emit ValidatorResult"
     );
     assert!(
-        !events
+        events
             .iter()
             .any(|e| matches!(e, SessionEvent::Checkpoint { .. })),
-        "empty validators slice must not emit Checkpoint"
+        "contract-scoped commit must emit Checkpoint even when validators is empty"
     );
     assert!(
         events
