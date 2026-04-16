@@ -26,7 +26,9 @@ use tokio::sync::mpsc;
 fn mock_end_turn_only() -> MockScript {
     MockScript {
         turns: vec![ModelTurnResponse {
-            content: vec![ContentBlock::Text { text: "done".into() }],
+            content: vec![ContentBlock::Text {
+                text: "done".into(),
+            }],
             stop_reason: StopReason::EndTurn,
             usage: Usage {
                 input_tokens: 4,
@@ -52,7 +54,7 @@ fn first_model_request_digest(session_path: &std::path::Path) -> String {
 async fn drive_one_turn(
     session_path: &std::path::Path,
     artifacts_root: &std::path::Path,
-    repo_root: &std::path::PathBuf,
+    repo_root: &std::path::Path,
     kernel: Option<&ContextKernel<'_>>,
     contract_ref: &Contract,
 ) {
@@ -70,7 +72,7 @@ async fn drive_one_turn(
         turn_id: turn_id.clone(),
         artifacts,
         cancellation: CancellationToken::new(),
-        repo_root: repo_root.clone(),
+        repo_root: repo_root.to_path_buf(),
     };
     let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalRequestMsg>(8);
     let mut caps = CapabilityStore::new();
@@ -119,12 +121,9 @@ async fn kernel_shadows_system_and_changes_request_digest() {
     let mut seed = JsonlWriter::open(&seed_path).unwrap();
     let mut drafted = contract::draft("bind contract into request");
     drafted.success_criteria.push("digest flows in".into());
-    let persisted = contract::accept_and_persist(
-        &mut seed,
-        drafted,
-        "2026-04-15T00:00:00Z".to_string(),
-    )
-    .expect("persist ok");
+    let persisted =
+        contract::accept_and_persist(&mut seed, drafted, "2026-04-15T00:00:00Z".to_string())
+            .expect("persist ok");
     drop(seed);
 
     // Run A: no kernel — baseline request_digest with just the raw system.
@@ -193,7 +192,7 @@ async fn kernel_without_contract_is_a_noop() {
     async fn run_one(
         path: &std::path::Path,
         artifacts_root: &std::path::Path,
-        repo_root: &std::path::PathBuf,
+        repo_root: &std::path::Path,
         kernel: Option<&ContextKernel<'_>>,
     ) -> String {
         let mut writer = JsonlWriter::open(path).unwrap();
@@ -210,7 +209,7 @@ async fn kernel_without_contract_is_a_noop() {
             turn_id: turn_id.clone(),
             artifacts,
             cancellation: CancellationToken::new(),
-            repo_root: repo_root.clone(),
+            repo_root: repo_root.to_path_buf(),
         };
         let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalRequestMsg>(8);
         let mut caps = CapabilityStore::new();

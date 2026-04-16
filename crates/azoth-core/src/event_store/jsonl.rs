@@ -167,8 +167,11 @@ impl JsonlReader {
             if line.trim().is_empty() {
                 continue;
             }
-            let ev: SessionEvent = serde_json::from_str(&line)
-                .map_err(|source| ProjectionError::Parse { line: idx + 1, source })?;
+            let ev: SessionEvent =
+                serde_json::from_str(&line).map_err(|source| ProjectionError::Parse {
+                    line: idx + 1,
+                    source,
+                })?;
 
             match &ev {
                 SessionEvent::TurnCommitted { turn_id, .. } => {
@@ -210,7 +213,10 @@ impl JsonlReader {
             .into_iter()
             .map(|ev| {
                 let non_replayable = !is_replayable(&ev, &scan.outcomes);
-                ForensicEvent { event: ev, non_replayable }
+                ForensicEvent {
+                    event: ev,
+                    non_replayable,
+                }
             })
             .collect())
     }
@@ -352,7 +358,9 @@ mod tests {
         w.append(&SessionEvent::ContentBlock {
             turn_id: t1.clone(),
             index: 0,
-            block: ContentBlock::Text { text: "hello".into() },
+            block: ContentBlock::Text {
+                text: "hello".into(),
+            },
         })
         .unwrap();
         w.append(&SessionEvent::ToolResult {
@@ -410,7 +418,12 @@ mod tests {
         let r = JsonlReader::open(&path);
         let replay = r.replayable().unwrap();
         // Expect: RunStarted + exactly t1's four events.
-        assert_eq!(replay.len(), 5, "replay: {:#?}", replay.iter().map(|e| &e.0).collect::<Vec<_>>());
+        assert_eq!(
+            replay.len(),
+            5,
+            "replay: {:#?}",
+            replay.iter().map(|e| &e.0).collect::<Vec<_>>()
+        );
         for e in &replay {
             match e.0.turn_id() {
                 None => {}
@@ -420,7 +433,10 @@ mod tests {
 
         let forensic = r.forensic().unwrap();
         let non_repl = forensic.iter().filter(|f| f.non_replayable).count();
-        assert!(non_repl >= 4, "expected non_replayable tags on t2+t3, got {non_repl}");
+        assert!(
+            non_repl >= 4,
+            "expected non_replayable tags on t2+t3, got {non_repl}"
+        );
     }
 
     #[test]
@@ -458,7 +474,10 @@ mod tests {
         let forensic = r.forensic().unwrap();
         assert!(forensic.iter().any(|f| matches!(
             &f.event,
-            SessionEvent::TurnInterrupted { reason: AbortReason::Crash, .. }
+            SessionEvent::TurnInterrupted {
+                reason: AbortReason::Crash,
+                ..
+            }
         )));
     }
 

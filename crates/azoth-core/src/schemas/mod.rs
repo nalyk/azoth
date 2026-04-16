@@ -2,18 +2,18 @@
 //!
 //! This is the type hub. Changes here ripple everywhere; stability is the goal.
 
-mod ids;
 mod content;
 mod contract;
 mod effect;
 mod event;
+mod ids;
 mod turn;
 
-pub use ids::*;
 pub use content::*;
 pub use contract::*;
 pub use effect::*;
 pub use event::*;
+pub use ids::*;
 pub use turn::*;
 
 use serde::{Deserialize, Serialize};

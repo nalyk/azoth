@@ -39,7 +39,10 @@ pub struct AuthorityEngine<'a> {
 
 impl<'a> AuthorityEngine<'a> {
     pub fn new(capabilities: &'a CapabilityStore, policy: ApprovalPolicyV1) -> Self {
-        Self { capabilities, policy }
+        Self {
+            capabilities,
+            policy,
+        }
     }
 
     pub fn authorize(
@@ -58,9 +61,7 @@ impl<'a> AuthorityEngine<'a> {
             EffectClass::Observe => AuthorityDecision::Auto,
             EffectClass::Stage => AuthorityDecision::Auto,
             EffectClass::ApplyLocal | EffectClass::ApplyRepo => {
-                if let Some(token) =
-                    self.capabilities.find(tool_name, effect_class, path_hint)
-                {
+                if let Some(token) = self.capabilities.find(tool_name, effect_class, path_hint) {
                     AuthorityDecision::Reuse(token.id.clone())
                 } else {
                     AuthorityDecision::RequireApproval {
@@ -114,7 +115,11 @@ mod tests {
         let caps = CapabilityStore::new();
         let eng = AuthorityEngine::new(&caps, ApprovalPolicyV1);
         match eng.authorize("fs.write", EffectClass::ApplyLocal, Some("/tmp/x")) {
-            AuthorityDecision::RequireApproval { tool_name, effect_class, .. } => {
+            AuthorityDecision::RequireApproval {
+                tool_name,
+                effect_class,
+                ..
+            } => {
                 assert_eq!(tool_name, "fs.write");
                 assert_eq!(effect_class, EffectClass::ApplyLocal);
             }

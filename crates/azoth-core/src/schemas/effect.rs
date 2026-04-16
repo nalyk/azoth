@@ -45,7 +45,10 @@ impl EffectClass {
     pub fn is_available_in_v1(self) -> bool {
         matches!(
             self,
-            EffectClass::Observe | EffectClass::Stage | EffectClass::ApplyLocal | EffectClass::ApplyRepo
+            EffectClass::Observe
+                | EffectClass::Stage
+                | EffectClass::ApplyLocal
+                | EffectClass::ApplyRepo
         )
     }
 }

@@ -76,13 +76,19 @@ fn message_to_wire(msg: &Message) -> Value {
 fn block_to_wire(block: &ContentBlock) -> Value {
     match block {
         ContentBlock::Text { text } => json!({"type": "text", "text": text}),
-        ContentBlock::ToolUse { id, name, input, .. } => json!({
+        ContentBlock::ToolUse {
+            id, name, input, ..
+        } => json!({
             "type": "tool_use",
             "id": id.as_str(),
             "name": name,
             "input": input,
         }),
-        ContentBlock::ToolResult { tool_use_id, content, is_error } => json!({
+        ContentBlock::ToolResult {
+            tool_use_id,
+            content,
+            is_error,
+        } => json!({
             "type": "tool_result",
             "tool_use_id": tool_use_id.as_str(),
             "content": content.iter().map(block_to_wire).collect::<Vec<_>>(),
@@ -116,7 +122,10 @@ impl ProviderAdapter for AnthropicMessagesAdapter {
         sink: mpsc::Sender<StreamEvent>,
     ) -> Result<ModelTurnResponse, AdapterError> {
         let body = self.build_body(&req);
-        let url = format!("{}/v1/messages", self.profile.base_url.trim_end_matches('/'));
+        let url = format!(
+            "{}/v1/messages",
+            self.profile.base_url.trim_end_matches('/')
+        );
 
         let mut builder = self
             .http
@@ -163,4 +172,3 @@ impl ProviderAdapter for AnthropicMessagesAdapter {
         Ok(TokenCount { input_tokens: 0 })
     }
 }
-

@@ -156,9 +156,7 @@ mod tests {
     use super::*;
     use crate::artifacts::ArtifactStore;
     use crate::authority::{Origin, Tainted};
-    use crate::execution::{
-        dispatch_tool, CancellationToken, ExecutionContext, ToolDispatcher,
-    };
+    use crate::execution::{dispatch_tool, CancellationToken, ExecutionContext, ToolDispatcher};
     use crate::schemas::{RunId, TurnId};
     use tempfile::tempdir;
 
@@ -181,10 +179,7 @@ mod tests {
 
         let mut disp = ToolDispatcher::new();
         disp.register(BashTool);
-        let raw = Tainted::new(
-            Origin::ModelOutput,
-            json!({ "command": "echo hello" }),
-        );
+        let raw = Tainted::new(Origin::ModelOutput, json!({ "command": "echo hello" }));
         let out = dispatch_tool(&disp, "bash", raw, &ctx).await.unwrap();
         assert_eq!(out["exit_code"], 0);
         assert_eq!(out["stdout"].as_str().unwrap().trim(), "hello");
@@ -199,10 +194,7 @@ mod tests {
 
         let mut disp = ToolDispatcher::new();
         disp.register(BashTool);
-        let raw = Tainted::new(
-            Origin::ModelOutput,
-            json!({ "command": "exit 42" }),
-        );
+        let raw = Tainted::new(Origin::ModelOutput, json!({ "command": "exit 42" }));
         let out = dispatch_tool(&disp, "bash", raw, &ctx).await.unwrap();
         assert_eq!(out["exit_code"], 42);
     }
@@ -233,10 +225,7 @@ mod tests {
 
         let mut disp = ToolDispatcher::new();
         disp.register(BashTool);
-        let raw = Tainted::new(
-            Origin::ModelOutput,
-            json!({ "command": "sleep 300" }),
-        );
+        let raw = Tainted::new(Origin::ModelOutput, json!({ "command": "sleep 300" }));
 
         let handle = tokio::spawn({
             let disp = std::sync::Arc::new(disp);
@@ -267,10 +256,7 @@ mod tests {
 
         let mut disp = ToolDispatcher::new();
         disp.register(BashTool);
-        let raw = Tainted::new(
-            Origin::ModelOutput,
-            json!({ "command": "cat marker.txt" }),
-        );
+        let raw = Tainted::new(Origin::ModelOutput, json!({ "command": "cat marker.txt" }));
         let out = dispatch_tool(&disp, "bash", raw, &ctx).await.unwrap();
         assert_eq!(out["stdout"].as_str().unwrap().trim(), "found-it");
     }

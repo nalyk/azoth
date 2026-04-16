@@ -141,9 +141,7 @@ mod tests {
     use super::*;
     use crate::artifacts::ArtifactStore;
     use crate::authority::{Origin, Tainted};
-    use crate::execution::{
-        dispatch_tool, CancellationToken, ExecutionContext, ToolDispatcher,
-    };
+    use crate::execution::{dispatch_tool, CancellationToken, ExecutionContext, ToolDispatcher};
     use crate::schemas::{RunId, TurnId};
     use tempfile::tempdir;
     use tokio::fs;
@@ -164,8 +162,14 @@ mod tests {
         let dir = tempdir().unwrap();
         let root = fs::canonicalize(dir.path()).await.unwrap();
 
-        let body_a = (1..=10).map(|i| format!("a-line-{i}")).collect::<Vec<_>>().join("\n");
-        let body_b = (1..=5).map(|i| format!("b-line-{i}")).collect::<Vec<_>>().join("\n");
+        let body_a = (1..=10)
+            .map(|i| format!("a-line-{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let body_b = (1..=5)
+            .map(|i| format!("b-line-{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         fs::write(root.join("a.txt"), &body_a).await.unwrap();
         fs::write(root.join("b.txt"), &body_b).await.unwrap();
 

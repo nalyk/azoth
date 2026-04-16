@@ -133,6 +133,9 @@ mod tests {
         let ex: JsonExtractor<Input> = JsonExtractor::new(&[Origin::User]);
         let raw = taint(Origin::ModelOutput, serde_json::json!({ "q": "hello" }));
         let err = ex.extract(raw).unwrap_err();
-        assert!(matches!(err, ExtractionError::OriginNotPermitted(Origin::ModelOutput, _)));
+        assert!(matches!(
+            err,
+            ExtractionError::OriginNotPermitted(Origin::ModelOutput, _)
+        ));
     }
 }

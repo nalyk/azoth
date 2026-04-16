@@ -2,7 +2,6 @@
 //!
 //! plan → compile → invoke → dispatch → validate → commit/abort
 
-use crate::telemetry;
 use crate::adapter::ProviderAdapter;
 use crate::authority::{
     mint_from_approval, ApprovalPolicyV1, ApprovalRequestMsg, ApprovalResponse, AuthorityDecision,
@@ -16,10 +15,40 @@ use crate::schemas::{
     EffectRecord, EffectRecordId, Message, ModelTurnRequest, RequestMetadata, Role, RunId,
     SessionEvent, StopReason, StreamEvent, ToolDefinition, TurnId, Usage, ValidatorStatus,
 };
+use crate::telemetry;
 use crate::validators::Validator;
-use tokio::sync::oneshot;
 use thiserror::Error;
 use tokio::sync::mpsc;
+use tokio::sync::oneshot;
+
+/// Result of a single `drive_turn` invocation.
+///
+/// `final_assistant` carries the content blocks of the last model response
+/// (the one that stopped with `EndTurn`/`StopSequence`), so the caller can
+/// feed them back as cross-turn memory on the next call. It is deliberately
+/// `None` for any non-committing outcome — the caller should never push
+/// content from an aborted or interrupted turn into a subsequent conversation.
+#[derive(Debug, Clone)]
+pub struct TurnOutcome {
+    pub usage: Usage,
+    pub final_assistant: Option<Vec<ContentBlock>>,
+}
+
+impl TurnOutcome {
+    fn aborted(usage: Usage) -> Self {
+        Self {
+            usage,
+            final_assistant: None,
+        }
+    }
+
+    fn committed(usage: Usage, final_assistant: Vec<ContentBlock>) -> Self {
+        Self {
+            usage,
+            final_assistant: Some(final_assistant),
+        }
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum TurnError {
@@ -111,12 +140,19 @@ impl<'a> TurnDriver<'a> {
     /// Drive a single turn. `messages` is the conversation tail the Context
     /// Kernel has already compiled for this step; the driver appends assistant
     /// + tool_result blocks as it goes.
+    ///
+    /// The returned `TurnOutcome::final_assistant` is populated with the
+    /// assistant content blocks from the final `EndTurn` / `StopSequence`
+    /// model response, so the caller can fold them back into the next turn's
+    /// `messages` argument and give the model cross-turn memory. It stays
+    /// `None` for any non-committing outcome (aborted / interrupted /
+    /// validator-failed).
     pub async fn drive_turn(
         &mut self,
         turn_id: TurnId,
         system: String,
         mut messages: Vec<Message>,
-    ) -> Result<Usage, TurnError> {
+    ) -> Result<TurnOutcome, TurnError> {
         // Contract-scoped guard: refuse to even open the turn if the
         // persisted contract has set a max_turns and we are at/over it.
         if let Some(c) = self.contract {
@@ -137,7 +173,7 @@ impl<'a> TurnDriver<'a> {
                         )),
                         Usage::default(),
                     )?;
-                    return Ok(Usage::default());
+                    return Ok(TurnOutcome::aborted(Usage::default()));
                 }
             }
         }
@@ -156,15 +192,13 @@ impl<'a> TurnDriver<'a> {
 
                 // Collect evidence when a collector is wired in.
                 let evidence = match self.evidence_collector {
-                    Some(collector) => {
-                        match collector.collect(&contract.goal, 20).await {
-                            Ok(items) => items,
-                            Err(e) => {
-                                eprintln!("[azoth] evidence collection failed: {e}");
-                                Vec::new()
-                            }
+                    Some(collector) => match collector.collect(&contract.goal, 20).await {
+                        Ok(items) => items,
+                        Err(e) => {
+                            eprintln!("[azoth] evidence collection failed: {e}");
+                            Vec::new()
                         }
-                    }
+                    },
                     None => Vec::new(),
                 };
                 let evidence_count = evidence.len();
@@ -189,7 +223,12 @@ impl<'a> TurnDriver<'a> {
                             packet_id: packet.id.clone(),
                             packet_digest: packet.digest.clone(),
                         });
-                        telemetry::emit_context_compiled(&self.run_id.0, &turn_id.0, 0, evidence_count);
+                        telemetry::emit_context_compiled(
+                            &self.run_id.0,
+                            &turn_id.0,
+                            0,
+                            evidence_count,
+                        );
                         let lane = &packet.constitution_lane;
                         format!(
                             "[azoth.constitution]\n\
@@ -216,7 +255,7 @@ impl<'a> TurnDriver<'a> {
                             Some(format!("context packet over budget: {used} > {max}")),
                             Usage::default(),
                         )?;
-                        return Ok(Usage::default());
+                        return Ok(TurnOutcome::aborted(Usage::default()));
                     }
                     Err(e) => return Err(TurnError::Kernel(e)),
                 }
@@ -242,7 +281,7 @@ impl<'a> TurnDriver<'a> {
                     partial_usage: Default::default(),
                 })?;
                 telemetry::emit_turn_interrupted(&self.run_id.0, &turn_id.0, "user_cancel");
-                return Ok(total_usage);
+                return Ok(TurnOutcome::aborted(total_usage));
             }
 
             let req = ModelTurnRequest {
@@ -290,7 +329,7 @@ impl<'a> TurnDriver<'a> {
                             },
                         })?;
                         telemetry::emit_turn_interrupted(&self.run_id.0, &turn_id.0, "user_cancel");
-                        return Ok(total_usage);
+                        return Ok(TurnOutcome::aborted(total_usage));
                     }
                     res = &mut invoke_fut => break res,
                     Some(_ev) = rx.recv() => { /* drain, continue */ }
@@ -313,8 +352,12 @@ impl<'a> TurnDriver<'a> {
             // Drain any stream events still queued after invoke returns.
             while let Ok(_ev) = rx.try_recv() {}
 
-            total_usage.input_tokens = total_usage.input_tokens.saturating_add(response.usage.input_tokens);
-            total_usage.output_tokens = total_usage.output_tokens.saturating_add(response.usage.output_tokens);
+            total_usage.input_tokens = total_usage
+                .input_tokens
+                .saturating_add(response.usage.input_tokens);
+            total_usage.output_tokens = total_usage
+                .output_tokens
+                .saturating_add(response.usage.output_tokens);
 
             for (idx, block) in response.content.iter().enumerate() {
                 self.writer.append(&SessionEvent::ContentBlock {
@@ -336,7 +379,10 @@ impl<'a> TurnDriver<'a> {
                     // v1 serializes them in order.
                     let mut tool_results: Vec<ContentBlock> = Vec::new();
                     for block in response.content.iter() {
-                        if let ContentBlock::ToolUse { id, name, input, .. } = block {
+                        if let ContentBlock::ToolUse {
+                            id, name, input, ..
+                        } = block
+                        {
                             let effect_class = self
                                 .dispatcher
                                 .tool(name)
@@ -366,7 +412,13 @@ impl<'a> TurnDriver<'a> {
                                     _ => (0, u32::MAX, ""),
                                 };
                                 if !label.is_empty() && used >= max {
-                                    telemetry::emit_effect_budget_exhausted(&self.run_id.0, &turn_id.0, label, used, max);
+                                    telemetry::emit_effect_budget_exhausted(
+                                        &self.run_id.0,
+                                        &turn_id.0,
+                                        label,
+                                        used,
+                                        max,
+                                    );
                                     self.record_abort(
                                         &turn_id,
                                         AbortReason::RuntimeError,
@@ -375,15 +427,13 @@ impl<'a> TurnDriver<'a> {
                                         )),
                                         total_usage.clone(),
                                     )?;
-                                    return Ok(total_usage);
+                                    return Ok(TurnOutcome::aborted(total_usage));
                                 }
                             }
 
                             let decision = {
-                                let engine = AuthorityEngine::new(
-                                    &*self.capabilities,
-                                    ApprovalPolicyV1,
-                                );
+                                let engine =
+                                    AuthorityEngine::new(&*self.capabilities, ApprovalPolicyV1);
                                 engine.authorize(name, effect_class, path_hint)
                             };
 
@@ -396,7 +446,7 @@ impl<'a> TurnDriver<'a> {
                                         Some(format!("effect not available: {hint}")),
                                         total_usage.clone(),
                                     )?;
-                                    return Ok(total_usage);
+                                    return Ok(TurnOutcome::aborted(total_usage));
                                 }
                                 AuthorityDecision::RequireApproval {
                                     approval_id,
@@ -406,7 +456,7 @@ impl<'a> TurnDriver<'a> {
                                     let summary = format!(
                                         "{} → {}",
                                         tool_name,
-                                        path_hint.unwrap_or("(no path)")
+                                        approval_hint(&tool_name, input)
                                     );
                                     self.writer.append(&SessionEvent::ApprovalRequest {
                                         turn_id: turn_id.clone(),
@@ -415,7 +465,12 @@ impl<'a> TurnDriver<'a> {
                                         tool_name: tool_name.clone(),
                                         summary: summary.clone(),
                                     })?;
-                                    telemetry::emit_approval_requested(&self.run_id.0, &turn_id.0, &tool_name, ec);
+                                    telemetry::emit_approval_requested(
+                                        &self.run_id.0,
+                                        &turn_id.0,
+                                        &tool_name,
+                                        ec,
+                                    );
 
                                     let (resp_tx, resp_rx) = oneshot::channel::<ApprovalResponse>();
                                     let msg = ApprovalRequestMsg {
@@ -437,7 +492,7 @@ impl<'a> TurnDriver<'a> {
                                             Some("approval bridge closed".into()),
                                             total_usage.clone(),
                                         )?;
-                                        return Ok(total_usage);
+                                        return Ok(TurnOutcome::aborted(total_usage));
                                     }
 
                                     match resp_rx.await {
@@ -452,27 +507,41 @@ impl<'a> TurnDriver<'a> {
                                                 token: tok_id,
                                                 scope: scope.clone(),
                                             })?;
-                                            telemetry::emit_approval_granted(&self.run_id.0, &turn_id.0, &tool_name, &format!("{scope:?}"));
+                                            telemetry::emit_approval_granted(
+                                                &self.run_id.0,
+                                                &turn_id.0,
+                                                &tool_name,
+                                                &format!("{scope:?}"),
+                                            );
                                         }
                                         Ok(ApprovalResponse::Deny) | Err(_) => {
                                             self.writer.append(&SessionEvent::ApprovalDenied {
                                                 turn_id: turn_id.clone(),
                                                 approval_id: approval_id.clone(),
                                             })?;
-                                            telemetry::emit_approval_denied(&self.run_id.0, &turn_id.0, &tool_name);
+                                            telemetry::emit_approval_denied(
+                                                &self.run_id.0,
+                                                &turn_id.0,
+                                                &tool_name,
+                                            );
                                             self.record_abort(
                                                 &turn_id,
                                                 AbortReason::ApprovalDenied,
                                                 Some("user denied approval".into()),
                                                 total_usage.clone(),
                                             )?;
-                                            return Ok(total_usage);
+                                            return Ok(TurnOutcome::aborted(total_usage));
                                         }
                                     }
                                 }
                             }
 
-                            telemetry::emit_tool_dispatch(&self.run_id.0, &turn_id.0, name, effect_class);
+                            telemetry::emit_tool_dispatch(
+                                &self.run_id.0,
+                                &turn_id.0,
+                                name,
+                                effect_class,
+                            );
                             let raw = Tainted::new(Origin::ModelOutput, input.clone());
                             let tool_start = std::time::Instant::now();
                             let result = crate::execution::dispatch_tool(
@@ -492,11 +561,19 @@ impl<'a> TurnDriver<'a> {
                                     false,
                                 ),
                                 Err(e) => (
-                                    vec![ContentBlock::Text { text: e.to_string() }],
+                                    vec![ContentBlock::Text {
+                                        text: e.to_string(),
+                                    }],
                                     true,
                                 ),
                             };
-                            telemetry::emit_tool_result(&self.run_id.0, &turn_id.0, name, is_error, tool_duration_ms);
+                            telemetry::emit_tool_result(
+                                &self.run_id.0,
+                                &turn_id.0,
+                                name,
+                                is_error,
+                                tool_duration_ms,
+                            );
 
                             self.writer.append(&SessionEvent::EffectRecord {
                                 turn_id: turn_id.clone(),
@@ -507,7 +584,11 @@ impl<'a> TurnDriver<'a> {
                                     tool_name: name.clone(),
                                     input_digest: Some(digest(input)),
                                     output_artifact: None,
-                                    error: if is_error { Some("tool error".into()) } else { None },
+                                    error: if is_error {
+                                        Some("tool error".into())
+                                    } else {
+                                        None
+                                    },
                                 },
                             })?;
                             // Bump the per-run counter after the EffectRecord
@@ -526,11 +607,13 @@ impl<'a> TurnDriver<'a> {
                                     _ => {}
                                 }
                             }
+                            let content_artifact =
+                                persist_tool_output(&self.ctx.artifacts, &content);
                             self.writer.append(&SessionEvent::ToolResult {
                                 turn_id: turn_id.clone(),
                                 tool_use_id: id.clone(),
                                 is_error,
-                                content_artifact: None,
+                                content_artifact,
                                 call_group: None,
                             })?;
 
@@ -553,9 +636,7 @@ impl<'a> TurnDriver<'a> {
                     // path, gated on `(contract.is_some(), !validators.is_empty())`
                     // so turns without either keep the pre-validators byte
                     // shape exactly.
-                    if let (Some(contract), false) =
-                        (self.contract, self.validators.is_empty())
-                    {
+                    if let (Some(contract), false) = (self.contract, self.validators.is_empty()) {
                         let mut failed: Option<(String, Option<String>)> = None;
                         for v in self.validators.iter() {
                             let report = v.check(contract);
@@ -566,10 +647,13 @@ impl<'a> TurnDriver<'a> {
                                 status: report.status,
                                 detail: report.detail.clone(),
                             })?;
-                            telemetry::emit_validator_result(&self.run_id.0, &turn_id.0, &name, report.status);
-                            if matches!(report.status, ValidatorStatus::Fail)
-                                && failed.is_none()
-                            {
+                            telemetry::emit_validator_result(
+                                &self.run_id.0,
+                                &turn_id.0,
+                                &name,
+                                report.status,
+                            );
+                            if matches!(report.status, ValidatorStatus::Fail) && failed.is_none() {
                                 failed = Some((name, report.detail));
                             }
                         }
@@ -584,7 +668,7 @@ impl<'a> TurnDriver<'a> {
                                 Some(msg),
                                 total_usage.clone(),
                             )?;
-                            return Ok(total_usage);
+                            return Ok(TurnOutcome::aborted(total_usage));
                         }
                         self.writer.append(&SessionEvent::Checkpoint {
                             turn_id: turn_id.clone(),
@@ -596,8 +680,13 @@ impl<'a> TurnDriver<'a> {
                         outcome: CommitOutcome::Success,
                         usage: total_usage.clone(),
                     })?;
-                    telemetry::emit_turn_committed(&self.run_id.0, &turn_id.0, total_usage.input_tokens, total_usage.output_tokens);
-                    return Ok(total_usage);
+                    telemetry::emit_turn_committed(
+                        &self.run_id.0,
+                        &turn_id.0,
+                        total_usage.input_tokens,
+                        total_usage.output_tokens,
+                    );
+                    return Ok(TurnOutcome::committed(total_usage, response.content));
                 }
                 StopReason::MaxTokens => {
                     self.record_abort(
@@ -606,7 +695,7 @@ impl<'a> TurnDriver<'a> {
                         Some("model hit max_tokens".into()),
                         total_usage.clone(),
                     )?;
-                    return Ok(total_usage);
+                    return Ok(TurnOutcome::aborted(total_usage));
                 }
                 StopReason::ContentFilter => {
                     self.record_abort(
@@ -615,7 +704,7 @@ impl<'a> TurnDriver<'a> {
                         Some("content filter".into()),
                         total_usage.clone(),
                     )?;
-                    return Ok(total_usage);
+                    return Ok(TurnOutcome::aborted(total_usage));
                 }
             }
         }
@@ -634,4 +723,116 @@ fn now_iso() -> String {
     time::OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
+}
+
+/// Persist a tool's output content blocks to the content-addressed artifact
+/// store and return the resulting `ArtifactId` for the `ToolResult` event.
+///
+/// Serializes the `Vec<ContentBlock>` as JSON (stable wire format matching
+/// the schema) and hands the bytes to `ArtifactStore::put`. On failure the
+/// error is logged and `None` is returned — the tool output still flows
+/// inline to the model through the in-memory message list, so turn execution
+/// is unaffected. Only forensic/replay fidelity degrades, and we surface that
+/// via tracing.
+fn persist_tool_output(
+    artifacts: &crate::artifacts::ArtifactStore,
+    content: &[crate::schemas::ContentBlock],
+) -> Option<crate::schemas::ArtifactId> {
+    let bytes = match serde_json::to_vec(content) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(error = %e, "serialize tool output for artifact store");
+            return None;
+        }
+    };
+    match artifacts.put(&bytes) {
+        Ok(id) => Some(id),
+        Err(e) => {
+            tracing::warn!(error = %e, "persist tool output to artifact store");
+            None
+        }
+    }
+}
+
+/// Human-readable hint describing what a tool is about to do, shown in the
+/// approval modal. Tool-specific extractors take priority over the generic
+/// JSON fallback so `bash → rm -rf /` renders meaningfully instead of
+/// `bash → (no path)`.
+fn approval_hint(tool_name: &str, input: &serde_json::Value) -> String {
+    if let Some(p) = input.get("path").and_then(|v| v.as_str()) {
+        return p.to_string();
+    }
+    match tool_name {
+        "bash" => {
+            if let Some(cmd) = input.get("command").and_then(|v| v.as_str()) {
+                return truncate_single_line(cmd, 80);
+            }
+        }
+        "repo.search" => {
+            if let Some(q) = input.get("q").and_then(|v| v.as_str()) {
+                return format!("q={}", truncate_single_line(q, 60));
+            }
+        }
+        _ => {}
+    }
+    let raw = input.to_string();
+    truncate_single_line(&raw, 80)
+}
+
+fn truncate_single_line(s: &str, n: usize) -> String {
+    let one_line: String = s
+        .chars()
+        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+        .collect();
+    if one_line.chars().count() <= n {
+        one_line
+    } else {
+        let head: String = one_line.chars().take(n).collect();
+        format!("{head}…")
+    }
+}
+
+#[cfg(test)]
+mod approval_hint_tests {
+    use super::*;
+
+    #[test]
+    fn bash_hint_shows_command() {
+        let v = serde_json::json!({ "command": "ls -la /tmp" });
+        assert_eq!(approval_hint("bash", &v), "ls -la /tmp");
+    }
+
+    #[test]
+    fn bash_multiline_command_collapses_to_one_line() {
+        let v = serde_json::json!({ "command": "set -e\necho hi" });
+        assert_eq!(approval_hint("bash", &v), "set -e echo hi");
+    }
+
+    #[test]
+    fn path_based_tool_prefers_path() {
+        let v = serde_json::json!({ "path": "src/foo.rs", "command": "ignored" });
+        assert_eq!(approval_hint("fs.write", &v), "src/foo.rs");
+    }
+
+    #[test]
+    fn search_hint_shows_query() {
+        let v = serde_json::json!({ "q": "refresh_token" });
+        assert_eq!(approval_hint("repo.search", &v), "q=refresh_token");
+    }
+
+    #[test]
+    fn long_command_gets_truncated_with_ellipsis() {
+        let long_cmd = "x".repeat(200);
+        let v = serde_json::json!({ "command": long_cmd });
+        let hint = approval_hint("bash", &v);
+        assert!(hint.ends_with('…'));
+        assert!(hint.chars().count() <= 81); // 80 chars + ellipsis
+    }
+
+    #[test]
+    fn unknown_tool_falls_back_to_json_snippet() {
+        let v = serde_json::json!({ "weird": "thing" });
+        let hint = approval_hint("custom.tool", &v);
+        assert!(hint.contains("weird"));
+    }
 }

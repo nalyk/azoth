@@ -102,9 +102,14 @@ mod tests {
         );
         assert_eq!(
             SlashCommand::parse("/contract fix token refresh"),
-            Some(SlashCommand::Contract(Some("fix token refresh".to_string())))
+            Some(SlashCommand::Contract(Some(
+                "fix token refresh".to_string()
+            )))
         );
-        assert_eq!(SlashCommand::parse("/approve"), Some(SlashCommand::Approve(None)));
+        assert_eq!(
+            SlashCommand::parse("/approve"),
+            Some(SlashCommand::Approve(None))
+        );
         assert_eq!(
             SlashCommand::parse("/approve fs.write"),
             Some(SlashCommand::Approve(Some("fs.write".to_string())))

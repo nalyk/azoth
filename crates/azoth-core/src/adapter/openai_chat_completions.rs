@@ -22,7 +22,10 @@ pub struct OpenAiChatCompletionsAdapter {
 
 impl OpenAiChatCompletionsAdapter {
     pub fn new(profile: ProviderProfile, api_key: SecretHandle) -> Self {
-        debug_assert!(matches!(profile.tool_use_shape, ToolUseShape::FlatToolCalls));
+        debug_assert!(matches!(
+            profile.tool_use_shape,
+            ToolUseShape::FlatToolCalls
+        ));
         Self {
             profile,
             api_key,
@@ -85,7 +88,11 @@ fn extend_openai_messages(out: &mut Vec<Value>, msg: &Message) {
                         }
                         text_buf.push_str(text);
                     }
-                    ContentBlock::ToolResult { tool_use_id, content, .. } => {
+                    ContentBlock::ToolResult {
+                        tool_use_id,
+                        content,
+                        ..
+                    } => {
                         if !text_buf.is_empty() {
                             out.push(json!({"role": "user", "content": text_buf.clone()}));
                             text_buf.clear();
@@ -122,7 +129,9 @@ fn extend_openai_messages(out: &mut Vec<Value>, msg: &Message) {
                         }
                         text_buf.push_str(text);
                     }
-                    ContentBlock::ToolUse { id, name, input, .. } => {
+                    ContentBlock::ToolUse {
+                        id, name, input, ..
+                    } => {
                         tool_calls.push(json!({
                             "id": id.as_str(),
                             "type": "function",

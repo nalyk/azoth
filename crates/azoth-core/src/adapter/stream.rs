@@ -35,7 +35,10 @@ pub(super) async fn emit_synthetic_stream(
             .await;
         if let ContentBlock::Text { text } = block {
             let _ = sink
-                .send(StreamEvent::TextDelta { index, text: text.clone() })
+                .send(StreamEvent::TextDelta {
+                    index,
+                    text: text.clone(),
+                })
                 .await;
         }
         let _ = sink.send(StreamEvent::ContentBlockStop { index }).await;

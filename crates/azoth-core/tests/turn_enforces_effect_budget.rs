@@ -40,14 +40,24 @@ fn fs_write_then_end() -> MockScript {
                     call_group: None,
                 }],
                 stop_reason: StopReason::ToolUse,
-                usage: Usage { input_tokens: 3, output_tokens: 2, ..Default::default() },
+                usage: Usage {
+                    input_tokens: 3,
+                    output_tokens: 2,
+                    ..Default::default()
+                },
             },
             // Never reached when the budget gate fires, but present so the
             // mock script doesn't run dry on the inert-path test below.
             ModelTurnResponse {
-                content: vec![ContentBlock::Text { text: "done".into() }],
+                content: vec![ContentBlock::Text {
+                    text: "done".into(),
+                }],
                 stop_reason: StopReason::EndTurn,
-                usage: Usage { input_tokens: 2, output_tokens: 1, ..Default::default() },
+                usage: Usage {
+                    input_tokens: 2,
+                    output_tokens: 1,
+                    ..Default::default()
+                },
             },
         ],
     }
@@ -97,16 +107,20 @@ async fn over_budget_apply_local_aborts_turn_with_runtime_error() {
     let (approval_tx, mut approval_rx) = mpsc::channel::<ApprovalRequestMsg>(8);
     tokio::spawn(async move {
         while let Some(req) = approval_rx.recv().await {
-            let _ = req
-                .responder
-                .send(ApprovalResponse::Grant { scope: ApprovalScope::Session });
+            let _ = req.responder.send(ApprovalResponse::Grant {
+                scope: ApprovalScope::Session,
+            });
         }
     });
 
     let mut caps = CapabilityStore::new();
     // Seed the counter AT the cap, as if a prior turn had already consumed
     // the sole apply_local budget — the next call must short-circuit.
-    let mut effects = EffectCounter { apply_local: 1, apply_repo: 0, network_reads: 0 };
+    let mut effects = EffectCounter {
+        apply_local: 1,
+        apply_repo: 0,
+        network_reads: 0,
+    };
 
     {
         let mut driver = TurnDriver {

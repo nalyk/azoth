@@ -47,7 +47,11 @@ pub fn lint(contract: &Contract) -> Result<(), ContractError> {
     if contract.success_criteria.is_empty() {
         return bail("contract must have at least one success criterion");
     }
-    if contract.success_criteria.iter().any(|c| c.trim().is_empty()) {
+    if contract
+        .success_criteria
+        .iter()
+        .any(|c| c.trim().is_empty())
+    {
         return bail("success criteria must not contain blank entries");
     }
     let mut seen: HashSet<&str> = HashSet::new();

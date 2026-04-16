@@ -3,20 +3,20 @@
 //!
 //! No stateful chaining on the provider side — Azoth owns continuity.
 
+mod anthropic_messages;
 mod error;
+mod mock;
+mod openai_chat_completions;
+mod openai_sse;
 pub mod profile;
 mod sse;
-mod openai_sse;
 mod stream;
-mod anthropic_messages;
-mod openai_chat_completions;
-mod mock;
 
-pub use error::{AdapterError, TokenCount};
-pub use profile::{ProviderProfile, TokenizerFamily, ToolUseShape};
 pub use anthropic_messages::AnthropicMessagesAdapter;
-pub use openai_chat_completions::OpenAiChatCompletionsAdapter;
+pub use error::{AdapterError, TokenCount};
 pub use mock::{MockAdapter, MockScript};
+pub use openai_chat_completions::OpenAiChatCompletionsAdapter;
+pub use profile::{ProviderProfile, TokenizerFamily, ToolUseShape};
 
 use crate::schemas::{ModelTurnRequest, ModelTurnResponse, StreamEvent};
 use async_trait::async_trait;

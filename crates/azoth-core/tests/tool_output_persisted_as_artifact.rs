@@ -1,10 +1,12 @@
-//! End-to-end smoke: the TUI worker path in isolation.
+//! Dogfood regression: tool output must be durably persisted to the
+//! `ArtifactStore` so the replayable projection can reconstruct full
+//! conversation fidelity after resume.
 //!
-//! Opens a tapped `JsonlWriter`, registers `repo.search`, runs a scripted
-//! `MockAdapter` (ToolUse → EndTurn) through `TurnDriver`, then asserts:
-//!  * the tap saw the full canonical sequence for the turn,
-//!  * the JSONL file on disk has a matching `TurnCommitted` line, and
-//!  * the replayable projection trusts the whole turn.
+//! Before this fix, `SessionEvent::ToolResult.content_artifact` was hardcoded
+//! `None`, so every committed session held 23+ tool calls but the
+//! `.azoth/artifacts/` directory stayed empty — on resume the model would
+//! see "that" a tool ran but not "what it returned", producing context-
+//! incomplete replays.
 
 use azoth_core::adapter::{MockAdapter, MockScript, ProviderProfile};
 use azoth_core::artifacts::ArtifactStore;
@@ -12,8 +14,8 @@ use azoth_core::authority::{ApprovalRequestMsg, CapabilityStore};
 use azoth_core::event_store::{JsonlReader, JsonlWriter};
 use azoth_core::execution::{CancellationToken, ExecutionContext, ToolDispatcher};
 use azoth_core::schemas::{
-    CommitOutcome, ContentBlock, Message, ModelTurnResponse, RunId, SessionEvent, StopReason,
-    ToolUseId, TurnId, Usage,
+    ContentBlock, Message, ModelTurnResponse, RunId, SessionEvent, StopReason, ToolUseId, TurnId,
+    Usage,
 };
 use azoth_core::tools::RepoSearchTool;
 use azoth_core::turn::TurnDriver;
@@ -21,20 +23,15 @@ use tempfile::tempdir;
 use tokio::sync::mpsc;
 
 #[tokio::test]
-async fn tui_worker_pipeline_drives_full_turn_sequence() {
+async fn tool_result_event_carries_artifact_id_and_blob_lands_on_disk() {
     let dir = tempdir().unwrap();
     let repo_root = dir.path().to_path_buf();
-
-    // A file the repo.search tool can find.
     std::fs::write(repo_root.join("needle.txt"), "azoth sentinel line\n").unwrap();
 
-    let session_path = repo_root.join(".azoth/sessions/run_test.jsonl");
+    let session_path = repo_root.join(".azoth/sessions/run_artifact.jsonl");
     let artifacts_root = repo_root.join(".azoth/artifacts");
 
     let mut writer = JsonlWriter::open(&session_path).unwrap();
-    let (tap_tx, mut tap_rx) = mpsc::unbounded_channel::<SessionEvent>();
-    writer.set_tap(tap_tx);
-
     let artifacts = ArtifactStore::open(&artifacts_root).unwrap();
 
     let mut dispatcher = ToolDispatcher::new();
@@ -44,7 +41,7 @@ async fn tui_worker_pipeline_drives_full_turn_sequence() {
         turns: vec![
             ModelTurnResponse {
                 content: vec![ContentBlock::ToolUse {
-                    id: ToolUseId::new(),
+                    id: ToolUseId::from("tu_search".to_string()),
                     name: "repo.search".into(),
                     input: serde_json::json!({ "q": "sentinel", "limit": 3 }),
                     call_group: None,
@@ -74,12 +71,14 @@ async fn tui_worker_pipeline_drives_full_turn_sequence() {
         script,
     );
 
-    let run_id = RunId::from("run_test".to_string());
-    let turn_id = TurnId::from("t_test".to_string());
+    let run_id = RunId::from("run_artifact".to_string());
+    let turn_id = TurnId::from("t_artifact".to_string());
     let ctx = ExecutionContext {
         run_id: run_id.clone(),
         turn_id: turn_id.clone(),
-        artifacts,
+        // A separate ArtifactStore handle pointing at the same root — both
+        // should converge on the same content-addressed blob.
+        artifacts: ArtifactStore::open(&artifacts_root).unwrap(),
         cancellation: CancellationToken::new(),
         repo_root: repo_root.clone(),
     };
@@ -103,7 +102,7 @@ async fn tui_worker_pipeline_drives_full_turn_sequence() {
             effects_consumed: &mut effects,
             evidence_collector: None,
         };
-        let usage = driver
+        driver
             .drive_turn(
                 turn_id.clone(),
                 "system".into(),
@@ -111,71 +110,48 @@ async fn tui_worker_pipeline_drives_full_turn_sequence() {
             )
             .await
             .expect("turn drives cleanly");
-        assert!(usage.usage.output_tokens >= 5);
     }
     drop(writer);
 
-    // Drain the tap and check the canonical sequence fired.
-    let mut tap_events = Vec::new();
-    while let Ok(ev) = tap_rx.try_recv() {
-        tap_events.push(ev);
-    }
-
-    assert!(
-        matches!(tap_events.first(), Some(SessionEvent::TurnStarted { .. })),
-        "first tapped event should be TurnStarted, got: {:#?}",
-        tap_events.first()
-    );
-
-    let saw_tool_use = tap_events.iter().any(|e| {
-        matches!(
-            e,
-            SessionEvent::ContentBlock {
-                block: ContentBlock::ToolUse { name, .. }, ..
-            } if name == "repo.search"
-        )
-    });
-    assert!(
-        saw_tool_use,
-        "expected a ContentBlock::ToolUse(repo.search)"
-    );
-
-    let saw_effect = tap_events
-        .iter()
-        .any(|e| matches!(e, SessionEvent::EffectRecord { .. }));
-    assert!(saw_effect, "expected an EffectRecord");
-
-    let saw_tool_result = tap_events.iter().any(|e| {
-        matches!(
-            e,
-            SessionEvent::ToolResult {
-                is_error: false,
-                ..
-            }
-        )
-    });
-    assert!(saw_tool_result, "expected a clean ToolResult");
-
-    let saw_commit = tap_events.iter().any(|e| {
-        matches!(
-            e,
-            SessionEvent::TurnCommitted {
-                outcome: CommitOutcome::Success,
-                ..
-            }
-        )
-    });
-    assert!(saw_commit, "expected a TurnCommitted(Success)");
-
-    // The on-disk JSONL file must round-trip through the replayable projection
-    // with the full turn intact — confirms the tap and the writer agree.
+    // Read the replayable projection and find the ToolResult event.
     let reader = JsonlReader::open(&session_path);
-    let replay = reader.replayable().unwrap();
+    let events = reader.replayable().expect("replayable projection");
+    let tool_result = events
+        .iter()
+        .find_map(|e| match &e.0 {
+            SessionEvent::ToolResult {
+                tool_use_id,
+                content_artifact,
+                is_error,
+                ..
+            } if tool_use_id.as_str() == "tu_search" => Some((content_artifact.clone(), *is_error)),
+            _ => None,
+        })
+        .expect("ToolResult for tu_search present in replayable projection");
+
+    let (artifact_id, is_error) = tool_result;
+    assert!(!is_error, "tool did not error");
+    let artifact_id =
+        artifact_id.expect("content_artifact must be Some — the whole point of this fix");
+
+    // The artifact blob must exist on disk and round-trip to the original
+    // ContentBlock shape — that's what replay will need to re-hydrate the
+    // conversation for a resuming turn.
+    let bytes = artifacts
+        .get(&artifact_id)
+        .expect("artifact bytes readable from store");
+    let restored: Vec<ContentBlock> =
+        serde_json::from_slice(&bytes).expect("artifact JSON deserializes as Vec<ContentBlock>");
     assert!(
-        replay.iter().any(|e| matches!(
-            &e.0,
-            SessionEvent::TurnCommitted { turn_id: tid, .. } if tid == &turn_id
-        )),
-        "replay projection missing TurnCommitted for {turn_id}"
+        !restored.is_empty(),
+        "restored content should have at least one block"
+    );
+    // repo.search returns a JSON document as a single Text block.
+    let has_text = restored
+        .iter()
+        .any(|b| matches!(b, ContentBlock::Text { text } if text.contains("needle.txt")));
+    assert!(
+        has_text,
+        "restored artifact should contain the search hit for needle.txt, got: {restored:#?}"
     );
 }

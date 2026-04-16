@@ -91,7 +91,10 @@ async fn happy_path_parses_text_only_fixture() {
     while sink_rx.try_recv().is_ok() {
         saw_any = true;
     }
-    assert!(saw_any, "sink should have received at least one StreamEvent");
+    assert!(
+        saw_any,
+        "sink should have received at least one StreamEvent"
+    );
 }
 
 #[tokio::test]

@@ -5,9 +5,7 @@
 
 use azoth_core::adapter::{MockAdapter, MockScript, ProviderProfile};
 use azoth_core::artifacts::ArtifactStore;
-use azoth_core::authority::{
-    ApprovalRequestMsg, ApprovalResponse, CapabilityStore,
-};
+use azoth_core::authority::{ApprovalRequestMsg, ApprovalResponse, CapabilityStore};
 use azoth_core::event_store::JsonlWriter;
 use azoth_core::execution::{CancellationToken, ExecutionContext, ToolDispatcher};
 use azoth_core::schemas::{
@@ -33,14 +31,22 @@ fn fs_write_script() -> MockScript {
                     call_group: None,
                 }],
                 stop_reason: StopReason::ToolUse,
-                usage: Usage { input_tokens: 10, output_tokens: 3, ..Default::default() },
+                usage: Usage {
+                    input_tokens: 10,
+                    output_tokens: 3,
+                    ..Default::default()
+                },
             },
             ModelTurnResponse {
                 content: vec![ContentBlock::Text {
                     text: "wrote hello".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
-                usage: Usage { input_tokens: 12, output_tokens: 5, ..Default::default() },
+                usage: Usage {
+                    input_tokens: 12,
+                    output_tokens: 5,
+                    ..Default::default()
+                },
             },
         ],
     }
@@ -48,7 +54,12 @@ fn fs_write_script() -> MockScript {
 
 async fn drive_with_responder(
     respond_with: Option<ApprovalResponse>,
-) -> (tempfile::TempDir, std::path::PathBuf, Vec<SessionEvent>, bool) {
+) -> (
+    tempfile::TempDir,
+    std::path::PathBuf,
+    Vec<SessionEvent>,
+    bool,
+) {
     let dir = tempdir().unwrap();
     let repo_root = tokio::fs::canonicalize(dir.path()).await.unwrap();
     let session_path = repo_root.join(".azoth/sessions/run_test.jsonl");
@@ -116,7 +127,11 @@ async fn drive_with_responder(
             .await
             .expect("driver returns Ok even on deny");
         had_any_cap = caps
-            .find("fs.write", EffectClass::ApplyLocal, Some(".azoth/tmp/hello.txt"))
+            .find(
+                "fs.write",
+                EffectClass::ApplyLocal,
+                Some(".azoth/tmp/hello.txt"),
+            )
             .is_some();
     }
     drop(writer);
@@ -132,11 +147,9 @@ async fn drive_with_responder(
 
 #[tokio::test]
 async fn approval_grant_path_mints_token_and_writes_file() {
-    let (_dir, repo_root, events, had_cap) = drive_with_responder(Some(
-        ApprovalResponse::Grant {
-            scope: ApprovalScope::Session,
-        },
-    ))
+    let (_dir, repo_root, events, had_cap) = drive_with_responder(Some(ApprovalResponse::Grant {
+        scope: ApprovalScope::Session,
+    }))
     .await;
 
     // Sequence check: ApprovalRequest → ApprovalGranted → EffectRecord(ApplyLocal)
@@ -151,21 +164,36 @@ async fn approval_grant_path_mints_token_and_writes_file() {
         .expect("ApprovalGranted missing");
     let idx_effect = events
         .iter()
-        .position(|e| matches!(
-            e,
-            SessionEvent::EffectRecord { effect, .. } if effect.class == EffectClass::ApplyLocal
-        ))
+        .position(|e| {
+            matches!(
+                e,
+                SessionEvent::EffectRecord { effect, .. } if effect.class == EffectClass::ApplyLocal
+            )
+        })
         .expect("EffectRecord(ApplyLocal) missing");
     let idx_result = events
         .iter()
-        .position(|e| matches!(e, SessionEvent::ToolResult { is_error: false, .. }))
+        .position(|e| {
+            matches!(
+                e,
+                SessionEvent::ToolResult {
+                    is_error: false,
+                    ..
+                }
+            )
+        })
         .expect("clean ToolResult missing");
     let idx_commit = events
         .iter()
-        .position(|e| matches!(
-            e,
-            SessionEvent::TurnCommitted { outcome: CommitOutcome::Success, .. }
-        ))
+        .position(|e| {
+            matches!(
+                e,
+                SessionEvent::TurnCommitted {
+                    outcome: CommitOutcome::Success,
+                    ..
+                }
+            )
+        })
         .expect("TurnCommitted missing");
     assert!(idx_req < idx_grant);
     assert!(idx_grant < idx_effect);
@@ -193,7 +221,10 @@ async fn approval_deny_path_aborts_turn_and_writes_nothing() {
         .any(|e| matches!(e, SessionEvent::ApprovalDenied { .. })));
     assert!(events.iter().any(|e| matches!(
         e,
-        SessionEvent::TurnAborted { reason: AbortReason::ApprovalDenied, .. }
+        SessionEvent::TurnAborted {
+            reason: AbortReason::ApprovalDenied,
+            ..
+        }
     )));
     assert!(!events
         .iter()

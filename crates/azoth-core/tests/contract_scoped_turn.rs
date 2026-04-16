@@ -14,8 +14,8 @@ use azoth_core::contract;
 use azoth_core::event_store::{JsonlReader, JsonlWriter};
 use azoth_core::execution::{CancellationToken, ExecutionContext, ToolDispatcher};
 use azoth_core::schemas::{
-    AbortReason, ContentBlock, Message, ModelTurnResponse, RunId, SessionEvent, StopReason,
-    TurnId, Usage,
+    AbortReason, ContentBlock, Message, ModelTurnResponse, RunId, SessionEvent, StopReason, TurnId,
+    Usage,
 };
 use azoth_core::turn::TurnDriver;
 use tempfile::tempdir;
@@ -106,7 +106,11 @@ async fn driver_honors_persisted_contract_round_trip() {
         // round-trip before we even drive.
         assert_eq!(driver.contract.unwrap(), &persisted);
         driver
-            .drive_turn(turn_id.clone(), "system".into(), vec![Message::user_text("go")])
+            .drive_turn(
+                turn_id.clone(),
+                "system".into(),
+                vec![Message::user_text("go")],
+            )
             .await
             .expect("turn drives cleanly under contract");
     }
@@ -178,10 +182,17 @@ async fn driver_aborts_when_contract_max_turns_reached() {
             evidence_collector: None,
         };
         let usage = driver
-            .drive_turn(turn_id.clone(), "system".into(), vec![Message::user_text("go")])
+            .drive_turn(
+                turn_id.clone(),
+                "system".into(),
+                vec![Message::user_text("go")],
+            )
             .await
             .expect("abort returns Ok with empty usage");
-        assert_eq!(usage.output_tokens, 0, "no adapter call should have happened");
+        assert_eq!(
+            usage.usage.output_tokens, 0,
+            "no adapter call should have happened"
+        );
     }
     drop(writer);
 
@@ -204,13 +215,18 @@ async fn driver_aborts_when_contract_max_turns_reached() {
     let forensic = JsonlReader::open(&session_path)
         .forensic()
         .expect("forensic ok");
-    let saw_abort = forensic.iter().any(|e| matches!(
-        &e.event,
-        SessionEvent::TurnAborted {
-            turn_id: tid,
-            reason: AbortReason::TokenBudget,
-            ..
-        } if tid == &turn_id
-    ));
-    assert!(saw_abort, "expected TurnAborted(TokenBudget) for maxed turn");
+    let saw_abort = forensic.iter().any(|e| {
+        matches!(
+            &e.event,
+            SessionEvent::TurnAborted {
+                turn_id: tid,
+                reason: AbortReason::TokenBudget,
+                ..
+            } if tid == &turn_id
+        )
+    });
+    assert!(
+        saw_abort,
+        "expected TurnAborted(TokenBudget) for maxed turn"
+    );
 }

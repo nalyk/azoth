@@ -27,7 +27,9 @@ use tokio::sync::mpsc;
 fn mock_end_turn_only() -> MockScript {
     MockScript {
         turns: vec![ModelTurnResponse {
-            content: vec![ContentBlock::Text { text: "done".into() }],
+            content: vec![ContentBlock::Text {
+                text: "done".into(),
+            }],
             stop_reason: StopReason::EndTurn,
             usage: Usage {
                 input_tokens: 4,
@@ -55,12 +57,12 @@ impl Validator for AlwaysFailValidator {
     }
 }
 
-async fn drive_with_validators<'a>(
+async fn drive_with_validators(
     session_path: &std::path::Path,
     artifacts_root: &std::path::Path,
-    repo_root: &std::path::PathBuf,
+    repo_root: &std::path::Path,
     contract_ref: &Contract,
-    validators: &[&'a dyn Validator],
+    validators: &[&dyn Validator],
 ) -> Vec<SessionEvent> {
     let mut writer = JsonlWriter::open(session_path).unwrap();
     let artifacts = ArtifactStore::open(artifacts_root).unwrap();
@@ -76,7 +78,7 @@ async fn drive_with_validators<'a>(
         turn_id: turn_id.clone(),
         artifacts,
         cancellation: CancellationToken::new(),
-        repo_root: repo_root.clone(),
+        repo_root: repo_root.to_path_buf(),
     };
     let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalRequestMsg>(8);
     let mut caps = CapabilityStore::new();
@@ -121,12 +123,9 @@ fn persist_contract(seed_path: &std::path::Path, goal: &str) -> Contract {
     let mut seed = JsonlWriter::open(seed_path).unwrap();
     let mut drafted = contract::draft(goal);
     drafted.success_criteria.push("validators wired".into());
-    let persisted = contract::accept_and_persist(
-        &mut seed,
-        drafted,
-        "2026-04-16T00:00:00Z".to_string(),
-    )
-    .expect("persist ok");
+    let persisted =
+        contract::accept_and_persist(&mut seed, drafted, "2026-04-16T00:00:00Z".to_string())
+            .expect("persist ok");
     drop(seed);
     persisted
 }
@@ -261,14 +260,8 @@ async fn empty_validators_slice_keeps_pre_validators_byte_shape() {
     let persisted = persist_contract(&seed_path, "no validators attached");
 
     let session_path = repo_root.join(".azoth/sessions/empty.jsonl");
-    let events = drive_with_validators(
-        &session_path,
-        &artifacts_root,
-        &repo_root,
-        &persisted,
-        &[],
-    )
-    .await;
+    let events =
+        drive_with_validators(&session_path, &artifacts_root, &repo_root, &persisted, &[]).await;
 
     assert!(
         !events

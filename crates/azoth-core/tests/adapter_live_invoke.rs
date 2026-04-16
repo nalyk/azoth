@@ -95,7 +95,10 @@ async fn anthropic_live_invoke_roundtrip() {
     .expect("live anthropic invoke");
 
     assert!(
-        matches!(resp.stop_reason, StopReason::EndTurn | StopReason::MaxTokens),
+        matches!(
+            resp.stop_reason,
+            StopReason::EndTurn | StopReason::MaxTokens
+        ),
         "unexpected stop_reason: {:?}",
         resp.stop_reason
     );
@@ -118,7 +121,10 @@ async fn anthropic_live_invoke_roundtrip() {
     eprintln!("anthropic live reply: {:?}", text_blocks);
 
     let events = drain_sink(&mut sink_rx);
-    assert!(events > 0, "sink should have received at least one StreamEvent");
+    assert!(
+        events > 0,
+        "sink should have received at least one StreamEvent"
+    );
 }
 
 #[tokio::test]
@@ -145,7 +151,10 @@ async fn openrouter_live_invoke_roundtrip() {
     .expect("live openrouter invoke");
 
     assert!(
-        matches!(resp.stop_reason, StopReason::EndTurn | StopReason::MaxTokens),
+        matches!(
+            resp.stop_reason,
+            StopReason::EndTurn | StopReason::MaxTokens
+        ),
         "unexpected stop_reason: {:?}",
         resp.stop_reason
     );
@@ -168,5 +177,8 @@ async fn openrouter_live_invoke_roundtrip() {
     eprintln!("openrouter live reply: {:?}", text_blocks);
 
     let events = drain_sink(&mut sink_rx);
-    assert!(events > 0, "sink should have received at least one StreamEvent");
+    assert!(
+        events > 0,
+        "sink should have received at least one StreamEvent"
+    );
 }

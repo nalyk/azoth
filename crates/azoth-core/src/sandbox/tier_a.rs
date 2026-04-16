@@ -111,10 +111,7 @@ impl SandboxChild {
 /// multi-threaded process is UB per POSIX. The v1 callers (integration
 /// tests, future synchronous wiring) enforce this.
 #[cfg(target_os = "linux")]
-pub fn spawn_jailed(
-    tool_argv: &[&str],
-    opts: &SpawnOptions,
-) -> Result<SandboxChild, SandboxError> {
+pub fn spawn_jailed(tool_argv: &[&str], opts: &SpawnOptions) -> Result<SandboxChild, SandboxError> {
     use nix::fcntl::OFlag;
     use nix::unistd::{fork, getgid, getuid, pipe2, ForkResult};
     use std::io::Read;
@@ -158,7 +155,10 @@ pub fn spawn_jailed(
                 Ok(0) => {
                     // EOF without data: child successfully reached execvp
                     // (write end was O_CLOEXEC, closed atomically by exec).
-                    Ok(SandboxChild { pid: child, reaped: false })
+                    Ok(SandboxChild {
+                        pid: child,
+                        reaped: false,
+                    })
                 }
                 Ok(_) => {
                     // Reap the failed child so it doesn't linger as a zombie.

@@ -229,13 +229,10 @@ async fn handle_chunk(
     if let Some(reason) = finish {
         let stop = parse_finish_reason(reason);
         builder.stop_reason = Some(stop);
-        let usage_delta = builder
-            .pending_usage_delta
-            .take()
-            .unwrap_or(UsageDelta {
-                input_tokens: 0,
-                output_tokens: 0,
-            });
+        let usage_delta = builder.pending_usage_delta.take().unwrap_or(UsageDelta {
+            input_tokens: 0,
+            output_tokens: 0,
+        });
         let _ = sink
             .send(StreamEvent::MessageDelta {
                 stop_reason: Some(stop),
@@ -315,10 +312,7 @@ async fn handle_tool_call_fragment(
 fn classify_error(kind: &str) -> AdapterErrorCode {
     if kind.contains("rate_limit") || kind == "overloaded_error" {
         AdapterErrorCode::RateLimited
-    } else if kind.contains("auth")
-        || kind == "permission_error"
-        || kind == "invalid_api_key"
-    {
+    } else if kind.contains("auth") || kind == "permission_error" || kind == "invalid_api_key" {
         AdapterErrorCode::AuthFailed
     } else if kind == "invalid_request_error" {
         AdapterErrorCode::InvalidRequest
@@ -437,7 +431,9 @@ impl ResponseBuilder {
                 *input = Some(parsed);
             }
             self.open[idx] = false;
-            let _ = sink.send(StreamEvent::ContentBlockStop { index: idx }).await;
+            let _ = sink
+                .send(StreamEvent::ContentBlockStop { index: idx })
+                .await;
         }
     }
 

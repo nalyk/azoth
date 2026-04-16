@@ -76,8 +76,7 @@ impl SqliteMirror {
     }
 
     fn ensure_schema(conn: &Connection) -> Result<(), MirrorError> {
-        let current: i32 =
-            conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        let current: i32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         if current == 0 {
             conn.execute_batch(
                 r#"
@@ -295,7 +294,8 @@ mod tests {
         m.apply(&committed("t_1", 10, 20)).unwrap();
 
         m.apply(&turn_started("run_A", "t_2")).unwrap();
-        m.apply(&aborted("t_2", AbortReason::ValidatorFail)).unwrap();
+        m.apply(&aborted("t_2", AbortReason::ValidatorFail))
+            .unwrap();
 
         m.apply(&turn_started("run_A", "t_3")).unwrap();
         m.apply(&interrupted("t_3")).unwrap();
@@ -349,7 +349,8 @@ mod tests {
         w.append(&turn_started("run_B", "t_a")).unwrap();
         w.append(&committed("t_a", 1, 2)).unwrap();
         w.append(&turn_started("run_B", "t_b")).unwrap();
-        w.append(&aborted("t_b", AbortReason::ApprovalDenied)).unwrap();
+        w.append(&aborted("t_b", AbortReason::ApprovalDenied))
+            .unwrap();
         drop(w);
 
         let mut m = SqliteMirror::open_in_memory().unwrap();
