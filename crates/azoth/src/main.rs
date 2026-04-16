@@ -1,7 +1,11 @@
 #![allow(dead_code)]
 //! azoth CLI binary entrypoint.
 
+use std::path::PathBuf;
+
 use clap::{Parser, Subcommand};
+
+mod replay;
 
 #[derive(Parser, Debug)]
 #[command(name = "azoth", version, about = "Azoth coding-first agent runtime")]
@@ -19,13 +23,31 @@ enum Command {
         /// The `run_id` of the session file to reopen.
         run_id: String,
     },
+    /// Render a prior session's JSONL log to stdout. Replayable projection by
+    /// default; pass `--forensic` to include aborted/interrupted turns.
+    Replay {
+        /// The `run_id` of the session file to read.
+        run_id: String,
+        /// Include non-replayable events (aborted, interrupted, dangling).
+        #[arg(long)]
+        forensic: bool,
+        /// Output format.
+        #[arg(long, value_enum, default_value_t = replay::Format::Text)]
+        format: replay::Format,
+        /// Directory containing `<run_id>.jsonl`. Defaults to `.azoth/sessions`.
+        #[arg(long)]
+        sessions_dir: Option<PathBuf>,
+    },
     /// Dump version + build info.
     Version,
 }
 
 fn main() {
     let cli = Cli::parse();
-    let is_tui = !matches!(cli.command, Some(Command::Version));
+    let is_tui = matches!(
+        cli.command,
+        None | Some(Command::Tui) | Some(Command::Resume { .. })
+    );
 
     if is_tui {
         // TUI mode: tracing goes to .azoth/azoth.log so it doesn't corrupt
@@ -59,6 +81,27 @@ fn main() {
     match cli.command.unwrap_or(Command::Tui) {
         Command::Tui => run_tui(None),
         Command::Resume { run_id } => run_tui(Some(run_id)),
+        Command::Replay {
+            run_id,
+            forensic,
+            format,
+            sessions_dir,
+        } => {
+            let sessions_dir =
+                sessions_dir.unwrap_or_else(|| PathBuf::from(".azoth").join("sessions"));
+            let args = replay::Args {
+                run_id,
+                sessions_dir,
+                forensic,
+                format,
+            };
+            let stdout = std::io::stdout();
+            let mut lock = stdout.lock();
+            if let Err(e) = replay::run(args, &mut lock) {
+                eprintln!("replay error: {e}");
+                std::process::exit(1);
+            }
+        }
         Command::Version => {
             println!("azoth {}", env!("CARGO_PKG_VERSION"));
         }

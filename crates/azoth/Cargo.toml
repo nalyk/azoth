@@ -29,3 +29,6 @@ time = { workspace = true }
 ratatui = { workspace = true, optional = true }
 crossterm = { workspace = true, optional = true }
 tui-textarea = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
