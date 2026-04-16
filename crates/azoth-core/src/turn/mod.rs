@@ -420,7 +420,7 @@ impl<'a> TurnDriver<'a> {
                                     let summary = format!(
                                         "{} → {}",
                                         tool_name,
-                                        path_hint.unwrap_or("(no path)")
+                                        approval_hint(&tool_name, input)
                                     );
                                     self.writer.append(&SessionEvent::ApprovalRequest {
                                         turn_id: turn_id.clone(),
@@ -571,11 +571,13 @@ impl<'a> TurnDriver<'a> {
                                     _ => {}
                                 }
                             }
+                            let content_artifact =
+                                persist_tool_output(&self.ctx.artifacts, &content);
                             self.writer.append(&SessionEvent::ToolResult {
                                 turn_id: turn_id.clone(),
                                 tool_use_id: id.clone(),
                                 is_error,
-                                content_artifact: None,
+                                content_artifact,
                                 call_group: None,
                             })?;
 
@@ -685,4 +687,116 @@ fn now_iso() -> String {
     time::OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
+}
+
+/// Persist a tool's output content blocks to the content-addressed artifact
+/// store and return the resulting `ArtifactId` for the `ToolResult` event.
+///
+/// Serializes the `Vec<ContentBlock>` as JSON (stable wire format matching
+/// the schema) and hands the bytes to `ArtifactStore::put`. On failure the
+/// error is logged and `None` is returned — the tool output still flows
+/// inline to the model through the in-memory message list, so turn execution
+/// is unaffected. Only forensic/replay fidelity degrades, and we surface that
+/// via tracing.
+fn persist_tool_output(
+    artifacts: &crate::artifacts::ArtifactStore,
+    content: &[crate::schemas::ContentBlock],
+) -> Option<crate::schemas::ArtifactId> {
+    let bytes = match serde_json::to_vec(content) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(error = %e, "serialize tool output for artifact store");
+            return None;
+        }
+    };
+    match artifacts.put(&bytes) {
+        Ok(id) => Some(id),
+        Err(e) => {
+            tracing::warn!(error = %e, "persist tool output to artifact store");
+            None
+        }
+    }
+}
+
+/// Human-readable hint describing what a tool is about to do, shown in the
+/// approval modal. Tool-specific extractors take priority over the generic
+/// JSON fallback so `bash → rm -rf /` renders meaningfully instead of
+/// `bash → (no path)`.
+fn approval_hint(tool_name: &str, input: &serde_json::Value) -> String {
+    if let Some(p) = input.get("path").and_then(|v| v.as_str()) {
+        return p.to_string();
+    }
+    match tool_name {
+        "bash" => {
+            if let Some(cmd) = input.get("command").and_then(|v| v.as_str()) {
+                return truncate_single_line(cmd, 80);
+            }
+        }
+        "repo.search" => {
+            if let Some(q) = input.get("q").and_then(|v| v.as_str()) {
+                return format!("q={}", truncate_single_line(q, 60));
+            }
+        }
+        _ => {}
+    }
+    let raw = input.to_string();
+    truncate_single_line(&raw, 80)
+}
+
+fn truncate_single_line(s: &str, n: usize) -> String {
+    let one_line: String = s
+        .chars()
+        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+        .collect();
+    if one_line.chars().count() <= n {
+        one_line
+    } else {
+        let head: String = one_line.chars().take(n).collect();
+        format!("{head}…")
+    }
+}
+
+#[cfg(test)]
+mod approval_hint_tests {
+    use super::*;
+
+    #[test]
+    fn bash_hint_shows_command() {
+        let v = serde_json::json!({ "command": "ls -la /tmp" });
+        assert_eq!(approval_hint("bash", &v), "ls -la /tmp");
+    }
+
+    #[test]
+    fn bash_multiline_command_collapses_to_one_line() {
+        let v = serde_json::json!({ "command": "set -e\necho hi" });
+        assert_eq!(approval_hint("bash", &v), "set -e echo hi");
+    }
+
+    #[test]
+    fn path_based_tool_prefers_path() {
+        let v = serde_json::json!({ "path": "src/foo.rs", "command": "ignored" });
+        assert_eq!(approval_hint("fs.write", &v), "src/foo.rs");
+    }
+
+    #[test]
+    fn search_hint_shows_query() {
+        let v = serde_json::json!({ "q": "refresh_token" });
+        assert_eq!(approval_hint("repo.search", &v), "q=refresh_token");
+    }
+
+    #[test]
+    fn long_command_gets_truncated_with_ellipsis() {
+        let long_cmd = "x".repeat(200);
+        let v = serde_json::json!({ "command": long_cmd });
+        let hint = approval_hint("bash", &v);
+        assert!(hint.ends_with('…'));
+        assert!(hint.chars().count() <= 81); // 80 chars + ellipsis
+    }
+
+    #[test]
+    fn unknown_tool_falls_back_to_json_snippet() {
+        let v = serde_json::json!({ "weird": "thing" });
+        let hint = approval_hint("custom.tool", &v);
+        assert!(hint.contains("weird"));
+    }
 }
