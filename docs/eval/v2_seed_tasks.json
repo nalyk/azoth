@@ -1,0 +1,306 @@
+[
+  {
+    "id": "loc01",
+    "prompt": "Ctrl+C is ignored during a long streaming response; fix the turn driver's select loop so cancellation wins over the model stream.",
+    "relevant_files": [
+      "crates/azoth-core/src/turn/driver.rs",
+      "crates/azoth-core/src/turn/mod.rs"
+    ],
+    "predicted_files": [
+      "crates/azoth-core/src/turn/driver.rs",
+      "crates/azoth-core/src/turn/mod.rs",
+      "crates/azoth-core/src/adapter/mod.rs",
+      "crates/azoth-core/tests/backpressure_smoke.rs",
+      "CLAUDE.md"
+    ],
+    "notes": "MED-3 cancellation priority. Biased select! lives in driver.rs."
+  },
+  {
+    "id": "loc02",
+    "prompt": "Add a new SessionEvent variant for indexer activity. Make sure existing JSONL sessions still deserialise.",
+    "relevant_files": [
+      "crates/azoth-core/src/schemas/event.rs",
+      "crates/azoth-core/src/schemas/mod.rs"
+    ],
+    "predicted_files": [
+      "crates/azoth-core/src/schemas/event.rs",
+      "crates/azoth-core/src/schemas/mod.rs",
+      "crates/azoth-core/src/schemas/turn.rs",
+      "crates/azoth-core/src/event_store/jsonl.rs"
+    ],
+    "notes": "SessionEvent is the wire format; additions need serde(default)."
+  },
+  {
+    "id": "loc03",
+    "prompt": "The FTS5 snippet output is not byte-stable across reindexes. Normalise whitespace before it enters the evidence lane.",
+    "relevant_files": [
+      "crates/azoth-repo/src/fts.rs",
+      "crates/azoth-core/src/context/evidence.rs"
+    ],
+    "predicted_files": [
+      "crates/azoth-repo/src/fts.rs",
+      "crates/azoth-core/src/context/evidence.rs",
+      "crates/azoth-core/src/schemas/turn.rs",
+      "crates/azoth-core/tests/evidence_snippet_stable.rs",
+      "crates/azoth-repo/src/indexer.rs"
+    ],
+    "notes": "Cache-prefix stability risk #1 from docs/v2_plan.md."
+  },
+  {
+    "id": "loc04",
+    "prompt": "A migration forward-compat bug: a fresh DB lands at a different user_version than a seeded v1.5 DB. Fix the migrator.",
+    "relevant_files": [
+      "crates/azoth-core/src/event_store/migrations/mod.rs",
+      "crates/azoth-core/tests/migration_forward_compat.rs"
+    ],
+    "predicted_files": [
+      "crates/azoth-core/src/event_store/migrations/mod.rs",
+      "crates/azoth-core/src/event_store/migrations/m0001_initial.rs",
+      "crates/azoth-core/src/event_store/sqlite.rs",
+      "crates/azoth-core/tests/migration_forward_compat.rs"
+    ],
+    "notes": "Hand-rolled migrator in azoth-core."
+  },
+  {
+    "id": "loc05",
+    "prompt": "Add a new tool that reads a file span. Route it through the taint gate correctly.",
+    "relevant_files": [
+      "crates/azoth-core/src/authority/tainted.rs",
+      "crates/azoth-core/src/execution/dispatcher.rs",
+      "crates/azoth-core/src/tools"
+    ],
+    "predicted_files": [
+      "crates/azoth-core/src/tools",
+      "crates/azoth-core/src/execution/dispatcher.rs",
+      "crates/azoth-core/src/schemas/content.rs",
+      "crates/azoth-core/src/authority/tainted.rs"
+    ],
+    "notes": "CRIT-2 taint discipline lives in dispatcher."
+  },
+  {
+    "id": "loc06",
+    "prompt": "Ollama endpoint returns 502 during live invoke. Add retry logic to the OpenAI-shape adapter.",
+    "relevant_files": [
+      "crates/azoth-core/src/adapter/openai_chat_completions.rs",
+      "crates/azoth-core/src/adapter/mod.rs"
+    ],
+    "predicted_files": [
+      "crates/azoth-core/src/adapter/openai_chat_completions.rs",
+      "crates/azoth-core/src/adapter/anthropic_messages.rs",
+      "crates/azoth-core/src/adapter/mod.rs",
+      "crates/azoth-core/src/adapter/stream.rs",
+      "crates/azoth-core/tests/adapter_live_invoke.rs"
+    ],
+    "notes": "OpenAI-shape adapter handles OpenRouter + Ollama."
+  },
+  {
+    "id": "loc07",
+    "prompt": "Resume path on a v1.5 session file panics on ImpactComputed events. Teach the reader to skip unknown variants gracefully.",
+    "relevant_files": [
+      "crates/azoth-core/src/event_store/jsonl.rs",
+      "crates/azoth-core/tests/resume_rebuilds_history.rs"
+    ],
+    "predicted_files": [
+      "crates/azoth-core/src/event_store/jsonl.rs",
+      "crates/azoth-core/tests/resume_rebuilds_history.rs",
+      "crates/azoth-core/src/schemas/event.rs",
+      "crates/azoth/src/tui/app.rs"
+    ],
+    "notes": "Forward-compat on resume path."
+  },
+  {
+    "id": "loc08",
+    "prompt": "Composite evidence collector starves the symbol lane under skewed weights. Add a per-lane floor to the budget.",
+    "relevant_files": [
+      "crates/azoth-core/src/context/budget.rs",
+      "crates/azoth-core/src/context/composite.rs"
+    ],
+    "predicted_files": [
+      "crates/azoth-core/src/context/composite.rs",
+      "crates/azoth-core/src/context/budget.rs",
+      "crates/azoth-core/src/context/evidence.rs",
+      "crates/azoth-core/tests/context_budget_fairness.rs",
+      "crates/azoth-core/src/context/kernel.rs"
+    ],
+    "notes": "Sprint 4 budget fairness."
+  },
+  {
+    "id": "loc09",
+    "prompt": "TDAD selector picks the wrong tests when the diff only touches tests/. Check the cargo-test selector's file-edge heuristic.",
+    "relevant_files": [
+      "crates/azoth-repo/src/impact/cargo.rs",
+      "crates/azoth-core/src/validators/impact.rs"
+    ],
+    "predicted_files": [
+      "crates/azoth-repo/src/impact",
+      "crates/azoth-core/src/validators/impact.rs",
+      "crates/azoth-core/src/impact",
+      "crates/azoth-core/src/schemas/impact.rs"
+    ],
+    "notes": "Sprint 5 ImpactSelector dispatch."
+  },
+  {
+    "id": "loc10",
+    "prompt": "Tier B sandbox can't probe fuse-overlayfs on boot. Add a startup probe and a degraded-mode warning.",
+    "relevant_files": [
+      "crates/azoth-core/src/sandbox"
+    ],
+    "predicted_files": [
+      "crates/azoth-core/src/sandbox",
+      "crates/azoth-core/src/execution/context.rs",
+      "crates/azoth-core/tests/sandbox_tier_a_smoke.rs",
+      "CLAUDE.md"
+    ],
+    "notes": "Sandbox module is multi-file; tier_b.rs lives there."
+  },
+  {
+    "id": "loc11",
+    "prompt": "Symbol index doesn't deduplicate symbols across re-indexes; writes grow unbounded. Fix invalidation.",
+    "relevant_files": [
+      "crates/azoth-repo/src/code_graph",
+      "crates/azoth-repo/src/indexer.rs"
+    ],
+    "predicted_files": [
+      "crates/azoth-repo/src/code_graph",
+      "crates/azoth-repo/src/indexer.rs",
+      "crates/azoth-core/src/retrieval/symbol.rs",
+      "crates/azoth-core/src/event_store/migrations/m0003_symbols.rs"
+    ],
+    "notes": "Sprint 2 symbol index; mtime-gated reindex."
+  },
+  {
+    "id": "loc12",
+    "prompt": "Co-edit graph returns bogus neighbors on squash-merge repos. Add the skip_large_commits config knob.",
+    "relevant_files": [
+      "crates/azoth-repo/src/history/co_edit.rs",
+      "crates/azoth-repo/src/history"
+    ],
+    "predicted_files": [
+      "crates/azoth-repo/src/history",
+      "crates/azoth-repo/src/history/git_cli.rs",
+      "crates/azoth-repo/src/history/co_edit.rs",
+      "crates/azoth-core/src/retrieval/mod.rs"
+    ],
+    "notes": "Sprint 3 co-edit graph risk #3."
+  },
+  {
+    "id": "loc13",
+    "prompt": "The MockAdapter script exhausts mid-run. Improve the error to say which turn ran out of scripted responses.",
+    "relevant_files": [
+      "crates/azoth-core/src/adapter/mock.rs"
+    ],
+    "predicted_files": [
+      "crates/azoth-core/src/adapter/mock.rs",
+      "crates/azoth-core/src/adapter/mod.rs",
+      "crates/azoth-core/src/adapter/error.rs",
+      "crates/azoth-core/src/turn/driver.rs"
+    ],
+    "notes": "MockAdapter lives in adapter/."
+  },
+  {
+    "id": "loc14",
+    "prompt": "Export subcommand writes bytes-not-cleanly-UTF8 to stdout. Filter ContentBlock::ToolUse input payloads through a sanitiser.",
+    "relevant_files": [
+      "crates/azoth/src/export.rs",
+      "crates/azoth-core/src/schemas/content.rs"
+    ],
+    "predicted_files": [
+      "crates/azoth/src/export.rs",
+      "crates/azoth/src/main.rs",
+      "crates/azoth/src/replay.rs",
+      "crates/azoth-core/src/schemas/content.rs"
+    ],
+    "notes": "azoth CLI export subcommand."
+  },
+  {
+    "id": "loc15",
+    "prompt": "TUI slash-command `/context` crashes on an empty session. Add a guard.",
+    "relevant_files": [
+      "crates/azoth/src/tui/input",
+      "crates/azoth/src/tui/app.rs"
+    ],
+    "predicted_files": [
+      "crates/azoth/src/tui/input",
+      "crates/azoth/src/tui/app.rs",
+      "crates/azoth/src/tui/widgets",
+      "crates/azoth/src/tui/render.rs"
+    ],
+    "notes": "TUI lives in azoth bin crate."
+  },
+  {
+    "id": "loc16",
+    "prompt": "Reranker trait is registered but returns unimplemented!. Wire IdentityReranker as the default.",
+    "relevant_files": [
+      "crates/azoth-core/src/context/reranker.rs",
+      "crates/azoth-core/src/context/composite.rs"
+    ],
+    "predicted_files": [
+      "crates/azoth-core/src/context/reranker.rs",
+      "crates/azoth-core/src/context/composite.rs",
+      "crates/azoth-core/src/context/kernel.rs",
+      "crates/azoth-core/tests/context_kernel_v2.rs"
+    ],
+    "notes": "Sprint 4 reranker trait + IdentityReranker."
+  },
+  {
+    "id": "loc17",
+    "prompt": "A newly-added provider profile needs an entry in the config registry and a constructor in the adapter profile module.",
+    "relevant_files": [
+      "crates/azoth-core/src/adapter/mod.rs",
+      "crates/azoth/src/tui"
+    ],
+    "predicted_files": [
+      "crates/azoth-core/src/adapter/mod.rs",
+      "crates/azoth/src/tui",
+      "crates/azoth-core/src/adapter/anthropic_messages.rs",
+      "crates/azoth-core/src/adapter/openai_chat_completions.rs",
+      "CLAUDE.md"
+    ],
+    "notes": "Profile registry split between azoth-core adapter and azoth bin config."
+  },
+  {
+    "id": "loc18",
+    "prompt": "ContextPacket digest differs across reruns because evidence items sort is non-deterministic on ties. Add an explicit tie-break.",
+    "relevant_files": [
+      "crates/azoth-core/src/context/composite.rs",
+      "crates/azoth-core/src/context/kernel.rs"
+    ],
+    "predicted_files": [
+      "crates/azoth-core/src/context/composite.rs",
+      "crates/azoth-core/src/context/kernel.rs",
+      "crates/azoth-core/src/context/evidence.rs",
+      "crates/azoth-core/tests/context_kernel_v2.rs"
+    ],
+    "notes": "PR #8 tie-break by label."
+  },
+  {
+    "id": "loc19",
+    "prompt": "SQLite mirror does not project ImpactComputed events. Add the upsert.",
+    "relevant_files": [
+      "crates/azoth-core/src/event_store/sqlite.rs",
+      "crates/azoth-core/src/event_store/migrations/m0005_impact.rs"
+    ],
+    "predicted_files": [
+      "crates/azoth-core/src/event_store/sqlite.rs",
+      "crates/azoth-core/src/event_store/migrations/m0005_impact.rs",
+      "crates/azoth-core/src/event_store/jsonl.rs",
+      "crates/azoth-core/src/schemas/event.rs"
+    ],
+    "notes": "PR #9 codex P1 projector."
+  },
+  {
+    "id": "loc20",
+    "prompt": "Localization metric: compute precision@k from predicted and relevant file lists.",
+    "relevant_files": [
+      "crates/azoth-core/src/eval/localization.rs",
+      "crates/azoth-core/src/eval/mod.rs"
+    ],
+    "predicted_files": [
+      "crates/azoth-core/src/eval/localization.rs",
+      "crates/azoth-core/src/eval/mod.rs",
+      "crates/azoth-core/src/eval/regression.rs",
+      "docs/eval/v2_seed_tasks.json"
+    ],
+    "notes": "This very sprint's ship."
+  }
+]

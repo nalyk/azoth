@@ -76,8 +76,8 @@ fn fresh_open_creates_v1_schema_and_accepts_terminal_events() {
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
     assert_eq!(
-        user_version, 5,
-        "Sprint 5 ships m0005 (test_impact) on top of m0004 (co_edit_edges) on top of m0003 (symbols) on top of m0002 (FTS) on top of m0001 (turns)"
+        user_version, 6,
+        "Sprint 6 ships m0006 (eval_runs) on top of m0005 (test_impact) / m0004 (co_edit_edges) / m0003 (symbols) / m0002 (FTS) / m0001 (turns)"
     );
 
     let mut cols: Vec<String> = {

@@ -292,6 +292,26 @@ fn write_event_line<W: std::io::Write>(
             selected_tests.len(),
             if ran_at.is_empty() { "-" } else { ran_at }
         ),
+        SessionEvent::EvalSampled {
+            metric,
+            value,
+            k,
+            task_id,
+            sampled_at,
+            ..
+        } => writeln!(
+            out,
+            "{prefix}{turn} eval_sampled     metric={} value={:.4} k={} task={} at={}",
+            metric,
+            value,
+            k,
+            if task_id.is_empty() { "-" } else { task_id },
+            if sampled_at.is_empty() {
+                "-"
+            } else {
+                sampled_at
+            }
+        ),
     }
 }
 

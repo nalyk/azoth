@@ -5,6 +5,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
+mod eval;
 mod export;
 mod replay;
 
@@ -57,6 +58,43 @@ enum Command {
     },
     /// Dump version + build info.
     Version,
+    /// Eval plane (v2 Sprint 6). Sweeps a seed task set, computes
+    /// localization@k, prints a report, and emits `EvalSampled`
+    /// events to `.azoth/sessions/<run_id>.jsonl` for SQLite mirror
+    /// projection.
+    Eval {
+        #[command(subcommand)]
+        sub: EvalCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum EvalCommand {
+    /// Score every task in a seed JSON file against its
+    /// `relevant_files` ground truth.
+    Run {
+        /// Path to the seed task JSON file. Schema:
+        /// `[{id, prompt, relevant_files[], predicted_files[], notes}, ...]`.
+        #[arg(long)]
+        seed: PathBuf,
+        /// Cut-off k for precision@k. Defaults to 5 (plan §Verification
+        /// gate 8).
+        #[arg(long, default_value_t = 5)]
+        k: u32,
+        /// Write the full `EvalReport` as JSON to this path. When
+        /// omitted, only the human-readable report lands on stdout.
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Directory for the synthetic session JSONL. Defaults to
+        /// `.azoth/sessions`.
+        #[arg(long)]
+        sessions_dir: Option<PathBuf>,
+        /// Override the synthesised run_id. Default: `eval_<digest>`
+        /// where `<digest>` is the first 12 hex chars of the seed
+        /// file's sha256.
+        #[arg(long)]
+        run_id: Option<String>,
+    },
 }
 
 fn main() {
@@ -154,6 +192,31 @@ fn main() {
         Command::Version => {
             println!("azoth {}", env!("CARGO_PKG_VERSION"));
         }
+        Command::Eval { sub } => match sub {
+            EvalCommand::Run {
+                seed,
+                k,
+                out,
+                sessions_dir,
+                run_id,
+            } => {
+                let sessions_dir =
+                    sessions_dir.unwrap_or_else(|| PathBuf::from(".azoth").join("sessions"));
+                let args = eval::Args {
+                    seed,
+                    k,
+                    out,
+                    sessions_dir,
+                    run_id,
+                };
+                let stdout = std::io::stdout();
+                let mut lock = stdout.lock();
+                if let Err(e) = eval::run(args, &mut lock) {
+                    eprintln!("eval error: {e}");
+                    std::process::exit(1);
+                }
+            }
+        },
     }
 }
 

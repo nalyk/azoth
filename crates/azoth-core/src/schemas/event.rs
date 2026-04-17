@@ -224,6 +224,42 @@ pub enum SessionEvent {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         confidence: Vec<f32>,
     },
+    /// An eval-plane measurement (Sprint 6). Emitted by
+    /// `azoth eval run` for each seed task and — in v2.1 — by the
+    /// `TurnDriver` itself at commit time for in-flow retrieval-
+    /// quality signals (invariant 6: every subsystem is eval-able).
+    ///
+    /// `metric` names the metric (`localization_precision_at_k`,
+    /// `regression_rate`, future additions). `value` is the measured
+    /// scalar in `[0.0, 1.0]` for rate-style metrics. `k` is the cut-
+    /// off used by precision@k / recall@k metrics; `0` when the
+    /// metric is scalar and k-independent.
+    ///
+    /// `task_id` identifies a seed-task scope. Empty for
+    /// turn-embedded signals where the per-turn `turn_id` is the only
+    /// needed scope.
+    ///
+    /// All non-essential fields carry `#[serde(default)]` so older
+    /// binaries tolerate forward-compat additions without treating
+    /// the absent field as a parse error.
+    EvalSampled {
+        turn_id: TurnId,
+        #[serde(default)]
+        metric: String,
+        #[serde(default)]
+        value: f64,
+        #[serde(default)]
+        k: u32,
+        /// ISO-8601 UTC wall-clock at emit time. Empty only for
+        /// forward-compat fixtures that predate this field; real
+        /// emitters populate it.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        sampled_at: String,
+        /// Seed-task scope label. Empty when the sample is turn-
+        /// embedded rather than seed-driven.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        task_id: String,
+    },
 }
 
 impl SessionEvent {
@@ -249,7 +285,8 @@ impl SessionEvent {
             | TurnInterrupted { turn_id, .. }
             | RetrievalQueried { turn_id, .. }
             | SymbolResolved { turn_id, .. }
-            | ImpactComputed { turn_id, .. } => Some(turn_id),
+            | ImpactComputed { turn_id, .. }
+            | EvalSampled { turn_id, .. } => Some(turn_id),
         }
     }
 
@@ -417,6 +454,64 @@ mod tests {
             !s.contains("\"selected_tests\""),
             "wire leaked selected_tests: {s}"
         );
+    }
+
+    #[test]
+    fn eval_sampled_round_trips_and_omits_empty_optionals() {
+        // Populated emit: all fields round-trip exactly.
+        let ev = SessionEvent::EvalSampled {
+            turn_id: TurnId::from("t_eval_1".to_string()),
+            metric: "localization_precision_at_k".to_string(),
+            value: 0.8,
+            k: 5,
+            sampled_at: "2026-04-17T15:00:00Z".to_string(),
+            task_id: "loc01".to_string(),
+        };
+        let s = serde_json::to_string(&ev).unwrap();
+        assert!(s.contains(r#""type":"eval_sampled""#), "{s}");
+        assert!(s.contains(r#""task_id":"loc01""#), "{s}");
+        let back: SessionEvent = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, ev);
+        assert_eq!(back.turn_id().map(|t| t.as_str()), Some("t_eval_1"));
+
+        // Turn-embedded variant: empty task_id must not leak onto the
+        // wire — cache-prefix stability (see pattern_serde_skip_
+        // serializing_if_for_cache_stability).
+        let ev2 = SessionEvent::EvalSampled {
+            turn_id: TurnId::from("t_eval_2".to_string()),
+            metric: "regression_rate".into(),
+            value: 0.0,
+            k: 0,
+            sampled_at: "2026-04-17T15:01:00Z".into(),
+            task_id: String::new(),
+        };
+        let s2 = serde_json::to_string(&ev2).unwrap();
+        assert!(!s2.contains("\"task_id\""), "wire leaked task_id: {s2}");
+
+        // Forward-compat: a minimal writer (no sampled_at, no task_id)
+        // must still deserialise.
+        let wire = r#"{
+            "type":"eval_sampled",
+            "turn_id":"t_eval_3"
+        }"#;
+        let back3: SessionEvent = serde_json::from_str(wire).unwrap();
+        match back3 {
+            SessionEvent::EvalSampled {
+                metric,
+                value,
+                k,
+                sampled_at,
+                task_id,
+                ..
+            } => {
+                assert!(metric.is_empty());
+                assert_eq!(value, 0.0);
+                assert_eq!(k, 0);
+                assert!(sampled_at.is_empty());
+                assert!(task_id.is_empty());
+            }
+            other => panic!("expected EvalSampled, got {other:?}"),
+        }
     }
 
     #[test]
