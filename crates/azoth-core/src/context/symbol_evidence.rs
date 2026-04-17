@@ -66,6 +66,8 @@ fn symbols_to_evidence(symbols: Vec<Symbol>, limit: usize) -> Vec<EvidenceItem> 
             artifact_ref: Some(format!("{}#L{}", s.path, s.start_line)),
             inline: None,
             decision_weight: base.saturating_sub(idx as u32).max(1),
+            lane: Some("symbol".into()),
+            rerank_score: None,
         })
         .collect()
 }

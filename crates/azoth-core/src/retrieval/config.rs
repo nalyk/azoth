@@ -1,4 +1,5 @@
-//! Retrieval configuration — Sprint 1 knob for `lexical_backend`.
+//! Retrieval configuration — Sprint 1 knob for `lexical_backend`,
+//! Sprint 3 co-edit knobs, Sprint 4 `retrieval.mode` selector.
 //!
 //! The `AzothConfig` object prescribed by `docs/v2_plan.md` §Sprint 1
 //! does not yet exist as a single struct in the codebase. Rather than
@@ -10,6 +11,11 @@
 //!
 //! Sprint 1 default: `ripgrep` — no behavior change on upgrade. Sprint
 //! 5 eval flips to `both`; Sprint 7 flips to `fts` as the ship default.
+//!
+//! Sprint 4 adds `RetrievalMode { Legacy, Composite }` — the high-level
+//! switch between the single-lane `LexicalEvidenceCollector` and the
+//! multi-lane `CompositeEvidenceCollector`. Default is `Legacy` through
+//! Sprint 6; Sprint 7 flips to `Composite` as the ship default.
 
 use serde::{Deserialize, Serialize};
 
@@ -86,6 +92,37 @@ impl Default for CoEditConfig {
     }
 }
 
+/// High-level retrieval mode — v2 Sprint 4 knob. `Legacy` is the
+/// single-lane `LexicalEvidenceCollector` path (same behaviour as
+/// pre-Sprint-4). `Composite` wires the multi-lane
+/// `CompositeEvidenceCollector` (`graph → symbol → lexical → fts →
+/// rerank`). Default is `Legacy` through Sprint 6; Sprint 7 flips to
+/// `Composite`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetrievalMode {
+    #[default]
+    Legacy,
+    Composite,
+}
+
+impl RetrievalMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RetrievalMode::Legacy => "legacy",
+            RetrievalMode::Composite => "composite",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "legacy" => Some(RetrievalMode::Legacy),
+            "composite" => Some(RetrievalMode::Composite),
+            _ => None,
+        }
+    }
+}
+
 /// Retrieval subtree of the (future) central config. Kept small so the
 /// lexical_backend knob can flow through the runtime without invoking
 /// a broader config migration.
@@ -95,6 +132,8 @@ pub struct RetrievalConfig {
     pub lexical_backend: LexicalBackend,
     #[serde(default)]
     pub co_edit: CoEditConfig,
+    #[serde(default)]
+    pub mode: RetrievalMode,
 }
 
 impl RetrievalConfig {
@@ -120,12 +159,24 @@ impl RetrievalConfig {
             co_edit_defaults.skip_large_commits,
         );
 
+        let mode = match std::env::var("AZOTH_RETRIEVAL_MODE") {
+            Ok(raw) => RetrievalMode::parse(raw.trim()).unwrap_or_else(|| {
+                tracing::warn!(
+                    value = %raw,
+                    "unknown AZOTH_RETRIEVAL_MODE; falling back to default (legacy)"
+                );
+                RetrievalMode::default()
+            }),
+            Err(_) => RetrievalMode::default(),
+        };
+
         Self {
             lexical_backend,
             co_edit: CoEditConfig {
                 window,
                 skip_large_commits,
             },
+            mode,
         }
     }
 }
@@ -178,5 +229,40 @@ mod tests {
         assert_eq!(json, "\"fts\"");
         let parsed: LexicalBackend = serde_json::from_str("\"both\"").unwrap();
         assert_eq!(parsed, LexicalBackend::Both);
+    }
+
+    #[test]
+    fn retrieval_mode_default_is_legacy() {
+        // Sprint 4: default legacy through Sprint 6; Sprint 7 flips.
+        assert_eq!(RetrievalMode::default(), RetrievalMode::Legacy);
+        let cfg = RetrievalConfig::default();
+        assert_eq!(cfg.mode, RetrievalMode::Legacy);
+    }
+
+    #[test]
+    fn retrieval_mode_parse_round_trips() {
+        for m in [RetrievalMode::Legacy, RetrievalMode::Composite] {
+            assert_eq!(RetrievalMode::parse(m.as_str()), Some(m));
+        }
+        assert_eq!(RetrievalMode::parse("noise"), None);
+    }
+
+    #[test]
+    fn retrieval_mode_json_round_trips() {
+        let json = serde_json::to_string(&RetrievalMode::Composite).unwrap();
+        assert_eq!(json, "\"composite\"");
+        let parsed: RetrievalMode = serde_json::from_str("\"legacy\"").unwrap();
+        assert_eq!(parsed, RetrievalMode::Legacy);
+    }
+
+    #[test]
+    fn v1_5_config_deserialises_without_mode_field() {
+        // Risk ledger #1: additive schema change. A pre-Sprint-4
+        // serialised config has no `mode` field — must still load as
+        // `Legacy` via `#[serde(default)]`.
+        let json =
+            r#"{"lexical_backend":"ripgrep","co_edit":{"window":500,"skip_large_commits":50}}"#;
+        let cfg: RetrievalConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.mode, RetrievalMode::Legacy);
     }
 }
