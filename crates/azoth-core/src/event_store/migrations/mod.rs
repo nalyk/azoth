@@ -43,11 +43,17 @@ use crate::event_store::sqlite::MirrorError;
 mod m0001_initial;
 mod m0002_fts_schema;
 mod m0003_symbols;
+mod m0004_co_edit;
 
 type MigrationStep = fn(&Transaction) -> Result<(), MirrorError>;
 
 fn all_steps() -> &'static [MigrationStep] {
-    &[m0001_initial::up, m0002_fts_schema::up, m0003_symbols::up]
+    &[
+        m0001_initial::up,
+        m0002_fts_schema::up,
+        m0003_symbols::up,
+        m0004_co_edit::up,
+    ]
 }
 
 /// Bring `conn` up to the latest schema version. Returns the new

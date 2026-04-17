@@ -21,8 +21,10 @@
 
 pub mod code_graph;
 pub mod fts;
+pub mod history;
 pub mod indexer;
 
 pub use code_graph::{extract_rust, SqliteSymbolIndex};
 pub use fts::FtsLexicalRetrieval;
+pub use history::{CoEditBuildStats, CoEditError, CoEditGraphRetrieval, PATH_PREFIX};
 pub use indexer::{IndexStats, IndexerError, RepoIndexer};

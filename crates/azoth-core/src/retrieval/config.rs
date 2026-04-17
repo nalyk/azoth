@@ -48,6 +48,44 @@ impl LexicalBackend {
     }
 }
 
+/// Sprint 3 — co-edit graph knobs. The graph is a read-only overlay on
+/// `git log`; no knob actively changes behaviour at query time, so the
+/// two tunables here both shape the *build* pass (migration m0004 +
+/// `history::co_edit::build`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoEditConfig {
+    /// How many recent commits to walk when building the graph. Plan
+    /// §Sprint 3 fixes this at 500. Larger windows produce denser
+    /// graphs but mask recent locality; smaller windows lose signal
+    /// on older files that are still load-bearing.
+    #[serde(default = "default_co_edit_window")]
+    pub window: u32,
+    /// Commits that touched more than this many files are skipped,
+    /// mitigating the "squash-merge degeneracy" called out in the
+    /// v2 plan risk ledger #3: a 100-file squash would add
+    /// C(100, 2) = 4950 dense edges of nearly-equal weight, all
+    /// signal-free. Default 50. `0` means "never skip".
+    #[serde(default = "default_skip_large_commits")]
+    pub skip_large_commits: u32,
+}
+
+fn default_co_edit_window() -> u32 {
+    500
+}
+
+fn default_skip_large_commits() -> u32 {
+    50
+}
+
+impl Default for CoEditConfig {
+    fn default() -> Self {
+        Self {
+            window: default_co_edit_window(),
+            skip_large_commits: default_skip_large_commits(),
+        }
+    }
+}
+
 /// Retrieval subtree of the (future) central config. Kept small so the
 /// lexical_backend knob can flow through the runtime without invoking
 /// a broader config migration.
@@ -55,6 +93,8 @@ impl LexicalBackend {
 pub struct RetrievalConfig {
     #[serde(default)]
     pub lexical_backend: LexicalBackend,
+    #[serde(default)]
+    pub co_edit: CoEditConfig,
 }
 
 impl RetrievalConfig {
@@ -72,7 +112,36 @@ impl RetrievalConfig {
             }),
             Err(_) => LexicalBackend::default(),
         };
-        Self { lexical_backend }
+
+        let co_edit_defaults = CoEditConfig::default();
+        let window = parse_u32_env("AZOTH_CO_EDIT_WINDOW", co_edit_defaults.window);
+        let skip_large_commits = parse_u32_env(
+            "AZOTH_CO_EDIT_SKIP_LARGE_COMMITS",
+            co_edit_defaults.skip_large_commits,
+        );
+
+        Self {
+            lexical_backend,
+            co_edit: CoEditConfig {
+                window,
+                skip_large_commits,
+            },
+        }
+    }
+}
+
+fn parse_u32_env(var: &str, fallback: u32) -> u32 {
+    match std::env::var(var) {
+        Ok(raw) => raw.trim().parse::<u32>().unwrap_or_else(|_| {
+            tracing::warn!(
+                value = %raw,
+                var,
+                fallback,
+                "unparseable u32 env var; using fallback"
+            );
+            fallback
+        }),
+        Err(_) => fallback,
     }
 }
 
