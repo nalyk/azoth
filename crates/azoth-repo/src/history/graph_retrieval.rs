@@ -88,6 +88,19 @@ fn bfs_neighbors(
         .lock()
         .map_err(|e| RetrievalError::Other(format!("conn mutex poisoned: {e}")))?;
 
+    // PR #7 review (gemini HIGH): hoist the `prepare` out of the
+    // per-anchor loop. Inside BFS with depth>1, a frontier of N
+    // nodes would otherwise re-parse the same SQL N times per hop;
+    // one prepared statement reused for every `query_rows` call
+    // turns that into N bind-and-step cycles over the same bytecode.
+    let mut stmt = guard
+        .prepare(
+            "SELECT path_b AS neighbor, weight FROM co_edit_edges WHERE path_a = ?1 \
+             UNION ALL \
+             SELECT path_a AS neighbor, weight FROM co_edit_edges WHERE path_b = ?1",
+        )
+        .map_err(|e| RetrievalError::Other(format!("prepare neighbor: {e}")))?;
+
     // best[path] = greatest weight on any visited path back to seed.
     let mut best: HashMap<String, f32> = HashMap::new();
     let mut frontier: Vec<String> = vec![seed.clone()];
@@ -99,7 +112,7 @@ fn bfs_neighbors(
         }
         let mut next: Vec<String> = Vec::new();
         for anchor in frontier.drain(..) {
-            for (neighbor, weight) in query_one_hop(&guard, &anchor)? {
+            for (neighbor, weight) in query_one_hop(&mut stmt, &anchor)? {
                 let entry = best.entry(neighbor.clone()).or_insert(f32::NEG_INFINITY);
                 let improved = weight > *entry;
                 if improved {
@@ -132,14 +145,13 @@ fn bfs_neighbors(
         .collect())
 }
 
-fn query_one_hop(conn: &Connection, anchor: &str) -> Result<Vec<(String, f32)>, RetrievalError> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT path_b AS neighbor, weight FROM co_edit_edges WHERE path_a = ?1 \
-             UNION ALL \
-             SELECT path_a AS neighbor, weight FROM co_edit_edges WHERE path_b = ?1",
-        )
-        .map_err(|e| RetrievalError::Other(format!("prepare neighbor: {e}")))?;
+/// Execute the hoisted prepared statement against one anchor path
+/// and collect the `(neighbor, weight)` rows. See `bfs_neighbors`
+/// for why the `Statement` is owned at the caller level.
+fn query_one_hop(
+    stmt: &mut rusqlite::Statement<'_>,
+    anchor: &str,
+) -> Result<Vec<(String, f32)>, RetrievalError> {
     let rows = stmt
         .query_map(params![anchor], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)? as f32))

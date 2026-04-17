@@ -9,11 +9,21 @@
 //!
 //! ## Output contract
 //!
-//! Equivalent to `git log --no-merges --name-only --format='%H%n%ct'`
-//! but uses an explicit `AZOTH_COMMIT|sha|ct` sentinel line instead of
-//! the plain-header format. The sentinel eliminates ambiguity between
-//! "40-hex file name" and "40-hex SHA" — an edge case that is
-//! astronomically unlikely but cheap to rule out.
+//! Equivalent to `git log --no-merges --name-only -z --format='...'`.
+//! Two robustness moves:
+//!
+//! 1. **`-z` NUL-separation** (PR #7 review, gemini MEDIUM). Git's
+//!    default `--name-only` separates files by LF, which breaks if a
+//!    path contains a newline (rare but legal on Linux and not subject
+//!    to any git-side quoting unless `core.quotepath=true`, which is
+//!    user config we cannot rely on). `-z` forces NUL as the file
+//!    separator and also NUL-terminates the format block — paths
+//!    with embedded LFs now round-trip cleanly.
+//! 2. **`AZOTH_COMMIT|sha|ct` sentinel** instead of the plain
+//!    `%H%n%ct` the v2 plan prescribes. Eliminates the (astronomically
+//!    unlikely) ambiguity between a 40-hex filename and a 40-hex SHA,
+//!    and makes the parser's commit-vs-file branch a cheap prefix
+//!    check instead of a state machine.
 //!
 //! `--no-merges` is deliberate: merge commits with `--name-only` emit
 //! nothing by default (they show combined diffs only under `-m`), and
@@ -75,6 +85,7 @@ pub fn recent_commits(repo_root: &Path, window: u32) -> Result<Vec<Commit>, GitE
             "log",
             "--no-merges",
             "--name-only",
+            "-z",
             "-n",
             &n,
             &format!("--format={format}"),
@@ -95,17 +106,31 @@ fn run_git(cwd: &Path, args: &[&str]) -> Result<String, GitError> {
 }
 
 fn parse(stdout: &str) -> Result<Vec<Commit>, GitError> {
+    // Under `-z`, git separates file entries with NUL and also
+    // NUL-terminates the format block. An LF still appears between
+    // each block pair (post-format / pre-names) because git-log
+    // frames records that way; we treat a single leading LF on a
+    // record as the block separator from the prior commit, not
+    // as part of the file path. A filename that genuinely starts
+    // with LF (legal on Linux, vanishingly rare in real repos)
+    // would lose that one byte — acceptable, and still strictly
+    // better than the LF-as-separator default which would split
+    // the filename outright.
     let mut commits: Vec<Commit> = Vec::new();
     let mut current: Option<Commit> = None;
 
-    for line in stdout.lines() {
-        if let Some(rest) = line.strip_prefix(COMMIT_MARK) {
+    for raw in stdout.split('\0') {
+        let record = raw.trim_start_matches('\n');
+        if record.is_empty() {
+            continue;
+        }
+        if let Some(rest) = record.strip_prefix(COMMIT_MARK) {
             if let Some(c) = current.take() {
                 commits.push(c);
             }
             let (sha, ct) = rest
                 .split_once('|')
-                .ok_or_else(|| GitError::Parse(format!("malformed sentinel: {line}")))?;
+                .ok_or_else(|| GitError::Parse(format!("malformed sentinel: {record}")))?;
             let committed_at = ct
                 .parse::<i64>()
                 .map_err(|e| GitError::Parse(format!("bad committer ts {ct:?}: {e}")))?;
@@ -117,15 +142,11 @@ fn parse(stdout: &str) -> Result<Vec<Commit>, GitError> {
             continue;
         }
 
-        if line.is_empty() {
-            continue;
-        }
-
         match current.as_mut() {
-            Some(c) => c.files.push(line.to_owned()),
+            Some(c) => c.files.push(record.to_owned()),
             None => {
                 return Err(GitError::Parse(format!(
-                    "unexpected file line before any commit sentinel: {line}"
+                    "unexpected file record before any commit sentinel: {record:?}"
                 )))
             }
         }
@@ -165,16 +186,10 @@ mod tests {
 
     #[test]
     fn parse_happy_path_two_commits() {
-        let input = "\
-AZOTH_COMMIT|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|100
-
-src/foo.rs
-src/bar.rs
-
-AZOTH_COMMIT|bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb|50
-
-src/baz.rs
-";
+        // Shape mirrors the actual `git log --name-only -z --format=...`
+        // stream: NUL-terminated format block, an LF between blocks,
+        // then NUL-separated filenames.
+        let input = "AZOTH_COMMIT|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|100\0\nsrc/foo.rs\0src/bar.rs\0AZOTH_COMMIT|bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb|50\0\nsrc/baz.rs\0";
         let c = parse(input).unwrap();
         assert_eq!(c.len(), 2);
         assert_eq!(c[0].sha.len(), 40);
@@ -189,7 +204,7 @@ src/baz.rs
         // `--no-merges` removes empty-file commits in practice, but a
         // root commit with `--allow-empty` would land here. The parser
         // must not choke.
-        let input = "AZOTH_COMMIT|cccccccccccccccccccccccccccccccccccccccc|1\n\n";
+        let input = "AZOTH_COMMIT|cccccccccccccccccccccccccccccccccccccccc|1\0";
         let c = parse(input).unwrap();
         assert_eq!(c.len(), 1);
         assert!(c[0].files.is_empty());
@@ -202,14 +217,26 @@ src/baz.rs
 
     #[test]
     fn parse_rejects_file_without_sentinel() {
-        let input = "src/foo.rs\n";
+        let input = "src/foo.rs\0";
         assert!(parse(input).is_err());
     }
 
     #[test]
     fn parse_rejects_malformed_sentinel() {
-        assert!(parse("AZOTH_COMMIT|no_pipe_here\n").is_err());
-        assert!(parse("AZOTH_COMMIT|sha|not_an_int\n").is_err());
+        assert!(parse("AZOTH_COMMIT|no_pipe_here\0").is_err());
+        assert!(parse("AZOTH_COMMIT|sha|not_an_int\0").is_err());
+    }
+
+    #[test]
+    fn parse_preserves_filename_with_embedded_newline() {
+        // Linux allows `\n` inside filenames. Under `-z`, the NUL
+        // terminator makes this round-trip; under the old LF-based
+        // parser this would have split the path in half.
+        let input =
+            "AZOTH_COMMIT|dddddddddddddddddddddddddddddddddddddddd|7\0\nweird\nname.rs\0other.rs\0";
+        let c = parse(input).unwrap();
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].files, vec!["weird\nname.rs", "other.rs"]);
     }
 
     #[test]
