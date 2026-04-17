@@ -10,17 +10,17 @@
 //! `RunStarted` is observed so the mirror can tag rows with the current
 //! run; all other variants are silently ignored.
 //!
-//! v1 schema is append-only and refinery-free: one CREATE TABLE IF NOT
-//! EXISTS pass on open, guarded by `PRAGMA user_version`. Migrations land
-//! when a second schema version is needed.
+//! Schema evolution is handled by the hand-rolled migrator at
+//! `event_store::migrations` — an ordered list of `MigrationStep` fns
+//! guarded by `PRAGMA user_version`, applied inside a single transaction
+//! so a half-migrated DB is never persisted.
 
 use crate::event_store::jsonl::{JsonlReader, ProjectionError};
+use crate::event_store::migrations;
 use crate::schemas::{AbortReason, CommitOutcome, RunId, SessionEvent, TurnId, Usage};
 use rusqlite::{params, Connection};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
-
-const SCHEMA_VERSION: i32 = 1;
 
 #[derive(Debug, Error)]
 pub enum MirrorError {
@@ -30,6 +30,8 @@ pub enum MirrorError {
     Projection(#[from] ProjectionError),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+    #[error("unknown schema version {current}; this binary knows up to {known}")]
+    UnknownSchema { current: u32, known: u32 },
 }
 
 /// Append-only SQLite index of terminal turn outcomes.
@@ -48,10 +50,10 @@ impl SqliteMirror {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let conn = Connection::open(&path)?;
+        let mut conn = Connection::open(&path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
-        Self::ensure_schema(&conn)?;
+        migrations::run(&mut conn)?;
         Ok(Self {
             conn,
             path,
@@ -62,8 +64,8 @@ impl SqliteMirror {
     /// In-memory variant for tests. Not persisted.
     #[cfg(test)]
     pub fn open_in_memory() -> Result<Self, MirrorError> {
-        let conn = Connection::open_in_memory()?;
-        Self::ensure_schema(&conn)?;
+        let mut conn = Connection::open_in_memory()?;
+        migrations::run(&mut conn)?;
         Ok(Self {
             conn,
             path: PathBuf::from(":memory:"),
@@ -73,32 +75,6 @@ impl SqliteMirror {
 
     pub fn path(&self) -> &Path {
         &self.path
-    }
-
-    fn ensure_schema(conn: &Connection) -> Result<(), MirrorError> {
-        let current: i32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if current == 0 {
-            conn.execute_batch(
-                r#"
-                CREATE TABLE IF NOT EXISTS turns (
-                    run_id       TEXT NOT NULL,
-                    turn_id      TEXT NOT NULL PRIMARY KEY,
-                    outcome      TEXT NOT NULL,
-                    detail       TEXT,
-                    input_tokens INTEGER NOT NULL DEFAULT 0,
-                    output_tokens INTEGER NOT NULL DEFAULT 0,
-                    cache_read_tokens INTEGER NOT NULL DEFAULT 0,
-                    cache_creation_tokens INTEGER NOT NULL DEFAULT 0
-                );
-                CREATE INDEX IF NOT EXISTS turns_by_run ON turns(run_id);
-                "#,
-            )?;
-            conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-        } else if current != SCHEMA_VERSION {
-            // v1 has no migrations; future versions will diff here.
-            return Err(MirrorError::Sqlite(rusqlite::Error::InvalidQuery));
-        }
-        Ok(())
     }
 
     /// Apply one session event. No-op for every variant except
@@ -399,6 +375,6 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, SCHEMA_VERSION);
+        assert_eq!(v, 1, "Sprint 0 ships exactly one migration (m0001)");
     }
 }

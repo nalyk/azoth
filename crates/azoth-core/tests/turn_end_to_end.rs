@@ -10,7 +10,7 @@ use azoth_core::adapter::{MockAdapter, MockScript, ProviderProfile};
 use azoth_core::artifacts::ArtifactStore;
 use azoth_core::authority::{ApprovalRequestMsg, CapabilityStore};
 use azoth_core::event_store::{JsonlReader, JsonlWriter};
-use azoth_core::execution::{CancellationToken, ExecutionContext, ToolDispatcher};
+use azoth_core::execution::{ExecutionContext, ToolDispatcher};
 use azoth_core::schemas::{
     CommitOutcome, ContentBlock, Message, ModelTurnResponse, RunId, SessionEvent, StopReason,
     ToolUseId, TurnId, Usage,
@@ -76,13 +76,13 @@ async fn tui_worker_pipeline_drives_full_turn_sequence() {
 
     let run_id = RunId::from("run_test".to_string());
     let turn_id = TurnId::from("t_test".to_string());
-    let ctx = ExecutionContext {
-        run_id: run_id.clone(),
-        turn_id: turn_id.clone(),
+    let ctx = ExecutionContext::builder(
+        run_id.clone(),
+        turn_id.clone(),
         artifacts,
-        cancellation: CancellationToken::new(),
-        repo_root: repo_root.clone(),
-    };
+        repo_root.clone(),
+    )
+    .build();
 
     let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalRequestMsg>(8);
     let mut caps = CapabilityStore::new();

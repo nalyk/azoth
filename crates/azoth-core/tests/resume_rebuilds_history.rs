@@ -11,7 +11,7 @@ use azoth_core::adapter::{MockAdapter, MockScript, ProviderProfile};
 use azoth_core::artifacts::ArtifactStore;
 use azoth_core::authority::{ApprovalRequestMsg, CapabilityStore};
 use azoth_core::event_store::{JsonlReader, JsonlWriter};
-use azoth_core::execution::{CancellationToken, ExecutionContext, ToolDispatcher};
+use azoth_core::execution::{ExecutionContext, ToolDispatcher};
 use azoth_core::schemas::{
     ContentBlock, Message, ModelTurnResponse, Role, RunId, StopReason, TurnId, Usage,
 };
@@ -35,6 +35,7 @@ fn scripted_text(reply: &str) -> MockScript {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn drive_text_turn(
     repo_root: &Path,
     session_path: &Path,
@@ -58,13 +59,13 @@ async fn drive_text_turn(
         scripted_text(assistant_reply),
     );
 
-    let ctx = ExecutionContext {
-        run_id: run_id.clone(),
-        turn_id: turn_id.clone(),
-        artifacts: artifacts.clone(),
-        cancellation: CancellationToken::new(),
-        repo_root: repo_root.to_path_buf(),
-    };
+    let ctx = ExecutionContext::builder(
+        run_id.clone(),
+        turn_id.clone(),
+        artifacts.clone(),
+        repo_root.to_path_buf(),
+    )
+    .build();
 
     let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalRequestMsg>(8);
     let mut caps = CapabilityStore::new();

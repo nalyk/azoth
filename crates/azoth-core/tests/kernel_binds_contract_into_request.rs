@@ -14,7 +14,7 @@ use azoth_core::authority::{ApprovalRequestMsg, CapabilityStore};
 use azoth_core::context::{ContextKernel, TokenizerFamily};
 use azoth_core::contract;
 use azoth_core::event_store::{JsonlReader, JsonlWriter};
-use azoth_core::execution::{CancellationToken, ExecutionContext, ToolDispatcher};
+use azoth_core::execution::{ExecutionContext, ToolDispatcher};
 use azoth_core::schemas::{
     ContentBlock, Contract, Message, ModelTurnResponse, RunId, SessionEvent, StopReason, TurnId,
     Usage,
@@ -67,13 +67,13 @@ async fn drive_one_turn(
     );
     let run_id = RunId::from("run_kernel".to_string());
     let turn_id = TurnId::from("t_kernel_1".to_string());
-    let ctx = ExecutionContext {
-        run_id: run_id.clone(),
-        turn_id: turn_id.clone(),
+    let ctx = ExecutionContext::builder(
+        run_id.clone(),
+        turn_id.clone(),
         artifacts,
-        cancellation: CancellationToken::new(),
-        repo_root: repo_root.to_path_buf(),
-    };
+        repo_root.to_path_buf(),
+    )
+    .build();
     let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalRequestMsg>(8);
     let mut caps = CapabilityStore::new();
     let mut effects = azoth_core::schemas::EffectCounter::default();
@@ -204,13 +204,13 @@ async fn kernel_without_contract_is_a_noop() {
         );
         let run_id = RunId::from("run_noop".to_string());
         let turn_id = TurnId::from("t_noop_1".to_string());
-        let ctx = ExecutionContext {
-            run_id: run_id.clone(),
-            turn_id: turn_id.clone(),
+        let ctx = ExecutionContext::builder(
+            run_id.clone(),
+            turn_id.clone(),
             artifacts,
-            cancellation: CancellationToken::new(),
-            repo_root: repo_root.to_path_buf(),
-        };
+            repo_root.to_path_buf(),
+        )
+        .build();
         let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalRequestMsg>(8);
         let mut caps = CapabilityStore::new();
         let mut effects = azoth_core::schemas::EffectCounter::default();

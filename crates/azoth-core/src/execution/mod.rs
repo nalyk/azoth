@@ -4,5 +4,5 @@
 mod context;
 mod dispatcher;
 
-pub use context::{CancellationToken, ExecutionContext};
+pub use context::{CancellationToken, ExecutionContext, ExecutionContextBuilder};
 pub use dispatcher::{dispatch_tool, ErasedTool, Tool, ToolDispatcher, ToolError};

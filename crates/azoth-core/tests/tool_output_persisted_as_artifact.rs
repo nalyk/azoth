@@ -12,7 +12,7 @@ use azoth_core::adapter::{MockAdapter, MockScript, ProviderProfile};
 use azoth_core::artifacts::ArtifactStore;
 use azoth_core::authority::{ApprovalRequestMsg, CapabilityStore};
 use azoth_core::event_store::{JsonlReader, JsonlWriter};
-use azoth_core::execution::{CancellationToken, ExecutionContext, ToolDispatcher};
+use azoth_core::execution::{ExecutionContext, ToolDispatcher};
 use azoth_core::schemas::{
     ContentBlock, Message, ModelTurnResponse, RunId, SessionEvent, StopReason, ToolUseId, TurnId,
     Usage,
@@ -73,15 +73,15 @@ async fn tool_result_event_carries_artifact_id_and_blob_lands_on_disk() {
 
     let run_id = RunId::from("run_artifact".to_string());
     let turn_id = TurnId::from("t_artifact".to_string());
-    let ctx = ExecutionContext {
-        run_id: run_id.clone(),
-        turn_id: turn_id.clone(),
-        // A separate ArtifactStore handle pointing at the same root — both
-        // should converge on the same content-addressed blob.
-        artifacts: ArtifactStore::open(&artifacts_root).unwrap(),
-        cancellation: CancellationToken::new(),
-        repo_root: repo_root.clone(),
-    };
+    // A separate ArtifactStore handle pointing at the same root — both
+    // should converge on the same content-addressed blob.
+    let ctx = ExecutionContext::builder(
+        run_id.clone(),
+        turn_id.clone(),
+        ArtifactStore::open(&artifacts_root).unwrap(),
+        repo_root.clone(),
+    )
+    .build();
 
     let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalRequestMsg>(8);
     let mut caps = CapabilityStore::new();
