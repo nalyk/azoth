@@ -376,8 +376,8 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(
-            v, 2,
-            "Sprint 1 ships m0002 (FTS schema) on top of m0001 (turns)"
+            v, 3,
+            "Sprint 2 ships m0003 (symbols) on top of m0002 (FTS) on top of m0001 (turns)"
         );
     }
 }

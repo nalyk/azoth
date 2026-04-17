@@ -90,6 +90,11 @@ pub struct IndexStats {
     /// UTF-8 read. Counted together because the distinction is not
     /// interesting at the eval-plane layer.
     pub skipped_binary_or_large: u32,
+    /// Rust symbols extracted and persisted this pass (Sprint 2).
+    /// Counts every row written by `replace_symbols_for_path`, across
+    /// every Rust file in the insert/update set. Non-Rust files and
+    /// files that skipped Phase 3 do not contribute.
+    pub symbols_extracted: u32,
 }
 
 /// Holds a shared SQLite connection and the repo root. Both
@@ -336,38 +341,170 @@ fn reindex_blocking(
         }
     }
 
+    // Prepare the symbol writer's DELETE + INSERT once for the whole
+    // Phase-4 transaction (PR #6 gemini-code-assist MED — prior code
+    // re-prepared both per file, burning ~1 sqlite3_prepare_v2 per
+    // writer call × files-in-pass). The Rust parser is lazily built
+    // on first Rust hit and reused for every subsequent .rs file so
+    // we pay `Parser::new` + `set_language` at most once per pass.
+    let mut symbol_writer = crate::code_graph::SymbolWriter::new(&tx)?;
+    let mut rust_parser: Option<tree_sitter::Parser> = None;
+
+    let mut doc_insert = tx.prepare(
+        "INSERT INTO documents (path, mtime, language, content) VALUES (?1, ?2, ?3, ?4)",
+    )?;
+    let mut doc_update =
+        tx.prepare("UPDATE documents SET mtime = ?2, language = ?3, content = ?4 WHERE path = ?1")?;
+
     for w in &writes {
         match w.op {
             Op::Insert => {
-                tx.execute(
-                    "INSERT INTO documents (path, mtime, language, content)
-                     VALUES (?1, ?2, ?3, ?4)",
-                    params![w.path, w.mtime_ns, w.language, w.content],
-                )?;
+                doc_insert.execute(params![w.path, w.mtime_ns, w.language, w.content])?;
                 stats.inserted = stats.inserted.saturating_add(1);
             }
             Op::Update => {
-                tx.execute(
-                    "UPDATE documents
-                       SET mtime = ?2, language = ?3, content = ?4
-                     WHERE path = ?1",
-                    params![w.path, w.mtime_ns, w.language, w.content],
-                )?;
+                doc_update.execute(params![w.path, w.mtime_ns, w.language, w.content])?;
                 stats.updated = stats.updated.saturating_add(1);
             }
         }
+
+        // Sprint 2 — tree-sitter symbol extraction, Rust only. The
+        // language detector from `detect_language` names the grammar
+        // ("rust"); every other language skips the extractor until
+        // v2.1 lands the Python/TS/Go grammars. Extraction failures
+        // (bad bytes, parser error) never abort the reindex; the file
+        // simply lacks symbols this pass and gets another shot next
+        // pass.
+        if w.language == Some("rust") {
+            stats.symbols_extracted = stats.symbols_extracted.saturating_add(extract_and_store(
+                &w.path,
+                &w.content,
+                &mut rust_parser,
+                &mut symbol_writer,
+            )?);
+        }
     }
+
+    // Codex P2 (PR #6 #4) — backfill Rust docs that have no matching
+    // symbol rows. Two real scenarios this catches:
+    //
+    //   1. Schema v2 → v3 upgrade: `documents` was already populated
+    //      by a prior Sprint 1 binary; `symbols` is freshly created
+    //      empty by m0003. Every .rs file has an unchanged mtime so
+    //      the per-file loop above never touches it — without this
+    //      backfill, `by_name` / `enclosing` would return nothing
+    //      until each file is manually edited.
+    //
+    //   2. Out-of-band desync (manual `DELETE FROM symbols`,
+    //      partial extractor failures in a prior pass): the NOT-IN
+    //      anti-join quietly heals those paths.
+    //
+    // The subquery is cheap: `symbols_by_path_line_idx` covers the
+    // leading `path` column so the scan is an index lookup per row.
+    // On a well-synced DB the outer query returns zero rows.
+    let backfill: Vec<(String, String)> = {
+        let mut stmt = tx.prepare(
+            "SELECT path, content FROM documents
+             WHERE language = 'rust'
+               AND path NOT IN (SELECT DISTINCT path FROM symbols)",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    for (path, content) in &backfill {
+        stats.symbols_extracted = stats.symbols_extracted.saturating_add(extract_and_store(
+            path,
+            content,
+            &mut rust_parser,
+            &mut symbol_writer,
+        )?);
+    }
+
+    // Drop the prepared statements before the final tx-level
+    // operations so the tx can borrow freely for the bulk DELETEs
+    // below (rusqlite ties Statement lifetimes to &Transaction).
+    drop(symbol_writer);
+    drop(doc_insert);
+    drop(doc_update);
 
     stats.skipped_unchanged = unchanged_paths.len() as u32;
 
-    let deleted = tx.execute(
+    // Purge documents for files that vanished from the walk.
+    let deleted_docs = tx.execute(
         "DELETE FROM documents WHERE path NOT IN (SELECT path FROM _seen_paths)",
         [],
     )? as u32;
-    stats.deleted = deleted;
+    stats.deleted = deleted_docs;
+
+    // Sprint 2: mirror the documents purge for the symbols table. A
+    // file that vanishes from the walk (deleted OR grew-past-cap OR
+    // renamed) must not leave stale symbol rows behind. The anti-join
+    // against `_seen_paths` handles all three cases uniformly.
+    tx.execute(
+        "DELETE FROM symbols WHERE path NOT IN (SELECT path FROM _seen_paths)",
+        [],
+    )?;
 
     tx.commit()?;
     Ok(stats)
+}
+
+/// Run the tree-sitter extractor for one Rust file and persist the
+/// result via the shared `SymbolWriter`. Used by both the per-file
+/// write loop and the post-loop backfill pass — the two call sites
+/// share identical extract-then-write-or-purge semantics.
+///
+/// The lazy `Option<Parser>` stays owned by the caller so a single
+/// parser instance threads through the entire reindex pass. On
+/// parser init failure (ABI mismatch) we skip and return 0; the
+/// caller continues with its next file without the error cascading.
+///
+/// **Codex P2 #5 (PR #6)**: on extractor failure we explicitly
+/// replace the path's symbol rows with an empty set. The module doc
+/// comment promises "symbols missing until next pass" after a parse
+/// error; leaving pre-edit rows in place would instead serve stale
+/// content as if current, contradicting that promise and corrupting
+/// retrieval. `SymbolWriter::replace` with an empty slice deletes
+/// every row for the path and inserts nothing.
+fn extract_and_store(
+    path: &str,
+    content: &str,
+    rust_parser: &mut Option<tree_sitter::Parser>,
+    symbol_writer: &mut crate::code_graph::SymbolWriter<'_>,
+) -> Result<u32, IndexerError> {
+    let parser = match rust_parser.as_mut() {
+        Some(p) => p,
+        None => match crate::code_graph::rust_parser() {
+            Ok(p) => {
+                *rust_parser = Some(p);
+                rust_parser.as_mut().expect("just set above")
+            }
+            Err(e) => {
+                // set_language failing is catastrophic (grammar ABI
+                // mismatch) — skip this file and let the rest of the
+                // pass continue.
+                tracing::warn!(
+                    error = %e,
+                    "tree-sitter rust parser init failed; skipping path"
+                );
+                return Ok(0);
+            }
+        },
+    };
+    match crate::code_graph::extract_rust(parser, content) {
+        Ok(syms) => Ok(symbol_writer.replace(path, "rust", &syms)?),
+        Err(e) => {
+            tracing::warn!(
+                path = %path,
+                error = %e,
+                "tree-sitter rust extractor failed; purging stale rows for this path"
+            );
+            // Replace-with-empty deletes every prior row for the path,
+            // matching the "missing until next pass" promise.
+            symbol_writer.replace(path, "rust", &[])?;
+            Ok(0)
+        }
+    }
 }
 
 fn detect_language(path: &Path) -> Option<&'static str> {

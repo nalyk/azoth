@@ -264,6 +264,18 @@ fn write_event_line<W: std::io::Write>(
             latency_ms,
             truncate(query, 60)
         ),
+        SessionEvent::SymbolResolved {
+            backend,
+            query,
+            matched,
+            ..
+        } => writeln!(
+            out,
+            "{prefix}{turn} symbol_resolved  backend={} hits={} query={:?}",
+            backend,
+            matched.len(),
+            truncate(query, 60)
+        ),
     }
 }
 

@@ -2,7 +2,9 @@
 //! graph is a trait-only stub so v2 can land without touching signatures.
 
 pub mod config;
+pub mod symbol;
 pub use config::{LexicalBackend, RetrievalConfig};
+pub use symbol::{NullSymbolRetrieval, Symbol, SymbolId, SymbolKind, SymbolRetrieval};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};

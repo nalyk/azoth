@@ -229,8 +229,8 @@ fn v1_5_partial_init_is_healed_on_v2_boot() {
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
     assert_eq!(
-        v, 2,
-        "user_version advances past both migrations on self-heal (m0001 turns + m0002 fts)"
+        v, 3,
+        "user_version advances past every migration on self-heal (m0001 turns + m0002 fts + m0003 symbols)"
     );
 }
 
