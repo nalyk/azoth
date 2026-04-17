@@ -29,13 +29,14 @@ use azoth_core::artifacts::ArtifactStore;
 use azoth_core::authority::{ApprovalRequestMsg, ApprovalResponse, CapabilityStore};
 use azoth_core::context::{
     CompositeEvidenceCollector, EvidenceCollector, IdentityReranker, LexicalEvidenceCollector,
-    ReciprocalRankFusion, TokenBudget,
+    ReciprocalRankFusion, SymbolEvidenceCollector, TokenBudget,
 };
 use azoth_core::event_store::{JsonlReader, JsonlWriter, SqliteMirror};
 use azoth_core::execution::{ExecutionContext, ToolDispatcher};
 use azoth_core::impact::{DiffSource, ImpactConfig, ImpactSelector};
 use azoth_core::retrieval::{
-    LexicalRetrieval, RetrievalConfig, RetrievalMode, RipgrepLexicalRetrieval,
+    CoEditConfig, LexicalBackend, LexicalRetrieval, RetrievalConfig, RetrievalMode,
+    RipgrepLexicalRetrieval, SymbolRetrieval,
 };
 use azoth_core::schemas::{
     ApprovalId, ApprovalScope, CapabilityTokenId, ContentBlock, Contract, ContractId, Message,
@@ -48,6 +49,9 @@ use azoth_core::turn::TurnDriver;
 use azoth_core::validators::{
     ContractGoalValidator, ImpactValidator, SelectorBackedImpactValidator, Validator,
 };
+
+use azoth_repo::history::co_edit;
+use azoth_repo::{CoEditGraphRetrieval, FtsLexicalRetrieval, RepoIndexer, SqliteSymbolIndex};
 
 use super::input::SlashCommand;
 use super::render;
@@ -525,6 +529,86 @@ impl AppState {
     }
 }
 
+/// Composite-lane indexer backends materialised at worker startup.
+/// All three share a single SQLite connection on `.azoth/state.sqlite`;
+/// WAL mode (already enabled by `SqliteMirror`) lets this coexist with
+/// the event-store connection.
+struct IndexerBackends {
+    fts: Arc<FtsLexicalRetrieval>,
+    symbols: Arc<SqliteSymbolIndex>,
+    /// Held for liveness so Sprint 7.1 can bolt on a GraphEvidenceCollector.
+    #[allow(dead_code)]
+    graph: Arc<CoEditGraphRetrieval>,
+}
+
+/// Open the mirror DB, run the reindex pass, and (best-effort) rebuild
+/// the co-edit graph. Returns `None` on any failure — composite falls
+/// back to ripgrep-only operation. Errors log at `warn` so dogfood
+/// sessions can see why a lane went dark.
+async fn build_indexer_backends(
+    db_path: &std::path::Path,
+    repo_root: &std::path::Path,
+    co_edit_cfg: CoEditConfig,
+) -> Option<IndexerBackends> {
+    let indexer = match RepoIndexer::open(db_path, repo_root.to_path_buf()) {
+        Ok(i) => i,
+        Err(e) => {
+            tracing::warn!(error = %e, "repo indexer open failed; composite lanes will be ripgrep-only");
+            return None;
+        }
+    };
+    let conn = indexer.connection();
+
+    match indexer.reindex_incremental().await {
+        Ok(stats) => {
+            tracing::info!(
+                walked = stats.walked,
+                inserted = stats.inserted,
+                updated = stats.updated,
+                deleted = stats.deleted,
+                symbols_extracted = stats.symbols_extracted,
+                "repo indexer pass complete"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "reindex_incremental failed; lanes may serve stale data");
+        }
+    }
+
+    // Co-edit graph: blocking git shell-out + SQLite writes. Best
+    // effort — a non-git workspace is a legitimate reason to skip.
+    let co_edit_conn = Arc::clone(&conn);
+    let co_edit_root = repo_root.to_path_buf();
+    let co_edit_res = tokio::task::spawn_blocking(move || {
+        co_edit::build(&co_edit_conn, &co_edit_root, co_edit_cfg)
+    })
+    .await;
+    match co_edit_res {
+        Ok(Ok(stats)) => {
+            tracing::info!(
+                commits_walked = stats.commits_walked,
+                commits_contributed = stats.commits_contributed,
+                commits_skipped_large = stats.commits_skipped_large,
+                edges_written = stats.edges_written,
+                elapsed_ms = stats.elapsed_ms,
+                "co_edit graph built"
+            );
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "co_edit graph build skipped");
+        }
+        Err(join_err) => {
+            tracing::warn!(error = %join_err, "co_edit graph build join failed");
+        }
+    }
+
+    Some(IndexerBackends {
+        fts: Arc::new(FtsLexicalRetrieval::with_connection(Arc::clone(&conn))),
+        symbols: Arc::new(SqliteSymbolIndex::new(Arc::clone(&conn))),
+        graph: Arc::new(CoEditGraphRetrieval::new(conn)),
+    })
+}
+
 pub async fn run_app(resume: Option<String>) -> io::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -702,25 +786,89 @@ pub async fn run_app(resume: Option<String>) -> io::Result<()> {
         );
         let adapter = super::config::build_adapter(&provider_profile);
 
-        // Evidence collector. Mode is switched by `AZOTH_RETRIEVAL_MODE`
-        // (via `RetrievalConfig`): `legacy` (default, Sprint 1 behaviour)
-        // keeps the single-lane ripgrep collector; `composite` (Sprint 4)
-        // uses `CompositeEvidenceCollector` with ripgrep wired into the
-        // lexical lane. Full multi-lane wiring (FTS + symbol + graph) is
-        // deferred to Sprint 7 when composite becomes the default.
+        // Evidence collector. Sprint 7 ship defaults are `composite`
+        // mode with `fts` lexical backend, with ripgrep retained as an
+        // opt-in fallback and `legacy` mode retained for byte-shape
+        // comparisons against pre-v2 behaviour.
+        //
+        // Composite-mode wiring:
+        //   - `lexical`  — ripgrep or FTS5 per `AZOTH_LEXICAL_BACKEND`.
+        //   - `fts`      — always FTS5 when the indexer is available, so
+        //                  FTS contributes as its own lane even when the
+        //                  lexical slot picks ripgrep.
+        //   - `symbol`   — tree-sitter-Rust symbol index.
+        //   - `graph`    — co-edit neighbours (built for future lanes;
+        //                  a GraphEvidenceCollector is Sprint 7.1).
+        //
+        // The composite is best-effort: indexer failures degrade to
+        // ripgrep-only composite so dogfood on fresh repos still works.
         let retrieval_cfg = RetrievalConfig::from_env();
-        let retrieval: Arc<dyn LexicalRetrieval> = Arc::new(RipgrepLexicalRetrieval {
+        let ripgrep_retrieval: Arc<dyn LexicalRetrieval> = Arc::new(RipgrepLexicalRetrieval {
             root: worker_cwd.clone(),
         });
+
+        // Materialise the indexer-backed lanes. `build_indexer_backends`
+        // opens a second Connection on `.azoth/state.sqlite` (WAL is
+        // already enabled by SqliteMirror above), runs migrations
+        // defensively, and reindexes documents + symbols before the
+        // first turn so queries return signal immediately. Any failure
+        // logs and nulls the indexer lanes — the composite remains
+        // useful via the ripgrep lane.
+        let indexer_db_path = worker_cwd.join(".azoth").join("state.sqlite");
+        let indexer_backends =
+            build_indexer_backends(&indexer_db_path, &worker_cwd, retrieval_cfg.co_edit).await;
+
+        let (fts_retrieval, symbol_retrieval) = match indexer_backends.as_ref() {
+            Some(b) => (Some(Arc::clone(&b.fts)), Some(Arc::clone(&b.symbols))),
+            None => (None, None),
+        };
+
+        // lexical_backend knob: `fts` demands the indexer; `ripgrep`
+        // stays pinned to the in-process ripgrep; `both` means "prefer
+        // FTS but retain ripgrep as the visible fallback" — with the
+        // indexer up, both lanes are already wired into composite, so
+        // under `both` we pin the lexical slot to ripgrep and let FTS
+        // supply its own lane (= true union, no double-count required
+        // because dedupe is applied downstream).
+        let (lexical_slot_retrieval, lexical_backend_in_use) =
+            match (retrieval_cfg.lexical_backend, fts_retrieval.clone()) {
+                (LexicalBackend::Fts, Some(fts)) => (fts as Arc<dyn LexicalRetrieval>, "fts"),
+                (LexicalBackend::Fts, None) => {
+                    tracing::warn!(
+                        "AZOTH_LEXICAL_BACKEND=fts requested but indexer unavailable; \
+                     falling back to ripgrep"
+                    );
+                    (ripgrep_retrieval.clone(), "ripgrep_fallback")
+                }
+                (LexicalBackend::Ripgrep, _) => (ripgrep_retrieval.clone(), "ripgrep"),
+                (LexicalBackend::Both, _) => (ripgrep_retrieval.clone(), "both"),
+            };
         let lexical_collector: Arc<LexicalEvidenceCollector<dyn LexicalRetrieval>> =
-            Arc::new(LexicalEvidenceCollector::new(retrieval));
+            Arc::new(LexicalEvidenceCollector::new(lexical_slot_retrieval));
+        // Legacy mode's single-lane evidence collector stays on the
+        // configured lexical backend so flipping `AZOTH_LEXICAL_BACKEND`
+        // is observable in both modes.
         let legacy_collector: Arc<dyn EvidenceCollector> = lexical_collector.clone();
+
+        let fts_lane_collector: Option<Arc<dyn EvidenceCollector>> =
+            fts_retrieval.as_ref().map(|fts| {
+                let fts_dyn: Arc<dyn LexicalRetrieval> = fts.clone();
+                Arc::new(LexicalEvidenceCollector::new(fts_dyn)) as Arc<dyn EvidenceCollector>
+            });
+        let symbol_lane_collector: Option<Arc<dyn EvidenceCollector>> =
+            symbol_retrieval.as_ref().map(|sym| {
+                let sym_dyn: Arc<dyn SymbolRetrieval> = sym.clone();
+                Arc::new(SymbolEvidenceCollector::new(sym_dyn)) as Arc<dyn EvidenceCollector>
+            });
+
         let composite_collector: Arc<dyn EvidenceCollector> = {
             let mut c = CompositeEvidenceCollector {
-                graph: None,
-                symbol: None,
+                graph: None, // Sprint 7.1: GraphEvidenceCollector needs a
+                // seed-path policy; the co-edit graph is built but not
+                // yet queried from the composite lane.
+                symbol: symbol_lane_collector.clone(),
                 lexical: Some(lexical_collector.clone()),
-                fts: None,
+                fts: fts_lane_collector.clone(),
                 reranker: match retrieval_cfg.mode {
                     // RRF is the Sprint 4 default reranker when composite
                     // is selected. Identity stays available as a test
@@ -729,18 +877,8 @@ pub async fn run_app(resume: Option<String>) -> io::Result<()> {
                     RetrievalMode::Legacy => Arc::new(IdentityReranker),
                 },
                 budget: TokenBudget::v2_default(),
-                // Match TurnDriver's ask of 20 so the single-lane
-                // Sprint 4 wiring doesn't silently cap recall below
-                // legacy mode (PR #8 review P1). With one lane wired,
-                // `per_lane_limit` is effectively a global cap — the
-                // per-lane-floor guarantees only matter once multiple
-                // lanes exist (Sprint 7). Sprint 7 can tune this down
-                // when graph+symbol+fts come online and dedupe starts
-                // doing real work.
                 per_lane_limit: 20,
             };
-            // Only one lane wired in Sprint 4; keep budget ceiling
-            // relaxed so the single lane doesn't hit artificial caps.
             c.budget.max_tokens = 8192;
             Arc::new(c)
         };
@@ -750,6 +888,10 @@ pub async fn run_app(resume: Option<String>) -> io::Result<()> {
         };
         tracing::info!(
             mode = retrieval_cfg.mode.as_str(),
+            lexical_backend = lexical_backend_in_use,
+            fts_lane_wired = fts_lane_collector.is_some(),
+            symbol_lane_wired = symbol_lane_collector.is_some(),
+            indexer_ready = indexer_backends.is_some(),
             "retrieval mode resolved"
         );
 

@@ -14,6 +14,14 @@ pub enum Origin {
     RepoFile,
     WebFetch,
     ModelOutput,
+    /// v2 Sprint 7 — content produced by the repo indexers (FTS5 snippets,
+    /// tree-sitter symbols, co-edit graph edges). Structurally distinct
+    /// from `ModelOutput` so the taint gate and future policy DSL (v2.5)
+    /// can reject hostile indexer payloads that try to impersonate model
+    /// tool calls. `rename_all = "snake_case"` serialises this as
+    /// `"indexer"`; pre-v2 logs cannot contain that token so existing
+    /// sessions deserialise unchanged.
+    Indexer,
 }
 
 /// Wraps a value whose provenance is not Azoth itself. The inner value can
@@ -30,6 +38,21 @@ pub struct Tainted<T> {
 
 impl<T> Tainted<T> {
     pub(crate) fn new(origin: Origin, inner: T) -> Self {
+        Self { origin, inner }
+    }
+
+    /// TEST-ONLY constructor used exclusively by injection-surface tests
+    /// (`tests/v2_injection_surface.rs`) and eval harnesses that need to
+    /// simulate cross-origin payloads without routing through an adapter
+    /// or dispatcher shim. Production code MUST go through the dispatcher
+    /// or adapter entry points — arbitrary minting bypasses the trust
+    /// discipline `Tainted` exists to enforce.
+    ///
+    /// `#[doc(hidden)]` so it does not surface in docs; every caller is
+    /// expected to carry a comment justifying why the real seams cannot
+    /// be used. If you are reading this from production code, stop.
+    #[doc(hidden)]
+    pub fn for_injection_test(origin: Origin, inner: T) -> Self {
         Self { origin, inner }
     }
 

@@ -9,13 +9,16 @@
 //! system gets folded into a central struct (a later sprint), this
 //! nests under it as `retrieval.lexical_backend`.
 //!
-//! Sprint 1 default: `ripgrep` — no behavior change on upgrade. Sprint
-//! 5 eval flips to `both`; Sprint 7 flips to `fts` as the ship default.
+//! Sprint 1 shipped the FTS backend behind an opt-in; Sprint 7 flips
+//! the default to `fts` as the ship default. Pre-Sprint-7 behaviour is
+//! reachable via `AZOTH_LEXICAL_BACKEND=ripgrep` for side-by-side
+//! comparisons. `both` remains the retrieval-parity eval knob.
 //!
 //! Sprint 4 adds `RetrievalMode { Legacy, Composite }` — the high-level
 //! switch between the single-lane `LexicalEvidenceCollector` and the
-//! multi-lane `CompositeEvidenceCollector`. Default is `Legacy` through
-//! Sprint 6; Sprint 7 flips to `Composite` as the ship default.
+//! multi-lane `CompositeEvidenceCollector`. Sprint 7 flips the default
+//! to `Composite`; `Legacy` stays reachable via
+//! `AZOTH_RETRIEVAL_MODE=legacy` for the same backward-compat reason.
 
 use serde::{Deserialize, Serialize};
 
@@ -25,11 +28,11 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "snake_case")]
 pub enum LexicalBackend {
     /// In-process ripgrep via `grep-searcher` + `ignore::WalkBuilder`.
-    /// Ships as the Sprint 1 default so no behavior changes by upgrading.
-    #[default]
+    /// Reachable via `AZOTH_LEXICAL_BACKEND=ripgrep` for side-by-side
+    /// comparisons against the FTS default.
     Ripgrep,
-    /// SQLite FTS5 over `documents` content table (Sprint 1 ships the
-    /// backend; Sprint 7 flips the default).
+    /// SQLite FTS5 over `documents` content table. v2 Sprint 7 default.
+    #[default]
     Fts,
     /// Run both and union — used by the Sprint 5 retrieval parity eval.
     Both,
@@ -96,13 +99,13 @@ impl Default for CoEditConfig {
 /// single-lane `LexicalEvidenceCollector` path (same behaviour as
 /// pre-Sprint-4). `Composite` wires the multi-lane
 /// `CompositeEvidenceCollector` (`graph → symbol → lexical → fts →
-/// rerank`). Default is `Legacy` through Sprint 6; Sprint 7 flips to
-/// `Composite`.
+/// rerank`). v2 Sprint 7 flips the default to `Composite`; `Legacy`
+/// stays reachable via `AZOTH_RETRIEVAL_MODE=legacy` for compat.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RetrievalMode {
-    #[default]
     Legacy,
+    #[default]
     Composite,
 }
 
@@ -145,7 +148,7 @@ impl RetrievalConfig {
             Ok(raw) => LexicalBackend::parse(raw.trim()).unwrap_or_else(|| {
                 tracing::warn!(
                     value = %raw,
-                    "unknown AZOTH_LEXICAL_BACKEND; falling back to default (ripgrep)"
+                    "unknown AZOTH_LEXICAL_BACKEND; falling back to default (fts)"
                 );
                 LexicalBackend::default()
             }),
@@ -163,7 +166,7 @@ impl RetrievalConfig {
             Ok(raw) => RetrievalMode::parse(raw.trim()).unwrap_or_else(|| {
                 tracing::warn!(
                     value = %raw,
-                    "unknown AZOTH_RETRIEVAL_MODE; falling back to default (legacy)"
+                    "unknown AZOTH_RETRIEVAL_MODE; falling back to default (composite)"
                 );
                 RetrievalMode::default()
             }),
@@ -201,9 +204,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_is_ripgrep_so_upgrade_is_a_no_op() {
+    fn default_is_fts_sprint_7_flip() {
+        // Sprint 7 ship default: FTS5. Pre-Sprint-7 ripgrep path stays
+        // reachable via `AZOTH_LEXICAL_BACKEND=ripgrep`.
         let cfg = RetrievalConfig::default();
-        assert_eq!(cfg.lexical_backend, LexicalBackend::Ripgrep);
+        assert_eq!(cfg.lexical_backend, LexicalBackend::Fts);
     }
 
     #[test]
@@ -232,11 +237,12 @@ mod tests {
     }
 
     #[test]
-    fn retrieval_mode_default_is_legacy() {
-        // Sprint 4: default legacy through Sprint 6; Sprint 7 flips.
-        assert_eq!(RetrievalMode::default(), RetrievalMode::Legacy);
+    fn retrieval_mode_default_is_composite_sprint_7_flip() {
+        // Sprint 7: default flipped to Composite. Legacy stays reachable
+        // via `AZOTH_RETRIEVAL_MODE=legacy`.
+        assert_eq!(RetrievalMode::default(), RetrievalMode::Composite);
         let cfg = RetrievalConfig::default();
-        assert_eq!(cfg.mode, RetrievalMode::Legacy);
+        assert_eq!(cfg.mode, RetrievalMode::Composite);
     }
 
     #[test]
@@ -258,11 +264,15 @@ mod tests {
     #[test]
     fn v1_5_config_deserialises_without_mode_field() {
         // Risk ledger #1: additive schema change. A pre-Sprint-4
-        // serialised config has no `mode` field — must still load as
-        // `Legacy` via `#[serde(default)]`.
+        // serialised config has no `mode` field — it must still
+        // deserialise via `#[serde(default)]`, which after the Sprint 7
+        // flip resolves to `Composite`. The old config's intent ("I
+        // want the pre-Sprint-4 single-lane path") is now expressed
+        // explicitly via `AZOTH_RETRIEVAL_MODE=legacy`; silent
+        // persistence of Legacy here would hide the flip from users.
         let json =
             r#"{"lexical_backend":"ripgrep","co_edit":{"window":500,"skip_large_commits":50}}"#;
         let cfg: RetrievalConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(cfg.mode, RetrievalMode::Legacy);
+        assert_eq!(cfg.mode, RetrievalMode::Composite);
     }
 }
