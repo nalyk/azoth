@@ -3,22 +3,46 @@
 //! the `documents` SQLite table. Triggers defined in migration
 //! `m0002_fts_schema` keep `documents_fts` in sync automatically.
 //!
-//! Incremental: each row carries an `mtime` column. `reindex_incremental`
-//! skips files whose on-disk mtime equals the stored mtime — matches the
-//! plan §Sprint 1 "mtime-gated upsert" requirement. Files that used to be
-//! indexed but are now gone are deleted at the end of the pass (so
-//! renamed or removed files don't linger in the index).
+//! ## Incremental model (four phases)
 //!
-//! Size/binary policy:
-//! - Files larger than `max_file_bytes` (default 1 MiB) are skipped.
-//! - Files that can't be read as UTF-8 (binaries, images, etc.) are
-//!   skipped. The read error is not surfaced — binary files are a
-//!   routine case, not an error.
+//! 1. **Walk** — metadata-only pass. Collects `(path, abs, mtime_ns)`
+//!    for every file inside `max_file_bytes`; files over the size
+//!    limit or with unreadable metadata are counted into
+//!    `skipped_binary_or_large` and deliberately NOT tracked, so
+//!    previously-indexed files that have since grown or turned into
+//!    binaries will be purged in phase 4.
+//! 2. **Triage** — single read-only pass over `documents.mtime` to
+//!    split candidates into `unchanged` vs. `needs-read`. Content
+//!    is not touched yet, so memory stays bounded at metadata size.
+//! 3. **Read** — UTF-8 `read_to_string` for only the
+//!    insert/update set. A file whose content fails UTF-8 between
+//!    walk and read is treated as if it had vanished.
+//! 4. **Write+purge (one tx)** — stage every confirmed-present path
+//!    into a TEMP `_seen_paths` table, apply all writes, then
+//!    `DELETE FROM documents WHERE path NOT IN _seen_paths`. No
+//!    Rust-side path-set needed; SQLite evaluates the anti-join.
 //!
-//! Connection ownership: the indexer opens its OWN `rusqlite::Connection`
-//! to the shared mirror DB file (`.azoth/state.sqlite` by convention).
-//! WAL mode is enabled at open — set once, persisted on the file — so
-//! the mirror's own connection and this one coexist. Migrations are
+//! ## mtime precision
+//!
+//! `mtime` is stored as **nanoseconds** since `UNIX_EPOCH` (i64,
+//! clamped at `i64::MAX` — good until year ~2262). This preserves
+//! subsec precision so within-second edits are detected as changes.
+//! Filesystems that only expose second-resolution times land at
+//! `secs * 10^9` with no harm done.
+//!
+//! ## Size/binary policy
+//!
+//! - Files larger than `max_file_bytes` (default 1 MiB) are skipped
+//!   in the walk, DO NOT enter the seen-set, and therefore are
+//!   purged from any prior index row — stale content never lingers.
+//! - Files that can't be read as UTF-8 are handled symmetrically.
+//!
+//! ## Connection ownership
+//!
+//! The indexer opens its OWN `rusqlite::Connection` to the shared
+//! mirror DB file (`.azoth/state.sqlite` by convention). WAL mode is
+//! enabled at open — set once, persisted on the file — so the
+//! mirror's own connection and this one coexist. Migrations are
 //! re-run defensively on open; the migrator is idempotent.
 
 use std::path::{Path, PathBuf};
@@ -141,16 +165,19 @@ fn reindex_blocking(
         return Ok(stats);
     }
 
-    // Collect file data (path, mtime, content) outside the DB lock so
-    // the SQLite write transaction is short.
-    struct Item {
+    // Phase 1 (no lock, no reads): walk the repo and collect (path, abs,
+    // mtime_ns) for every file that currently passes the size/metadata
+    // gate. Files over `max_bytes` or with unreadable metadata are
+    // counted into `skipped_binary_or_large` and intentionally NOT
+    // tracked here — if such a file used to be indexed, the SQL purge
+    // at Phase 4 will delete its stale row (Codex P1 on L257: skipped
+    // files must not protect old rows from deletion).
+    struct Candidate {
         path: String,
-        mtime: i64,
-        language: Option<&'static str>,
-        content: String,
+        abs: PathBuf,
+        mtime_ns: i64,
     }
-    let mut items: Vec<Item> = Vec::new();
-    let mut walked_paths: Vec<String> = Vec::new();
+    let mut candidates: Vec<Candidate> = Vec::new();
 
     let walker = WalkBuilder::new(root)
         .standard_filters(true)
@@ -167,15 +194,14 @@ fn reindex_blocking(
         }
         stats.walked = stats.walked.saturating_add(1);
 
-        let abs = dent.path();
+        let abs = dent.path().to_path_buf();
         let rel = match abs.strip_prefix(root) {
-            Ok(r) => r,
-            Err(_) => abs,
+            Ok(r) => r.to_path_buf(),
+            Err(_) => abs.clone(),
         };
         let path_str = rel.to_string_lossy().into_owned();
-        walked_paths.push(path_str.clone());
 
-        let meta = match std::fs::metadata(abs) {
+        let meta = match std::fs::metadata(&abs) {
             Ok(m) => m,
             Err(_) => {
                 stats.skipped_binary_or_large = stats.skipped_binary_or_large.saturating_add(1);
@@ -187,90 +213,159 @@ fn reindex_blocking(
             continue;
         }
 
-        let mtime = meta
+        // Nanosecond precision so within-second edits (fast save/
+        // reindex loops) are not silently missed. u128 → i64 is safe
+        // until ~year 2262; clamp defensively rather than panic.
+        // (Codex P1 on L194.)
+        let mtime_ns = meta
             .modified()
             .ok()
             .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-            .map(|d| d.as_secs() as i64)
+            .map(|d| d.as_nanos().min(i64::MAX as u128) as i64)
             .unwrap_or(0);
 
-        let content = match std::fs::read_to_string(abs) {
-            Ok(s) => s,
-            Err(_) => {
-                // Binary / non-UTF-8 / unreadable — silently skip.
-                stats.skipped_binary_or_large = stats.skipped_binary_or_large.saturating_add(1);
-                continue;
-            }
-        };
-
-        items.push(Item {
+        candidates.push(Candidate {
             path: path_str,
-            mtime,
-            language: detect_language(rel),
-            content,
+            abs,
+            mtime_ns,
         });
     }
 
+    // Phase 2 (short lock, no tx): triage candidates against the stored
+    // mtime. Reads nothing from disk beyond metadata, so the memory
+    // footprint stays O(number-of-candidates-with-small-fields). File
+    // content is read only for rows that actually need an INSERT/
+    // UPDATE (gemini HIGH on L212).
+    enum Op {
+        Insert,
+        Update,
+    }
+    struct PlannedWrite {
+        path: String,
+        abs: PathBuf,
+        mtime_ns: i64,
+        op: Op,
+    }
+    let mut to_write: Vec<PlannedWrite> = Vec::new();
+    let mut unchanged_paths: Vec<String> = Vec::new();
+    {
+        let guard = conn
+            .lock()
+            .map_err(|e| IndexerError::Other(format!("conn mutex poisoned: {e}")))?;
+        let mut stmt = guard.prepare("SELECT mtime FROM documents WHERE path = ?1")?;
+        for cand in &candidates {
+            let existing: Option<i64> = stmt
+                .query_row(params![cand.path], |r| r.get(0))
+                .optional()?;
+            match existing {
+                Some(old) if old == cand.mtime_ns => {
+                    unchanged_paths.push(cand.path.clone());
+                }
+                Some(_) => to_write.push(PlannedWrite {
+                    path: cand.path.clone(),
+                    abs: cand.abs.clone(),
+                    mtime_ns: cand.mtime_ns,
+                    op: Op::Update,
+                }),
+                None => to_write.push(PlannedWrite {
+                    path: cand.path.clone(),
+                    abs: cand.abs.clone(),
+                    mtime_ns: cand.mtime_ns,
+                    op: Op::Insert,
+                }),
+            }
+        }
+    }
+
+    // Phase 3 (no lock, no tx): read file contents only for the
+    // insert/update set. A file whose content fails UTF-8 reads
+    // between walk and read is treated as if it vanished — its row
+    // (if any) will be purged by Phase 4.
+    struct WriteWithContent {
+        path: String,
+        mtime_ns: i64,
+        language: Option<&'static str>,
+        content: String,
+        op: Op,
+    }
+    let mut writes: Vec<WriteWithContent> = Vec::with_capacity(to_write.len());
+    for pw in to_write {
+        match std::fs::read_to_string(&pw.abs) {
+            Ok(content) => {
+                let language = detect_language(Path::new(&pw.path));
+                writes.push(WriteWithContent {
+                    path: pw.path,
+                    mtime_ns: pw.mtime_ns,
+                    language,
+                    content,
+                    op: pw.op,
+                });
+            }
+            Err(_) => {
+                stats.skipped_binary_or_large = stats.skipped_binary_or_large.saturating_add(1);
+            }
+        }
+    }
+
+    // Phase 4 (one tx): populate a TEMP table with every path the
+    // indexer confirmed as currently present (either unchanged or
+    // freshly written), apply all writes, then purge any row in
+    // `documents` whose path is NOT in the seen set.
+    //
+    // The SQL DELETE avoids loading all documents.path rows into a
+    // Rust HashSet (gemini MEDIUM on L272) and scales better on large
+    // repos because SQLite evaluates the NOT IN via the PRIMARY KEY
+    // index on _seen_paths.
     let mut guard = conn
         .lock()
         .map_err(|e| IndexerError::Other(format!("conn mutex poisoned: {e}")))?;
     let tx = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
-    for item in &items {
-        let existing: Option<i64> = tx
-            .query_row(
-                "SELECT mtime FROM documents WHERE path = ?1",
-                params![item.path],
-                |r| r.get(0),
-            )
-            .optional()?;
-        match existing {
-            Some(old) if old == item.mtime => {
-                stats.skipped_unchanged = stats.skipped_unchanged.saturating_add(1);
+    tx.execute_batch(
+        "CREATE TEMP TABLE IF NOT EXISTS _seen_paths (path TEXT PRIMARY KEY);
+         DELETE FROM _seen_paths;",
+    )?;
+
+    {
+        let mut ins = tx.prepare("INSERT INTO _seen_paths (path) VALUES (?1)")?;
+        for p in &unchanged_paths {
+            ins.execute(params![p])?;
+        }
+        for w in &writes {
+            ins.execute(params![w.path])?;
+        }
+    }
+
+    for w in &writes {
+        match w.op {
+            Op::Insert => {
+                tx.execute(
+                    "INSERT INTO documents (path, mtime, language, content)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![w.path, w.mtime_ns, w.language, w.content],
+                )?;
+                stats.inserted = stats.inserted.saturating_add(1);
             }
-            Some(_) => {
+            Op::Update => {
                 tx.execute(
                     "UPDATE documents
                        SET mtime = ?2, language = ?3, content = ?4
                      WHERE path = ?1",
-                    params![item.path, item.mtime, item.language, item.content],
+                    params![w.path, w.mtime_ns, w.language, w.content],
                 )?;
                 stats.updated = stats.updated.saturating_add(1);
-            }
-            None => {
-                tx.execute(
-                    "INSERT INTO documents (path, mtime, language, content)
-                     VALUES (?1, ?2, ?3, ?4)",
-                    params![item.path, item.mtime, item.language, item.content],
-                )?;
-                stats.inserted = stats.inserted.saturating_add(1);
             }
         }
     }
 
-    // Purge rows for files that disappeared from the walk. `walked_paths`
-    // contains every file we considered (including those we skipped as
-    // binary/large) so we don't falsely purge large-but-present files
-    // from a previous smaller-threshold pass.
-    let purge_count = {
-        let present: std::collections::HashSet<&str> =
-            walked_paths.iter().map(|s| s.as_str()).collect();
-        let mut stmt = tx.prepare("SELECT path FROM documents")?;
-        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
-        let mut to_delete: Vec<String> = Vec::new();
-        for row in rows {
-            let p = row?;
-            if !present.contains(p.as_str()) {
-                to_delete.push(p);
-            }
-        }
-        drop(stmt);
-        for p in &to_delete {
-            tx.execute("DELETE FROM documents WHERE path = ?1", params![p])?;
-        }
-        to_delete.len() as u32
-    };
-    stats.deleted = purge_count;
+    stats.skipped_unchanged = unchanged_paths.len() as u32;
+
+    let deleted = tx.execute(
+        "DELETE FROM documents WHERE path NOT IN (SELECT path FROM _seen_paths)",
+        [],
+    )? as u32;
+    stats.deleted = deleted;
+
     tx.commit()?;
     Ok(stats)
 }
@@ -373,6 +468,101 @@ mod tests {
         let stats = idx.reindex_incremental().await.unwrap();
         assert_eq!(stats.inserted, 1, "only small.md fits under 64 bytes");
         assert!(stats.skipped_binary_or_large >= 1);
+    }
+
+    #[tokio::test]
+    async fn previously_indexed_file_that_grows_past_cap_is_purged() {
+        // Regression gate for codex P1 on L257: a file that used to be
+        // indexed and is now over the size cap must NOT linger in the
+        // index returning stale content. The skipped-file path is
+        // explicitly NOT added to the seen set, so the SQL purge
+        // catches it.
+        let td = TempDir::new().unwrap();
+        let db = td.path().join("mirror.sqlite");
+        let repo = td.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let small = repo.join("grows.md");
+        std::fs::write(&small, "tiny body\n").unwrap();
+
+        let mut idx = RepoIndexer::open(&db, &repo).unwrap();
+        idx.set_max_file_bytes(1024);
+        let first = idx.reindex_incremental().await.unwrap();
+        assert_eq!(first.inserted, 1);
+
+        // File grows past a newly-lowered cap (simulates both "file
+        // got bigger" and "admin lowered ceiling").
+        std::fs::write(&small, "x".repeat(4096)).unwrap();
+        idx.set_max_file_bytes(128);
+        let second = idx.reindex_incremental().await.unwrap();
+
+        assert_eq!(
+            second.deleted, 1,
+            "row for now-oversize file must be purged, not kept stale: {second:?}"
+        );
+        assert!(second.skipped_binary_or_large >= 1);
+
+        // And the DB must no longer carry that path.
+        let guard = idx.conn.lock().unwrap();
+        let n: i64 = guard
+            .query_row(
+                "SELECT COUNT(*) FROM documents WHERE path = 'grows.md'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[tokio::test]
+    async fn subsec_mtime_difference_triggers_update() {
+        // Regression gate for codex P1 on L194: the old indexer
+        // truncated mtimes to whole seconds, so a second edit within
+        // the same second (common in test harnesses and fast save
+        // loops) could be missed. The ns-precision mtime must catch
+        // it. We drive the difference via `filetime` — not available
+        // as a dep — so use File::set_modified (stable) to pin the
+        // two snapshots at distinct ns-precision SystemTime values.
+        use std::fs::OpenOptions;
+        use std::time::{Duration, SystemTime};
+
+        let td = TempDir::new().unwrap();
+        let db = td.path().join("mirror.sqlite");
+        let repo = td.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let path = repo.join("hot.rs");
+        std::fs::write(&path, "fn v1() {}\n").unwrap();
+
+        // Pin mtime to a known value with ns precision.
+        let base = SystemTime::UNIX_EPOCH + Duration::new(1_700_000_000, 123_456_789);
+        OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(base)
+            .unwrap();
+
+        let idx = RepoIndexer::open(&db, &repo).unwrap();
+        let first = idx.reindex_incremental().await.unwrap();
+        assert_eq!(first.inserted, 1);
+
+        // Rewrite with new content; pin mtime within the SAME second
+        // but a different ns offset. Seconds-truncating code would
+        // miss this; ns-precision must catch it.
+        std::fs::write(&path, "fn v2() { different(); }\n").unwrap();
+        let second_mtime = SystemTime::UNIX_EPOCH + Duration::new(1_700_000_000, 987_654_321);
+        OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(second_mtime)
+            .unwrap();
+
+        let second = idx.reindex_incremental().await.unwrap();
+        assert_eq!(
+            second.updated, 1,
+            "within-second ns-precision edit must trigger an update: {second:?}"
+        );
+        assert_eq!(second.skipped_unchanged, 0);
     }
 
     #[tokio::test]
