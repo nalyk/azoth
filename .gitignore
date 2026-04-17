@@ -17,3 +17,4 @@ Cargo.lock.bak
 
 # Logs
 *.log
+.azoth_memory
