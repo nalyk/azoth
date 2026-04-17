@@ -182,13 +182,26 @@ impl EvidenceCollector for CompositeEvidenceCollector {
         }
         combined = fused;
 
-        // Stable sort so ties fall back on original order → deterministic.
-        // Sort by rerank_score desc.
+        // Sort by rerank_score desc, tie-broken by `label` ascending.
+        //
+        // Rust's `sort_by` is stable, so ties would normally fall back
+        // on the `combined` insertion order — but that order is the
+        // concatenation of per-lane sub-collector outputs, and the
+        // ripgrep lane's hit sequence is filesystem-walk order (not
+        // deterministic across FS state or reindexes). Without an
+        // explicit tie-breaker, two items with equal RRF scores could
+        // swap positions between runs on the *same* logical input,
+        // perturbing the packet digest and collapsing Anthropic
+        // prompt-cache hits (risk ledger #1 — cache-prefix stability).
+        // PR #8 review (Gemini HIGH) called this out; fix is the
+        // `.then_with(label cmp)` below. After dedupe, every item has
+        // a unique label, so the tie-break is well-defined.
         combined.sort_by(|a, b| {
             b.rerank_score
                 .unwrap_or(0.0)
                 .partial_cmp(&a.rerank_score.unwrap_or(0.0))
                 .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.label.cmp(&b.label))
         });
 
         // Token budget with per-lane floor. Each slot's token cost is
@@ -433,6 +446,31 @@ mod tests {
             "the fused doc must sort ahead of the single-lane doc"
         );
         assert_eq!(out[1].label, only_fts);
+    }
+
+    #[tokio::test]
+    async fn tied_rerank_scores_break_by_label_alphabetically() {
+        // PR #8 Gemini review: cache-prefix stability requires the
+        // sort be deterministic even when scores tie. Two items with
+        // the same rank (hence the same RRF contribution) must come
+        // out in a stable order regardless of upstream insertion
+        // order. Label-alpha tie-break pins it.
+        //
+        // `zed.rs:1` has weight 10 (rank 1) in lexical, `apple.rs:1`
+        // has weight 10 (rank 1) in fts — same RRF score. Label
+        // tie-breaker must put apple first.
+        let lex = Arc::new(StaticCollector(vec![item("zed.rs:1", 10)]));
+        let fts = Arc::new(StaticCollector(vec![item("apple.rs:1", 10)]));
+        let mut c = CompositeEvidenceCollector::empty(Arc::new(ReciprocalRankFusion::default()));
+        c.lexical = Some(lex);
+        c.fts = Some(fts);
+        let out = c.collect("q", 10).await.unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(
+            out[0].label, "apple.rs:1",
+            "label tie-break must be ascending"
+        );
+        assert_eq!(out[1].label, "zed.rs:1");
     }
 
     #[tokio::test]
