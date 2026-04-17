@@ -7,6 +7,7 @@ mod contract;
 mod effect;
 mod event;
 mod ids;
+mod impact;
 mod turn;
 
 pub use content::*;
@@ -14,6 +15,7 @@ pub use contract::*;
 pub use effect::*;
 pub use event::*;
 pub use ids::*;
+pub use impact::*;
 pub use turn::*;
 
 use serde::{Deserialize, Serialize};
