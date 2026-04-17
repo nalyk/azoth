@@ -96,6 +96,84 @@ async fn edit_replaces_prior_symbols_for_same_path() {
 }
 
 #[tokio::test]
+async fn backfill_populates_symbols_for_upgrade_from_v2_to_v3() {
+    // Codex P2 #4 (PR #6) — when a v2 mirror is opened under a v2
+    // binary shipping Sprint 2, the migrator creates the `symbols`
+    // table but every existing `documents` row has a mtime matching
+    // the on-disk file. Phase 2 triage classifies those files as
+    // "unchanged", so the per-file extractor loop never touches them.
+    // Without the backfill pass, `by_name` / `enclosing` would return
+    // nothing until each file is manually edited.
+    //
+    // The test simulates that post-upgrade state by seeding a freshly-
+    // migrated DB with a pre-populated documents row whose mtime
+    // matches the on-disk file, then running reindex and asserting
+    // symbols were extracted.
+    use std::time::UNIX_EPOCH;
+    let td = TempDir::new().unwrap();
+    let repo = td.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    let rs = repo.join("legacy.rs");
+    let content = "pub fn legacy_fn() {}\n";
+    std::fs::write(&rs, content).unwrap();
+    let mtime_ns = rs
+        .metadata()
+        .unwrap()
+        .modified()
+        .unwrap()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos()
+        .min(i64::MAX as u128) as i64;
+
+    let db = td.path().join("state.sqlite");
+    // Open once to run migrations (creates symbols table via m0003).
+    let indexer = RepoIndexer::open(&db, &repo).unwrap();
+
+    // Seed a documents row directly — simulates "v2 mirror opened by
+    // v3 binary; symbols is empty, documents is pre-populated".
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute(
+            "INSERT INTO documents (path, mtime, language, content) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params!["legacy.rs", mtime_ns, "rust", content],
+        )
+        .unwrap();
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM symbols", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0, "seed precondition: symbols must start empty");
+    }
+
+    // Reindex. The file's mtime matches documents.mtime, so Phase 2
+    // classifies it as unchanged; the per-file extractor loop never
+    // touches it. The backfill must pick up the slack.
+    let stats = indexer.reindex_incremental().await.unwrap();
+    assert_eq!(
+        stats.skipped_unchanged, 1,
+        "pre-seeded doc row must register as mtime-unchanged: {stats:?}"
+    );
+    assert!(
+        stats.symbols_extracted >= 1,
+        "backfill must extract symbols for unchanged .rs files on first post-upgrade pass: {stats:?}"
+    );
+
+    let sym_conn = rusqlite::Connection::open(&db).unwrap();
+    let idx = SqliteSymbolIndex::new(Arc::new(Mutex::new(sym_conn)));
+    let hits = idx.by_name("legacy_fn", 10).await.unwrap();
+    assert_eq!(hits.len(), 1, "by_name must resolve the backfilled symbol");
+    assert_eq!(hits[0].path, "legacy.rs");
+
+    // Second pass must not re-extract (backfill idempotent — symbols
+    // already present for the path).
+    let stats2 = indexer.reindex_incremental().await.unwrap();
+    assert_eq!(
+        stats2.symbols_extracted, 0,
+        "backfill must be idempotent: {stats2:?}"
+    );
+}
+
+#[tokio::test]
 async fn deleted_file_purges_its_symbol_rows() {
     let td = TempDir::new().unwrap();
     let repo = td.path().join("repo");
