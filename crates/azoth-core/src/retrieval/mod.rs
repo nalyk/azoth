@@ -3,7 +3,7 @@
 
 pub mod config;
 pub mod symbol;
-pub use config::{LexicalBackend, RetrievalConfig};
+pub use config::{CoEditConfig, LexicalBackend, RetrievalConfig};
 pub use symbol::{NullSymbolRetrieval, Symbol, SymbolId, SymbolKind, SymbolRetrieval};
 
 use async_trait::async_trait;
@@ -29,9 +29,28 @@ pub struct Span {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeRef(pub String);
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Sprint 3 additive extension: edges gain a `weight`. Old JSONL
+/// sessions (pre-v2) have no `weight` field and deserialize as
+/// `1.0` via `#[serde(default)]`.
+///
+/// `Eq`/`Hash` were intentional before `weight` existed (edges went
+/// through `HashSet` for dedupe). `f32` has no `Eq`/`Hash`, so both
+/// derives are dropped — the Sprint-3 `CoEditGraphRetrieval` does
+/// not need them and a future consumer that does can hash a
+/// projection it owns.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Edge {
     pub kind: String,
+    #[serde(default = "one_f32")]
+    pub weight: f32,
+}
+
+/// Default for `Edge::weight` when loading pre-v2 JSONL that has
+/// no `weight` field. Named so it shows up in backtraces as the
+/// explicit "old sessions default" seam rather than an anonymous
+/// closure.
+fn one_f32() -> f32 {
+    1.0
 }
 
 #[async_trait]
@@ -177,6 +196,27 @@ impl<'a> grep_searcher::Sink for Collector<'a> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn edge_without_weight_field_deserialises_to_one() {
+        // Sprint 3 additive: pre-v2 JSONL has `{"kind": "..."}` with
+        // no `weight` field. Must still parse — Sprint 4's composite
+        // collector is allowed to treat `1.0` as the pre-v2 default.
+        let old: Edge = serde_json::from_str(r#"{"kind":"co_edit"}"#).unwrap();
+        assert_eq!(old.kind, "co_edit");
+        assert!((old.weight - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn edge_round_trips_with_weight() {
+        let e = Edge {
+            kind: "co_edit".into(),
+            weight: 3.5,
+        };
+        let wire = serde_json::to_string(&e).unwrap();
+        let back: Edge = serde_json::from_str(&wire).unwrap();
+        assert_eq!(e, back);
+    }
 
     fn seed_repo() -> (TempDir, std::path::PathBuf) {
         let td = TempDir::new().expect("tempdir");
