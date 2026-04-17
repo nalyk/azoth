@@ -101,6 +101,8 @@ async fn tool_result_event_carries_artifact_id_and_blob_lands_on_disk() {
             validators: &[],
             effects_consumed: &mut effects,
             evidence_collector: None,
+            impact_validators: &[],
+            diff_source: None,
         };
         driver
             .drive_turn(

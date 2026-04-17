@@ -102,6 +102,8 @@ async fn tui_worker_pipeline_drives_full_turn_sequence() {
             validators: &[],
             effects_consumed: &mut effects,
             evidence_collector: None,
+            impact_validators: &[],
+            diff_source: None,
         };
         let usage = driver
             .drive_turn(

@@ -99,6 +99,8 @@ async fn drive_with_validators(
             validators,
             effects_consumed: &mut effects,
             evidence_collector: None,
+            impact_validators: &[],
+            diff_source: None,
         };
         driver
             .drive_turn(

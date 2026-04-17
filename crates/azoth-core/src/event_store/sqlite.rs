@@ -376,8 +376,8 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(
-            v, 4,
-            "Sprint 3 ships m0004 (co_edit_edges) on top of m0003 (symbols) on top of m0002 (FTS) on top of m0001 (turns)"
+            v, 5,
+            "Sprint 5 ships m0005 (test_impact) on top of m0004 (co_edit_edges) on top of m0003 (symbols) on top of m0002 (FTS) on top of m0001 (turns)"
         );
     }
 }

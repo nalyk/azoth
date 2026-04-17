@@ -10,13 +10,14 @@ use crate::authority::{
 use crate::context::{ContextKernel, EvidenceCollector, KernelError, StepInput};
 use crate::event_store::JsonlWriter;
 use crate::execution::{ExecutionContext, ToolDispatcher, ToolError};
+use crate::impact::DiffSource;
 use crate::schemas::{
-    AbortReason, CheckpointId, CommitOutcome, ContentBlock, Contract, EffectClass, EffectCounter,
-    EffectRecord, EffectRecordId, Message, ModelTurnRequest, RequestMetadata, Role, RunId,
-    SessionEvent, StopReason, StreamEvent, ToolDefinition, TurnId, Usage, ValidatorStatus,
+    AbortReason, CheckpointId, CommitOutcome, ContentBlock, Contract, Diff, EffectClass,
+    EffectCounter, EffectRecord, EffectRecordId, Message, ModelTurnRequest, RequestMetadata, Role,
+    RunId, SessionEvent, StopReason, StreamEvent, ToolDefinition, TurnId, Usage, ValidatorStatus,
 };
 use crate::telemetry;
-use crate::validators::Validator;
+use crate::validators::{ImpactValidator, Validator};
 use thiserror::Error;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
@@ -115,6 +116,26 @@ pub struct TurnDriver<'a> {
     /// populate `StepInput.evidence`. When `None`, evidence stays
     /// `Vec::new()` — byte-for-byte compatible with the pre-evidence driver.
     pub evidence_collector: Option<&'a dyn EvidenceCollector>,
+    /// Async, turn-scoped impact validators (Sprint 5, TDAD). Each is
+    /// called at the `EndTurn` / `StopSequence` branch *after* the
+    /// classical `validators` slice passes, with the current `Diff`
+    /// from `diff_source`. Every call writes a `SessionEvent::
+    /// ImpactComputed` (selector + plan + selected tests) plus a
+    /// `SessionEvent::ValidatorResult`. A `Fail` verdict from any
+    /// impact validator aborts the turn under `AbortReason::
+    /// ValidatorFail` — identical wire shape to a classical
+    /// validator failure. Empty slice + `None` diff_source = no-op,
+    /// byte-for-byte compatible with the pre-Sprint-5 driver.
+    pub impact_validators: &'a [&'a dyn ImpactValidator],
+    /// Optional `DiffSource` queried once at the validate phase to
+    /// materialise the `Diff` handed to every `impact_validators`
+    /// entry. When `None`, impact validators observe
+    /// `Diff::empty()`; they are free to treat that as a no-op
+    /// (selectors keyed on changed paths emit an empty plan, which
+    /// counts as `Pass`). Shell-based sources (`git status
+    /// --porcelain`) live in `azoth-repo` so `azoth-core` stays
+    /// dep-thin.
+    pub diff_source: Option<&'a dyn DiffSource>,
 }
 
 impl<'a> TurnDriver<'a> {
@@ -681,6 +702,104 @@ impl<'a> TurnDriver<'a> {
                             )?;
                             return Ok(TurnOutcome::aborted(total_usage));
                         }
+
+                        // Sprint 5: TDAD impact validators. Compute the
+                        // diff once (default empty when no source is
+                        // wired), then walk impact_validators in order.
+                        // Each call emits ImpactComputed (plan detail)
+                        // plus ValidatorResult (pass/fail). A Fail
+                        // aborts the turn under the same
+                        // AbortReason::ValidatorFail the classical
+                        // path uses — forensic diffs across subsystems
+                        // stay consistent.
+                        if !self.impact_validators.is_empty() {
+                            let diff: Diff = match self.diff_source {
+                                Some(src) => match src.diff().await {
+                                    Ok(d) => d,
+                                    Err(e) => {
+                                        // Diff source errors are not a turn kill
+                                        // in isolation — we proceed with an empty
+                                        // diff and record the failure as a
+                                        // ValidatorResult so eval can see it.
+                                        tracing::warn!(
+                                            error = %e,
+                                            source = src.name(),
+                                            "diff_source failed; proceeding with empty diff"
+                                        );
+                                        self.writer.append(&SessionEvent::ValidatorResult {
+                                            turn_id: turn_id.clone(),
+                                            validator: format!("diff_source:{}", src.name()),
+                                            status: ValidatorStatus::Fail,
+                                            detail: Some(format!("{e}")),
+                                        })?;
+                                        telemetry::emit_validator_result(
+                                            &self.run_id.0,
+                                            &turn_id.0,
+                                            &format!("diff_source:{}", src.name()),
+                                            ValidatorStatus::Fail,
+                                        );
+                                        Diff::empty()
+                                    }
+                                },
+                                None => Diff::empty(),
+                            };
+
+                            let mut impact_failed: Option<(String, Option<String>)> = None;
+                            for iv in self.impact_validators.iter() {
+                                let report = iv.validate(contract, &diff).await;
+                                let vname = report.name.to_string();
+
+                                // Always persist plan detail when the
+                                // validator produced one — including
+                                // empty plans, so forensics can
+                                // distinguish "no impact" from
+                                // "selector errored before planning".
+                                if let Some(plan) = report.plan.as_ref() {
+                                    let selected_tests: Vec<String> =
+                                        plan.tests.iter().map(|t| t.0.clone()).collect();
+                                    self.writer.append(&SessionEvent::ImpactComputed {
+                                        turn_id: turn_id.clone(),
+                                        selector: vname.clone(),
+                                        selector_version: plan.selector_version,
+                                        changed_files: diff.changed_files.clone(),
+                                        selected_tests,
+                                    })?;
+                                }
+
+                                self.writer.append(&SessionEvent::ValidatorResult {
+                                    turn_id: turn_id.clone(),
+                                    validator: vname.clone(),
+                                    status: report.status,
+                                    detail: report.detail.clone(),
+                                })?;
+                                telemetry::emit_validator_result(
+                                    &self.run_id.0,
+                                    &turn_id.0,
+                                    &vname,
+                                    report.status,
+                                );
+                                if matches!(report.status, ValidatorStatus::Fail)
+                                    && impact_failed.is_none()
+                                {
+                                    impact_failed = Some((vname, report.detail));
+                                }
+                            }
+
+                            if let Some((name, detail)) = impact_failed {
+                                let msg = match detail {
+                                    Some(d) => format!("{name}: {d}"),
+                                    None => name,
+                                };
+                                self.record_abort(
+                                    &turn_id,
+                                    AbortReason::ValidatorFail,
+                                    Some(msg),
+                                    total_usage.clone(),
+                                )?;
+                                return Ok(TurnOutcome::aborted(total_usage));
+                            }
+                        }
+
                         self.writer.append(&SessionEvent::Checkpoint {
                             turn_id: turn_id.clone(),
                             checkpoint_id: CheckpointId::new(),

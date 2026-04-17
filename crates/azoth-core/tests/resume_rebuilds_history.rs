@@ -84,6 +84,8 @@ async fn drive_text_turn(
         validators: &[],
         effects_consumed: &mut effects,
         evidence_collector: None,
+        impact_validators: &[],
+        diff_source: None,
     };
 
     let mut messages = prior_history;

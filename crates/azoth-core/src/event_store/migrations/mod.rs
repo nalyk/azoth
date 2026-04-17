@@ -44,6 +44,7 @@ mod m0001_initial;
 mod m0002_fts_schema;
 mod m0003_symbols;
 mod m0004_co_edit;
+mod m0005_impact;
 
 type MigrationStep = fn(&Transaction) -> Result<(), MirrorError>;
 
@@ -53,6 +54,7 @@ fn all_steps() -> &'static [MigrationStep] {
         m0002_fts_schema::up,
         m0003_symbols::up,
         m0004_co_edit::up,
+        m0005_impact::up,
     ]
 }
 

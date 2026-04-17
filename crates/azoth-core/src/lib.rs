@@ -17,6 +17,7 @@ pub mod context;
 pub mod contract;
 pub mod event_store;
 pub mod execution;
+pub mod impact;
 pub mod retrieval;
 pub mod sandbox;
 pub mod schemas;

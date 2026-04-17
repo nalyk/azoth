@@ -22,9 +22,14 @@
 pub mod code_graph;
 pub mod fts;
 pub mod history;
+pub mod impact;
 pub mod indexer;
 
 pub use code_graph::{extract_rust, SqliteSymbolIndex};
 pub use fts::FtsLexicalRetrieval;
 pub use history::{CoEditBuildStats, CoEditError, CoEditGraphRetrieval, PATH_PREFIX};
+pub use impact::{
+    discover_cargo_tests, CargoTestImpact, GitStatusDiffSource, TestUniverse,
+    CARGO_TEST_IMPACT_VERSION,
+};
 pub use indexer::{IndexStats, IndexerError, RepoIndexer};

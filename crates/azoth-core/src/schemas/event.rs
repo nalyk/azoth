@@ -174,6 +174,26 @@ pub enum SessionEvent {
         #[serde(default)]
         matched: Vec<i64>,
     },
+    /// A `TestPlan` was computed by an `ImpactValidator` at the turn's
+    /// validate phase (Sprint 5). `changed_files` is the diff input
+    /// the selector operated on; `selected_tests` lists the plan's
+    /// ordered `TestId` values (plain strings on the wire). `selector`
+    /// names the concrete impl (`cargo_test`, future `pytest`,
+    /// `jest`, `go_test`), and `selector_version` bumps on heuristic
+    /// changes so replay can detect plan drift without re-running.
+    /// All non-essential fields carry `#[serde(default)]` for
+    /// forward-compat: older binaries can tolerate future extensions.
+    ImpactComputed {
+        turn_id: TurnId,
+        #[serde(default)]
+        selector: String,
+        #[serde(default)]
+        selector_version: u32,
+        #[serde(default)]
+        changed_files: Vec<String>,
+        #[serde(default)]
+        selected_tests: Vec<String>,
+    },
 }
 
 impl SessionEvent {
@@ -198,7 +218,8 @@ impl SessionEvent {
             | TurnAborted { turn_id, .. }
             | TurnInterrupted { turn_id, .. }
             | RetrievalQueried { turn_id, .. }
-            | SymbolResolved { turn_id, .. } => Some(turn_id),
+            | SymbolResolved { turn_id, .. }
+            | ImpactComputed { turn_id, .. } => Some(turn_id),
         }
     }
 
@@ -285,6 +306,46 @@ mod tests {
         match back2 {
             SessionEvent::SymbolResolved { matched, .. } => assert!(matched.is_empty()),
             other => panic!("expected SymbolResolved, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn impact_computed_round_trips_and_defaults_on_forward_compat() {
+        let ev = SessionEvent::ImpactComputed {
+            turn_id: TurnId::from("t_77".to_string()),
+            selector: "cargo_test".to_string(),
+            selector_version: 1,
+            changed_files: vec!["src/foo.rs".into()],
+            selected_tests: vec!["azoth_core::foo::tests::bar".into()],
+        };
+        let s = serde_json::to_string(&ev).unwrap();
+        assert!(s.contains(r#""type":"impact_computed""#), "{s}");
+        let back: SessionEvent = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, ev);
+        assert_eq!(back.turn_id().map(|t| t.as_str()), Some("t_77"));
+
+        // Forward-compat: a future minimal writer that drops every
+        // non-essential field must still deserialise under the current
+        // schema.
+        let wire = r#"{
+            "type":"impact_computed",
+            "turn_id":"t_78"
+        }"#;
+        let back2: SessionEvent = serde_json::from_str(wire).unwrap();
+        match back2 {
+            SessionEvent::ImpactComputed {
+                selector,
+                selector_version,
+                changed_files,
+                selected_tests,
+                ..
+            } => {
+                assert!(selector.is_empty());
+                assert_eq!(selector_version, 0);
+                assert!(changed_files.is_empty());
+                assert!(selected_tests.is_empty());
+            }
+            other => panic!("expected ImpactComputed, got {other:?}"),
         }
     }
 

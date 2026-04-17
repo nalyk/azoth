@@ -73,6 +73,8 @@ async fn end_turn_outcome_carries_final_assistant_content() {
         validators: &[],
         effects_consumed: &mut effects,
         evidence_collector: None,
+        impact_validators: &[],
+        diff_source: None,
     };
     let outcome = driver
         .drive_turn(
@@ -160,6 +162,8 @@ async fn contract_max_turns_abort_returns_none_final_assistant() {
         validators: &[],
         effects_consumed: &mut effects,
         evidence_collector: None,
+        impact_validators: &[],
+        diff_source: None,
     };
     let outcome = driver
         .drive_turn(turn_id, "system".into(), vec![Message::user_text("go")])

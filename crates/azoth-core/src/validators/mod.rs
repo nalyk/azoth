@@ -1,5 +1,9 @@
 //! Deterministic turn-exit validators.
 
+pub mod impact;
+
+pub use impact::{ImpactValidator, ImpactValidatorReport, SelectorBackedImpactValidator};
+
 use crate::schemas::{Contract, ValidatorStatus};
 
 pub struct ValidatorReport {

@@ -276,6 +276,20 @@ fn write_event_line<W: std::io::Write>(
             matched.len(),
             truncate(query, 60)
         ),
+        SessionEvent::ImpactComputed {
+            selector,
+            selector_version,
+            changed_files,
+            selected_tests,
+            ..
+        } => writeln!(
+            out,
+            "{prefix}{turn} impact_computed  selector={}@v{} changed={} selected={}",
+            selector,
+            selector_version,
+            changed_files.len(),
+            selected_tests.len()
+        ),
     }
 }
 

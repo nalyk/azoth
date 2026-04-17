@@ -933,6 +933,8 @@ pub async fn run_app(resume: Option<String>) -> io::Result<()> {
                 validators,
                 effects_consumed: &mut effects_consumed,
                 evidence_collector: Some(evidence_collector),
+                impact_validators: &[],
+                diff_source: None,
             };
 
             let result = driver
