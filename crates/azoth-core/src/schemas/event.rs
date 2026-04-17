@@ -160,6 +160,20 @@ pub enum SessionEvent {
         #[serde(default)]
         latency_ms: u64,
     },
+    /// A symbol-index query completed (Sprint 2). `matched` carries the
+    /// session-ephemeral `SymbolId`s returned for the query — never
+    /// treated as a durable reference by any replay consumer because
+    /// IDs regenerate every reindex pass (invariant #1). `backend`
+    /// names the concrete impl (`sqlite` today; future `composite` in
+    /// Sprint 4). All non-essential fields carry `#[serde(default)]`
+    /// for forward-compat.
+    SymbolResolved {
+        turn_id: TurnId,
+        backend: String,
+        query: String,
+        #[serde(default)]
+        matched: Vec<i64>,
+    },
 }
 
 impl SessionEvent {
@@ -183,7 +197,8 @@ impl SessionEvent {
             | TurnCommitted { turn_id, .. }
             | TurnAborted { turn_id, .. }
             | TurnInterrupted { turn_id, .. }
-            | RetrievalQueried { turn_id, .. } => Some(turn_id),
+            | RetrievalQueried { turn_id, .. }
+            | SymbolResolved { turn_id, .. } => Some(turn_id),
         }
     }
 
@@ -242,6 +257,35 @@ mod tests {
             Some("t_9"),
             "new variant must be covered by turn_id() match"
         );
+    }
+
+    #[test]
+    fn symbol_resolved_round_trips_and_defaults_matched() {
+        // With matched populated.
+        let ev = SessionEvent::SymbolResolved {
+            turn_id: TurnId::from("t_5".to_string()),
+            backend: "sqlite".to_string(),
+            query: "TurnDriver".to_string(),
+            matched: vec![1, 2, 3],
+        };
+        let s = serde_json::to_string(&ev).unwrap();
+        assert!(s.contains(r#""type":"symbol_resolved""#), "{s}");
+        let back: SessionEvent = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, ev);
+        assert_eq!(back.turn_id().map(|t| t.as_str()), Some("t_5"));
+
+        // Forward-compat: missing `matched` defaults to empty vec.
+        let wire = r#"{
+            "type":"symbol_resolved",
+            "turn_id":"t_6",
+            "backend":"sqlite",
+            "query":"foo"
+        }"#;
+        let back2: SessionEvent = serde_json::from_str(wire).unwrap();
+        match back2 {
+            SessionEvent::SymbolResolved { matched, .. } => assert!(matched.is_empty()),
+            other => panic!("expected SymbolResolved, got {other:?}"),
+        }
     }
 
     #[test]

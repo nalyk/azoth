@@ -19,8 +19,10 @@
 //! `azoth-repo` and handing the concrete retrieval impls to the runtime
 //! via the trait objects defined in `azoth_core::retrieval`.
 
+pub mod code_graph;
 pub mod fts;
 pub mod indexer;
 
+pub use code_graph::{extract_rust, SqliteSymbolIndex};
 pub use fts::FtsLexicalRetrieval;
 pub use indexer::{IndexStats, IndexerError, RepoIndexer};

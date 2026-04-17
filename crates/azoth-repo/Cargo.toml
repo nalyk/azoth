@@ -22,6 +22,11 @@ tokio = { workspace = true }
 # Repo walking (scope-parity with ripgrep lexical retrieval).
 ignore = { workspace = true }
 
+# Symbol extraction (Sprint 2). ABI-linked pair — never bump
+# independently. See workspace Cargo.toml note.
+tree-sitter = { workspace = true }
+tree-sitter-rust = { workspace = true }
+
 # Errors + logging
 thiserror = { workspace = true }
 tracing = { workspace = true }

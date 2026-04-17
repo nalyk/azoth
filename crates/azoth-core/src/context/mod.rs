@@ -10,10 +10,12 @@
 
 mod evidence;
 mod kernel;
+mod symbol_evidence;
 mod tokenizer;
 
 pub use evidence::{EvidenceCollector, LexicalEvidenceCollector};
 pub use kernel::{ContextKernel, KernelError, StepInput};
+pub use symbol_evidence::SymbolEvidenceCollector;
 pub use tokenizer::count_tokens;
 // The tokenizer family flows into the kernel at packet-compile time; re-export
 // it so callers do not need to reach into the adapter module directly.

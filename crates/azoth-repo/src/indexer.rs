@@ -90,6 +90,11 @@ pub struct IndexStats {
     /// UTF-8 read. Counted together because the distinction is not
     /// interesting at the eval-plane layer.
     pub skipped_binary_or_large: u32,
+    /// Rust symbols extracted and persisted this pass (Sprint 2).
+    /// Counts every row written by `replace_symbols_for_path`, across
+    /// every Rust file in the insert/update set. Non-Rust files and
+    /// files that skipped Phase 3 do not contribute.
+    pub symbols_extracted: u32,
 }
 
 /// Holds a shared SQLite connection and the repo root. Both
@@ -356,15 +361,49 @@ fn reindex_blocking(
                 stats.updated = stats.updated.saturating_add(1);
             }
         }
+
+        // Sprint 2 — tree-sitter symbol extraction, Rust only. The
+        // language detector from `detect_language` names the grammar
+        // ("rust"); every other language skips the extractor until
+        // v2.1 lands the Python/TS/Go grammars. Extraction failures
+        // (bad bytes, parser error) never abort the reindex; the file
+        // simply lacks symbols this pass and gets another shot next
+        // pass.
+        if w.language == Some("rust") {
+            match crate::code_graph::extract_rust(&w.content) {
+                Ok(syms) => {
+                    let n =
+                        crate::code_graph::replace_symbols_for_path(&tx, &w.path, "rust", &syms)?;
+                    stats.symbols_extracted = stats.symbols_extracted.saturating_add(n);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        path = %w.path,
+                        error = %e,
+                        "tree-sitter rust extractor failed; symbols for this path will be missing until next pass"
+                    );
+                }
+            }
+        }
     }
 
     stats.skipped_unchanged = unchanged_paths.len() as u32;
 
-    let deleted = tx.execute(
+    // Purge documents for files that vanished from the walk.
+    let deleted_docs = tx.execute(
         "DELETE FROM documents WHERE path NOT IN (SELECT path FROM _seen_paths)",
         [],
     )? as u32;
-    stats.deleted = deleted;
+    stats.deleted = deleted_docs;
+
+    // Sprint 2: mirror the documents purge for the symbols table. A
+    // file that vanishes from the walk (deleted OR grew-past-cap OR
+    // renamed) must not leave stale symbol rows behind. The anti-join
+    // against `_seen_paths` handles all three cases uniformly.
+    tx.execute(
+        "DELETE FROM symbols WHERE path NOT IN (SELECT path FROM _seen_paths)",
+        [],
+    )?;
 
     tx.commit()?;
     Ok(stats)
