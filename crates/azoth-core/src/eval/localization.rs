@@ -118,31 +118,48 @@ where
 /// Sweep a seed set, produce a per-task score vector. Callers
 /// aggregate via `mean_precision` or build an `EvalReport` around
 /// this. Pure function; no I/O, no side effects.
+///
+/// Implementation note: addresses PR #10 gemini-MED feedback — one
+/// canonicalisation pass per task, no redundant HashSet rebuilds, and
+/// `matched` is an integer counter rather than a float-reconstructed
+/// derivation (`(precision * considered).round()`) that could drift
+/// by one under f64 rounding.
 pub fn score_tasks(tasks: &[SeedTask], k: u32) -> Vec<TaskScore> {
     let k_usize = k as usize;
     tasks
         .iter()
         .map(|t| {
-            let mut seen = std::collections::HashSet::new();
-            let considered = t
+            let relevant_set: std::collections::HashSet<String> =
+                t.relevant_files.iter().map(|p| canonicalise(p)).collect();
+            let relevant_total = relevant_set.len() as u32;
+
+            let mut seen = std::collections::HashSet::with_capacity(k_usize);
+            let mut considered: u32 = 0;
+            let mut matched: u32 = 0;
+            for p in t
                 .predicted_files
                 .iter()
                 .take(k_usize)
-                .filter(|p| seen.insert(canonicalise(p)))
-                .count() as u32;
-            let seen_clone = t.relevant_files.clone();
-            let relevant_total: u32 = {
-                let mut s = std::collections::HashSet::new();
-                seen_clone
-                    .iter()
-                    .filter(|p| s.insert(canonicalise(p)))
-                    .count() as u32
+                .map(|p| canonicalise(p))
+            {
+                if !seen.insert(p.clone()) {
+                    continue;
+                }
+                considered += 1;
+                if relevant_set.contains(&p) {
+                    matched += 1;
+                }
+            }
+
+            let precision_at_k = if considered == 0 {
+                0.0
+            } else {
+                matched as f64 / considered as f64
             };
-            let precision = precision_at_k(&t.predicted_files, &t.relevant_files, k_usize);
-            let matched = (precision * considered as f64).round() as u32;
+
             TaskScore {
                 task_id: t.id.clone(),
-                precision_at_k: precision,
+                precision_at_k,
                 k,
                 matched,
                 relevant_total,

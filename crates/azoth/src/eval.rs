@@ -11,10 +11,24 @@
 //! event to an append-only `.azoth/sessions/<run_id>.jsonl` so the
 //! SQLite mirror's `eval_runs` table gets populated alongside the
 //! live stream. The `run_id` and per-task `turn_id` are synthesised
-//! deterministically from the seed file digest + task index — two
-//! back-to-back invocations against the same seed produce identical
-//! JSONL (byte-for-byte on the event stream minus `sampled_at`), so
-//! `rebuild_from` stays idempotent.
+//! deterministically from the seed file digest + `k` + task index —
+//! two back-to-back invocations against the same seed AND same `k`
+//! produce identical JSONL (byte-for-byte on the event stream minus
+//! `sampled_at`), so `rebuild_from` stays idempotent.
+//!
+//! ## Rerun semantics
+//!
+//! Two PR-#10 fixes shape the rerun contract:
+//! - **codex P1** — the default `run_id` folds in `k` (`eval_<digest12>_k<K>`)
+//!   so sweeping the same seed under different `--k` values produces
+//!   distinct `run_id`s. Otherwise the mirror's composite PK
+//!   `(run_id, turn_id, metric, task_id)` would silently overwrite
+//!   prior measurements when `--k` changed.
+//! - **codex P2** — the synthetic session JSONL is deleted before
+//!   writing so reruns under the same `run_id` produce a fresh
+//!   file rather than appending more `RunStarted` / `EvalSampled`
+//!   lines onto the previous run. A seed with fewer tasks on
+//!   rerun must not carry stale rows from the prior larger sweep.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -69,10 +83,13 @@ pub fn run<W: Write>(args: Args, out: &mut W) -> Result<EvalReport, EvalError> {
     let mean = mean_precision(&scores);
     let sampled_at = now_iso();
 
+    // PR #10 codex P1: fold `k` into the default run_id so sweeping
+    // the same seed under different `--k` values does not collide on
+    // the mirror's composite PK and silently overwrite prior samples.
     let run_id = args
         .run_id
         .clone()
-        .unwrap_or_else(|| format!("eval_{}", &seed_digest[..12]));
+        .unwrap_or_else(|| format!("eval_{}_k{}", &seed_digest[..12], args.k));
     write_eval_session(&args.sessions_dir, &run_id, &scores, &sampled_at)?;
 
     let report = EvalReport {
@@ -140,6 +157,21 @@ fn write_eval_session(
 ) -> Result<(), EvalError> {
     std::fs::create_dir_all(sessions_dir)?;
     let path = sessions_dir.join(format!("{run_id}.jsonl"));
+    // PR #10 codex P2: `JsonlWriter::open` appends. An eval rerun
+    // with the same `run_id` would otherwise accumulate duplicate
+    // `RunStarted` + stale `EvalSampled` rows, double-counting in
+    // forensic consumers and keeping old tasks around when the seed
+    // shrinks. A synthetic eval session has no replay-history
+    // semantics to preserve — delete-then-open is the right
+    // primitive here.
+    if path.exists() {
+        std::fs::remove_file(&path).map_err(|e| {
+            EvalError::Io(std::io::Error::other(format!(
+                "truncate stale session {}: {e}",
+                path.display()
+            )))
+        })?;
+    }
     let mut writer = JsonlWriter::open(&path).map_err(|e| {
         EvalError::Io(std::io::Error::other(format!(
             "open session {}: {e}",
@@ -235,5 +267,106 @@ mod tests {
         assert!(output.contains("localization@5"));
         assert!(output.contains("t1"));
         assert!(output.contains("t2"));
+    }
+
+    /// PR #10 codex P2 regression guard: rerunning the CLI against
+    /// the same `run_id` must produce a fresh synthetic session
+    /// rather than appending. Otherwise forensic consumers would
+    /// double-count historical `EvalSampled` rows and see two
+    /// `RunStarted` lines per run.
+    #[test]
+    fn rerun_truncates_session_instead_of_appending() {
+        let dir = tempdir().unwrap();
+        let seed_path = dir.path().join("seed.json");
+        std::fs::write(
+            &seed_path,
+            r#"[
+                {"id":"t1","prompt":"p","relevant_files":["a"],"predicted_files":["a"]},
+                {"id":"t2","prompt":"p","relevant_files":["b"],"predicted_files":["b"]}
+            ]"#,
+        )
+        .unwrap();
+
+        let sessions_dir = dir.path().join(".azoth").join("sessions");
+        let make_args = || Args {
+            seed: seed_path.clone(),
+            k: 5,
+            out: None,
+            sessions_dir: sessions_dir.clone(),
+            run_id: Some("eval_rerun".into()),
+        };
+
+        let mut buf: Vec<u8> = Vec::new();
+        run(make_args(), &mut buf).unwrap();
+        let path = sessions_dir.join("eval_rerun.jsonl");
+        let first_len = std::fs::read_to_string(&path).unwrap().lines().count();
+        assert_eq!(first_len, 3, "1 RunStarted + 2 EvalSampled");
+
+        // Second run under the same run_id must NOT append — the
+        // file should be regenerated, not grown.
+        let mut buf2: Vec<u8> = Vec::new();
+        run(make_args(), &mut buf2).unwrap();
+        let second_len = std::fs::read_to_string(&path).unwrap().lines().count();
+        assert_eq!(
+            second_len, 3,
+            "rerun must truncate stale session, got {second_len} lines"
+        );
+
+        // Count RunStarted events explicitly — that's the tell-tale
+        // accumulation signal a forensic consumer would trip over.
+        let run_started_count = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .filter(|l| l.contains(r#""type":"run_started""#))
+            .count();
+        assert_eq!(run_started_count, 1, "exactly one RunStarted per session");
+    }
+
+    /// PR #10 codex P1 regression guard: the default `run_id` must
+    /// differ across `--k` values so the mirror's composite PK does
+    /// not silently overwrite prior measurements when the same seed
+    /// is swept at multiple cut-offs.
+    #[test]
+    fn default_run_id_distinguishes_k() {
+        let dir = tempdir().unwrap();
+        let seed_path = dir.path().join("seed.json");
+        std::fs::write(
+            &seed_path,
+            r#"[
+                {"id":"t1","prompt":"p","relevant_files":["a"],"predicted_files":["a"]}
+            ]"#,
+        )
+        .unwrap();
+
+        let sessions_dir = dir.path().join(".azoth").join("sessions");
+        let run = |k: u32| {
+            let args = Args {
+                seed: seed_path.clone(),
+                k,
+                out: None,
+                sessions_dir: sessions_dir.clone(),
+                run_id: None, // exercise default path
+            };
+            let mut buf: Vec<u8> = Vec::new();
+            super::run(args, &mut buf).unwrap();
+        };
+
+        run(5);
+        run(10);
+
+        let jsonl_files: Vec<_> = std::fs::read_dir(&sessions_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "jsonl"))
+            .collect();
+        assert_eq!(
+            jsonl_files.len(),
+            2,
+            "--k 5 and --k 10 must produce distinct run_ids; got {:?}",
+            jsonl_files
+                .iter()
+                .map(|e| e.file_name())
+                .collect::<Vec<_>>()
+        );
     }
 }
