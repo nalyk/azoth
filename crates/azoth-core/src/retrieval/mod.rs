@@ -3,7 +3,7 @@
 
 pub mod config;
 pub mod symbol;
-pub use config::{CoEditConfig, LexicalBackend, RetrievalConfig};
+pub use config::{CoEditConfig, LexicalBackend, RetrievalConfig, RetrievalMode};
 pub use symbol::{NullSymbolRetrieval, Symbol, SymbolId, SymbolKind, SymbolRetrieval};
 
 use async_trait::async_trait;

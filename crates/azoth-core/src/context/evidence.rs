@@ -87,6 +87,8 @@ fn spans_to_evidence(spans: Vec<Span>, limit: usize) -> Vec<EvidenceItem> {
             // First hit gets `base`, decaying by 1; floor at 1 so every
             // item remains distinguishable from the kernel default of 0.
             decision_weight: base.saturating_sub(idx as u32).max(1),
+            lane: Some("lexical".into()),
+            rerank_score: None,
         })
         .collect()
 }

@@ -36,12 +36,28 @@ pub struct WorkingSetItem {
     pub summary: String,
 }
 
+/// Evidence item consumed by the Context Kernel's `evidence_lane`.
+///
+/// v2 Sprint 4 adds two additive optional fields — `lane` and
+/// `rerank_score` — so composite collectors can tag each item with
+/// provenance (which backend produced it) and a post-rerank score for
+/// forensic replay. Both carry `#[serde(default)]` so v1.5 JSONL
+/// sessions deserialise unchanged (risk ledger #1 — schema stability).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EvidenceItem {
     pub label: String,
     pub artifact_ref: Option<String>,
     pub inline: Option<String>,
     pub decision_weight: u32,
+    /// Provenance tag: which collector lane produced this item.
+    /// Conventional values: `"graph"`, `"symbol"`, `"lexical"`,
+    /// `"fts"`. `None` on pre-v2 items.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lane: Option<String>,
+    /// Statistical reranker score (e.g. RRF). `None` when the
+    /// identity reranker is used or on pre-v2 items.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rerank_score: Option<f32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

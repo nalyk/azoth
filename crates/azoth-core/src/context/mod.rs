@@ -8,13 +8,19 @@
 //! 4. long payloads stay as artifact refs, never inline
 //! 5. transcript is never copied verbatim
 
+mod budget;
+mod composite;
 mod evidence;
 mod kernel;
+mod reranker;
 mod symbol_evidence;
 mod tokenizer;
 
+pub use budget::{Slot, TokenBudget};
+pub use composite::CompositeEvidenceCollector;
 pub use evidence::{EvidenceCollector, LexicalEvidenceCollector};
 pub use kernel::{ContextKernel, KernelError, StepInput};
+pub use reranker::{BgeReranker, IdentityReranker, ReciprocalRankFusion, RerankError, Reranker};
 pub use symbol_evidence::SymbolEvidenceCollector;
 pub use tokenizer::count_tokens;
 // The tokenizer family flows into the kernel at packet-compile time; re-export

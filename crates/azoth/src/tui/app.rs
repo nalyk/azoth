@@ -27,10 +27,15 @@ use tui_textarea::{Input as TaInput, TextArea};
 
 use azoth_core::artifacts::ArtifactStore;
 use azoth_core::authority::{ApprovalRequestMsg, ApprovalResponse, CapabilityStore};
-use azoth_core::context::LexicalEvidenceCollector;
+use azoth_core::context::{
+    CompositeEvidenceCollector, EvidenceCollector, IdentityReranker, LexicalEvidenceCollector,
+    ReciprocalRankFusion, TokenBudget,
+};
 use azoth_core::event_store::{JsonlReader, JsonlWriter, SqliteMirror};
 use azoth_core::execution::{ExecutionContext, ToolDispatcher};
-use azoth_core::retrieval::RipgrepLexicalRetrieval;
+use azoth_core::retrieval::{
+    LexicalRetrieval, RetrievalConfig, RetrievalMode, RipgrepLexicalRetrieval,
+};
 use azoth_core::schemas::{
     ApprovalId, ApprovalScope, CapabilityTokenId, ContentBlock, Contract, ContractId, Message,
     RunId, SessionEvent, TurnId,
@@ -694,11 +699,56 @@ pub async fn run_app(resume: Option<String>) -> io::Result<()> {
         );
         let adapter = super::config::build_adapter(&provider_profile);
 
-        // Evidence collector backed by ripgrep search over the repo root.
-        let retrieval = Arc::new(RipgrepLexicalRetrieval {
+        // Evidence collector. Mode is switched by `AZOTH_RETRIEVAL_MODE`
+        // (via `RetrievalConfig`): `legacy` (default, Sprint 1 behaviour)
+        // keeps the single-lane ripgrep collector; `composite` (Sprint 4)
+        // uses `CompositeEvidenceCollector` with ripgrep wired into the
+        // lexical lane. Full multi-lane wiring (FTS + symbol + graph) is
+        // deferred to Sprint 7 when composite becomes the default.
+        let retrieval_cfg = RetrievalConfig::from_env();
+        let retrieval: Arc<dyn LexicalRetrieval> = Arc::new(RipgrepLexicalRetrieval {
             root: worker_cwd.clone(),
         });
-        let evidence_collector = LexicalEvidenceCollector::new(retrieval);
+        let lexical_collector: Arc<LexicalEvidenceCollector<dyn LexicalRetrieval>> =
+            Arc::new(LexicalEvidenceCollector::new(retrieval));
+        let legacy_collector: Arc<dyn EvidenceCollector> = lexical_collector.clone();
+        let composite_collector: Arc<dyn EvidenceCollector> = {
+            let mut c = CompositeEvidenceCollector {
+                graph: None,
+                symbol: None,
+                lexical: Some(lexical_collector.clone()),
+                fts: None,
+                reranker: match retrieval_cfg.mode {
+                    // RRF is the Sprint 4 default reranker when composite
+                    // is selected. Identity stays available as a test
+                    // double but the production knob is RRF.
+                    RetrievalMode::Composite => Arc::new(ReciprocalRankFusion::default()),
+                    RetrievalMode::Legacy => Arc::new(IdentityReranker),
+                },
+                budget: TokenBudget::v2_default(),
+                // Match TurnDriver's ask of 20 so the single-lane
+                // Sprint 4 wiring doesn't silently cap recall below
+                // legacy mode (PR #8 review P1). With one lane wired,
+                // `per_lane_limit` is effectively a global cap — the
+                // per-lane-floor guarantees only matter once multiple
+                // lanes exist (Sprint 7). Sprint 7 can tune this down
+                // when graph+symbol+fts come online and dedupe starts
+                // doing real work.
+                per_lane_limit: 20,
+            };
+            // Only one lane wired in Sprint 4; keep budget ceiling
+            // relaxed so the single lane doesn't hit artificial caps.
+            c.budget.max_tokens = 8192;
+            Arc::new(c)
+        };
+        let evidence_collector: &dyn EvidenceCollector = match retrieval_cfg.mode {
+            RetrievalMode::Legacy => legacy_collector.as_ref(),
+            RetrievalMode::Composite => composite_collector.as_ref(),
+        };
+        tracing::info!(
+            mode = retrieval_cfg.mode.as_str(),
+            "retrieval mode resolved"
+        );
 
         // Stash the last accepted contract from JSONL on startup/resume.
         // The writer tap replays ContractAccepted into the UI, but the
@@ -882,7 +932,7 @@ pub async fn run_app(resume: Option<String>) -> io::Result<()> {
                 kernel: Some(&kernel),
                 validators,
                 effects_consumed: &mut effects_consumed,
-                evidence_collector: Some(&evidence_collector),
+                evidence_collector: Some(evidence_collector),
             };
 
             let result = driver
