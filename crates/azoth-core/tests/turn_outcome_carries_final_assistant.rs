@@ -13,7 +13,7 @@ use azoth_core::adapter::{MockAdapter, MockScript, ProviderProfile};
 use azoth_core::artifacts::ArtifactStore;
 use azoth_core::authority::{ApprovalRequestMsg, CapabilityStore};
 use azoth_core::event_store::JsonlWriter;
-use azoth_core::execution::{CancellationToken, ExecutionContext, ToolDispatcher};
+use azoth_core::execution::{ExecutionContext, ToolDispatcher};
 use azoth_core::schemas::{
     ContentBlock, Message, ModelTurnResponse, RunId, StopReason, TurnId, Usage,
 };
@@ -48,13 +48,13 @@ async fn end_turn_outcome_carries_final_assistant_content() {
 
     let run_id = RunId::from("run_mem".to_string());
     let turn_id = TurnId::from("t_mem".to_string());
-    let ctx = ExecutionContext {
-        run_id: run_id.clone(),
-        turn_id: turn_id.clone(),
-        artifacts: ArtifactStore::open(&artifacts_root).unwrap(),
-        cancellation: CancellationToken::new(),
-        repo_root: dir.path().to_path_buf(),
-    };
+    let ctx = ExecutionContext::builder(
+        run_id.clone(),
+        turn_id.clone(),
+        ArtifactStore::open(&artifacts_root).unwrap(),
+        dir.path().to_path_buf(),
+    )
+    .build();
     let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalRequestMsg>(8);
     let mut caps = CapabilityStore::new();
     let mut effects = azoth_core::schemas::EffectCounter::default();
@@ -134,13 +134,13 @@ async fn contract_max_turns_abort_returns_none_final_assistant() {
 
     let run_id = RunId::from("run_abort".to_string());
     let turn_id = TurnId::from("t_abort".to_string());
-    let ctx = ExecutionContext {
-        run_id: run_id.clone(),
-        turn_id: turn_id.clone(),
-        artifacts: ArtifactStore::open(&artifacts_root).unwrap(),
-        cancellation: CancellationToken::new(),
-        repo_root: dir.path().to_path_buf(),
-    };
+    let ctx = ExecutionContext::builder(
+        run_id.clone(),
+        turn_id.clone(),
+        ArtifactStore::open(&artifacts_root).unwrap(),
+        dir.path().to_path_buf(),
+    )
+    .build();
     let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalRequestMsg>(8);
     let mut caps = CapabilityStore::new();
     let mut effects = azoth_core::schemas::EffectCounter::default();

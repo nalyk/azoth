@@ -73,13 +73,14 @@ async fn cancel_during_flood_writes_turn_interrupted_under_100ms() {
     let run_id = RunId::from("run_flood".to_string());
     let turn_id = TurnId::from("t_flood".to_string());
     let cancellation = CancellationToken::new();
-    let ctx = ExecutionContext {
-        run_id: run_id.clone(),
-        turn_id: turn_id.clone(),
+    let ctx = ExecutionContext::builder(
+        run_id.clone(),
+        turn_id.clone(),
         artifacts,
-        cancellation: cancellation.clone(),
-        repo_root: repo_root.clone(),
-    };
+        repo_root.clone(),
+    )
+    .cancellation(cancellation.clone())
+    .build();
 
     let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalRequestMsg>(8);
     let mut caps = CapabilityStore::new();

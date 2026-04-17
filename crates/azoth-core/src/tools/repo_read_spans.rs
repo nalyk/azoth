@@ -141,20 +141,20 @@ mod tests {
     use super::*;
     use crate::artifacts::ArtifactStore;
     use crate::authority::{Origin, Tainted};
-    use crate::execution::{dispatch_tool, CancellationToken, ExecutionContext, ToolDispatcher};
+    use crate::execution::{dispatch_tool, ExecutionContext, ToolDispatcher};
     use crate::schemas::{RunId, TurnId};
     use tempfile::tempdir;
     use tokio::fs;
 
     fn ctx_for(root: std::path::PathBuf) -> ExecutionContext {
         let artifacts = ArtifactStore::open(root.join(".azoth/artifacts")).unwrap();
-        ExecutionContext {
-            run_id: RunId::from("run_t".to_string()),
-            turn_id: TurnId::from("t_t".to_string()),
+        ExecutionContext::builder(
+            RunId::from("run_t".to_string()),
+            TurnId::from("t_t".to_string()),
             artifacts,
-            cancellation: CancellationToken::new(),
-            repo_root: root,
-        }
+            root,
+        )
+        .build()
     }
 
     #[tokio::test]

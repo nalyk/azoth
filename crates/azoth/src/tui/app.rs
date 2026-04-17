@@ -29,7 +29,7 @@ use azoth_core::artifacts::ArtifactStore;
 use azoth_core::authority::{ApprovalRequestMsg, ApprovalResponse, CapabilityStore};
 use azoth_core::context::LexicalEvidenceCollector;
 use azoth_core::event_store::{JsonlReader, JsonlWriter, SqliteMirror};
-use azoth_core::execution::{CancellationToken, ExecutionContext, ToolDispatcher};
+use azoth_core::execution::{ExecutionContext, ToolDispatcher};
 use azoth_core::retrieval::RipgrepLexicalRetrieval;
 use azoth_core::schemas::{
     ApprovalId, ApprovalScope, CapabilityTokenId, ContentBlock, Contract, ContractId, Message,
@@ -859,13 +859,13 @@ pub async fn run_app(resume: Option<String>) -> io::Result<()> {
             }
 
             let turn_id = TurnId::new();
-            let ctx = ExecutionContext {
-                run_id: worker_run_id.clone(),
-                turn_id: turn_id.clone(),
-                artifacts: artifacts.clone(),
-                cancellation: CancellationToken::new(),
-                repo_root: worker_cwd.clone(),
-            };
+            let ctx = ExecutionContext::builder(
+                worker_run_id.clone(),
+                turn_id.clone(),
+                artifacts.clone(),
+                worker_cwd.clone(),
+            )
+            .build();
 
             history.push(Message::user_text(user_text));
 

@@ -14,7 +14,7 @@ use azoth_core::artifacts::ArtifactStore;
 use azoth_core::authority::{ApprovalRequestMsg, CapabilityStore};
 use azoth_core::contract;
 use azoth_core::event_store::{JsonlReader, JsonlWriter};
-use azoth_core::execution::{CancellationToken, ExecutionContext, ToolDispatcher};
+use azoth_core::execution::{ExecutionContext, ToolDispatcher};
 use azoth_core::schemas::{
     AbortReason, ContentBlock, Contract, Message, ModelTurnResponse, RunId, SessionEvent,
     StopReason, TurnId, Usage, ValidatorStatus,
@@ -73,13 +73,13 @@ async fn drive_with_validators(
     );
     let run_id = RunId::from("run_validators".to_string());
     let turn_id = TurnId::from("t_validators_1".to_string());
-    let ctx = ExecutionContext {
-        run_id: run_id.clone(),
-        turn_id: turn_id.clone(),
+    let ctx = ExecutionContext::builder(
+        run_id.clone(),
+        turn_id.clone(),
         artifacts,
-        cancellation: CancellationToken::new(),
-        repo_root: repo_root.to_path_buf(),
-    };
+        repo_root.to_path_buf(),
+    )
+    .build();
     let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalRequestMsg>(8);
     let mut caps = CapabilityStore::new();
     let mut effects = azoth_core::schemas::EffectCounter::default();

@@ -16,7 +16,7 @@ use azoth_core::authority::{
 };
 use azoth_core::contract;
 use azoth_core::event_store::JsonlWriter;
-use azoth_core::execution::{CancellationToken, ExecutionContext, ToolDispatcher};
+use azoth_core::execution::{ExecutionContext, ToolDispatcher};
 use azoth_core::schemas::{
     AbortReason, ApprovalScope, ContentBlock, Contract, EffectClass, EffectCounter, Message,
     ModelTurnResponse, RunId, SessionEvent, StopReason, ToolUseId, TurnId, Usage,
@@ -93,13 +93,13 @@ async fn over_budget_apply_local_aborts_turn_with_runtime_error() {
     let contract_val = capped_contract("cap apply_local at 1");
     let run_id = RunId::from("run_budget".to_string());
     let turn_id = TurnId::from("t_budget_1".to_string());
-    let ctx = ExecutionContext {
-        run_id: run_id.clone(),
-        turn_id: turn_id.clone(),
+    let ctx = ExecutionContext::builder(
+        run_id.clone(),
+        turn_id.clone(),
         artifacts,
-        cancellation: CancellationToken::new(),
-        repo_root: repo_root.clone(),
-    };
+        repo_root.clone(),
+    )
+    .build();
 
     // Pre-mint a session-scope capability so the driver doesn't stall on
     // approval — the short-circuit we're testing lives BEFORE the authorize
@@ -220,13 +220,13 @@ async fn first_apply_local_under_cap_succeeds_and_bumps_counter() {
     let contract_val = capped_contract("single apply_local allowed");
     let run_id = RunId::from("run_under".to_string());
     let turn_id = TurnId::from("t_under_1".to_string());
-    let ctx = ExecutionContext {
-        run_id: run_id.clone(),
-        turn_id: turn_id.clone(),
+    let ctx = ExecutionContext::builder(
+        run_id.clone(),
+        turn_id.clone(),
         artifacts,
-        cancellation: CancellationToken::new(),
-        repo_root: repo_root.clone(),
-    };
+        repo_root.clone(),
+    )
+    .build();
 
     // Pre-mint the capability so authorize returns Reuse and no approval
     // round-trip is needed to prove the under-cap bump.

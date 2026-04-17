@@ -66,7 +66,47 @@ pub struct ExecutionContext {
     pub repo_root: std::path::PathBuf,
 }
 
+pub struct ExecutionContextBuilder {
+    run_id: RunId,
+    turn_id: TurnId,
+    artifacts: ArtifactStore,
+    repo_root: std::path::PathBuf,
+    cancellation: Option<CancellationToken>,
+}
+
+impl ExecutionContextBuilder {
+    pub fn cancellation(mut self, cancellation: CancellationToken) -> Self {
+        self.cancellation = Some(cancellation);
+        self
+    }
+
+    pub fn build(self) -> ExecutionContext {
+        ExecutionContext {
+            run_id: self.run_id,
+            turn_id: self.turn_id,
+            artifacts: self.artifacts,
+            cancellation: self.cancellation.unwrap_or_default(),
+            repo_root: self.repo_root,
+        }
+    }
+}
+
 impl ExecutionContext {
+    pub fn builder(
+        run_id: RunId,
+        turn_id: TurnId,
+        artifacts: ArtifactStore,
+        repo_root: std::path::PathBuf,
+    ) -> ExecutionContextBuilder {
+        ExecutionContextBuilder {
+            run_id,
+            turn_id,
+            artifacts,
+            repo_root,
+            cancellation: None,
+        }
+    }
+
     pub fn cancelled(&self) -> bool {
         self.cancellation.is_cancelled()
     }

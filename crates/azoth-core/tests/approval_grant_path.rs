@@ -7,7 +7,7 @@ use azoth_core::adapter::{MockAdapter, MockScript, ProviderProfile};
 use azoth_core::artifacts::ArtifactStore;
 use azoth_core::authority::{ApprovalRequestMsg, ApprovalResponse, CapabilityStore};
 use azoth_core::event_store::JsonlWriter;
-use azoth_core::execution::{CancellationToken, ExecutionContext, ToolDispatcher};
+use azoth_core::execution::{ExecutionContext, ToolDispatcher};
 use azoth_core::schemas::{
     AbortReason, ApprovalScope, CommitOutcome, ContentBlock, EffectClass, Message,
     ModelTurnResponse, RunId, SessionEvent, StopReason, ToolUseId, TurnId, Usage,
@@ -81,13 +81,13 @@ async fn drive_with_responder(
 
     let run_id = RunId::from("run_test".to_string());
     let turn_id = TurnId::from("t_test".to_string());
-    let ctx = ExecutionContext {
-        run_id: run_id.clone(),
-        turn_id: turn_id.clone(),
+    let ctx = ExecutionContext::builder(
+        run_id.clone(),
+        turn_id.clone(),
         artifacts,
-        cancellation: CancellationToken::new(),
-        repo_root: repo_root.clone(),
-    };
+        repo_root.clone(),
+    )
+    .build();
 
     let (atx, mut arx) = mpsc::channel::<ApprovalRequestMsg>(8);
     let responder = tokio::spawn(async move {
