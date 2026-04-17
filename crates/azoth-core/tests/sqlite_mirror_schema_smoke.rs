@@ -154,7 +154,10 @@ fn open_rejects_future_schema_version() {
 
     match SqliteMirror::open(&path) {
         Ok(_) => panic!("expected open to fail on future schema version"),
-        Err(MirrorError::Sqlite(_)) => {}
-        Err(other) => panic!("expected Sqlite error, got {other:?}"),
+        Err(MirrorError::UnknownSchema { current, known }) => {
+            assert_eq!(current, 99);
+            assert!(known < current, "known schema must trail future version");
+        }
+        Err(other) => panic!("expected UnknownSchema error, got {other:?}"),
     }
 }

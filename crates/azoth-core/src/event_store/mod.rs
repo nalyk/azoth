@@ -5,6 +5,7 @@
 //! structurally impossible in the model's replayed context.
 
 pub mod jsonl;
+pub(crate) mod migrations;
 pub mod sqlite;
 
 pub use jsonl::{
