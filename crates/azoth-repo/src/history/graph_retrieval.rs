@@ -14,11 +14,19 @@
 //!
 //! The trait's `depth: usize` is interpreted as "BFS radius", so
 //! `depth = 1` returns immediate co-edit neighbors, `depth = 2`
-//! also returns their neighbors, and so on. Each returned neighbor
-//! carries the **highest co-edit weight on any path** back to the
-//! seed node, so multi-hop results rank sensibly (closer, heavier
-//! paths dominate). `limit` bounds the result set, applied after
-//! the full BFS has completed so the strongest neighbors survive.
+//! also returns their neighbors, and so on.
+//!
+//! Each returned neighbor carries the **widest-path strength** on
+//! any path back to the seed: the maximum over all seed → node
+//! paths of the *minimum* edge weight on the path. This is the
+//! classic widest-path (bottleneck) metric — a long chain of tiny
+//! weights can't smuggle itself onto the top of the result list by
+//! riding a single strong last hop. Rationale: co-edit weight is a
+//! correlation strength, so the meaningful strength of a multi-hop
+//! path is bounded by its weakest link.
+//!
+//! `limit` bounds the result set, applied after the full BFS has
+//! completed so the strongest neighbors survive.
 //!
 //! ## Edge weight & direction
 //!
@@ -101,10 +109,14 @@ fn bfs_neighbors(
         )
         .map_err(|e| RetrievalError::Other(format!("prepare neighbor: {e}")))?;
 
-    // best[path] = greatest weight on any visited path back to seed.
+    // best[v] = widest-path strength from seed to v (max over
+    // paths of min edge weight). `INFINITY` on the seed makes the
+    // first hop's `min(best[anchor], edge_weight)` collapse to
+    // `edge_weight`, so depth-1 results match direct-edge weights
+    // exactly (unchanged from the pre-PR-#7-review behavior).
     let mut best: HashMap<String, f32> = HashMap::new();
     let mut frontier: Vec<String> = vec![seed.clone()];
-    best.insert(seed, f32::INFINITY); // seed itself is not a neighbor
+    best.insert(seed, f32::INFINITY); // seed itself is filtered from results below
 
     for _ in 0..depth {
         if frontier.is_empty() {
@@ -112,11 +124,16 @@ fn bfs_neighbors(
         }
         let mut next: Vec<String> = Vec::new();
         for anchor in frontier.drain(..) {
-            for (neighbor, weight) in query_one_hop(&mut stmt, &anchor)? {
+            let anchor_strength = *best.get(&anchor).unwrap_or(&f32::NEG_INFINITY);
+            for (neighbor, edge_weight) in query_one_hop(&mut stmt, &anchor)? {
+                // Widest-path update: the path's strength equals
+                // its weakest link. A long chain cannot surface on
+                // top of a direct edge just because its final hop
+                // happens to be heavy (PR #7 review, codex P1).
+                let path_strength = anchor_strength.min(edge_weight);
                 let entry = best.entry(neighbor.clone()).or_insert(f32::NEG_INFINITY);
-                let improved = weight > *entry;
-                if improved {
-                    *entry = weight;
+                if path_strength > *entry {
+                    *entry = path_strength;
                     next.push(neighbor);
                 }
             }

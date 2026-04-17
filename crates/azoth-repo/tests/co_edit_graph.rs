@@ -248,6 +248,65 @@ async fn depth_2_bfs_reaches_second_hop() {
 }
 
 #[tokio::test]
+async fn bfs_widest_path_not_last_hop() {
+    // PR #7 review (codex P1). Graph:
+    //   seed.rs — A.rs    ×1   (weight 1.0, weak link)
+    //   A.rs    — C.rs    ×10  (weight 10.0, strong link)
+    //   seed.rs — B.rs    ×5   (weight 5.0, direct)
+    //
+    // Pre-fix BFS reported C at 10.0 (only the last hop), which
+    // ranked a weakly-connected transitive neighbor above the direct
+    // neighbor B. Widest-path: C's strength = min(1.0, 10.0) = 1.0,
+    // so at depth=2 the order is B(5.0) > A(1.0) ≈ C(1.0).
+    let td = TempDir::new().unwrap();
+    let repo = td.path();
+    git_init(repo);
+
+    let mut plan: Vec<(&[&str], u32)> = Vec::new();
+    let mut tick = 1u32;
+    let mut push = |p: &mut Vec<(&[&str], u32)>, files: &'static [&'static str], times: usize| {
+        for _ in 0..times {
+            p.push((files, tick));
+            tick += 1;
+        }
+    };
+    push(&mut plan, &["seed.rs", "A.rs"], 1);
+    push(&mut plan, &["A.rs", "C.rs"], 10);
+    push(&mut plan, &["seed.rs", "B.rs"], 5);
+    fast_import(repo, &plan);
+
+    let conn = fresh_mirror(repo);
+    build(&conn, repo, CoEditConfig::default()).unwrap();
+    let graph = CoEditGraphRetrieval::new(conn);
+
+    let hits = graph.neighbors(path_node("seed.rs"), 2, 5).await.unwrap();
+    let by_name: std::collections::HashMap<&str, f32> = hits
+        .iter()
+        .map(|(n, e)| (n.0.strip_prefix("path:").unwrap(), e.weight))
+        .collect();
+
+    assert!(
+        (by_name["B.rs"] - 5.0).abs() < 1e-5,
+        "B direct: {:?}",
+        by_name
+    );
+    assert!(
+        (by_name["A.rs"] - 1.0).abs() < 1e-5,
+        "A direct: {:?}",
+        by_name
+    );
+    assert!(
+        (by_name["C.rs"] - 1.0).abs() < 1e-5,
+        "C via A: weakest link dominates — pre-fix would have said 10.0. got {:?}",
+        by_name
+    );
+    assert!(
+        by_name["B.rs"] > by_name["C.rs"],
+        "direct B must rank above indirect C: {by_name:?}"
+    );
+}
+
+#[tokio::test]
 async fn skip_large_commits_filters_wide_pr() {
     let td = TempDir::new().unwrap();
     let repo = td.path();

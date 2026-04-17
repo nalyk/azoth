@@ -85,38 +85,42 @@ pub struct CoEditBuildStats {
 /// drops from ≈ 90 k string allocations to ≈ 2 k.
 type Accumulator = HashMap<String, HashMap<String, Accum>>;
 
-struct Accum {
-    weight: f32,
+pub(crate) struct Accum {
+    pub(crate) weight: f32,
     /// Commit sha from the newest commit that contributed to this
     /// pair. Newness comes from `git log` order (newest first); we
     /// only set this on first-touch.
-    last_sha: String,
+    pub(crate) last_sha: String,
 }
 
-/// Build the co-edit graph by walking the last `cfg.window` commits
-/// in `repo_root` and writing the aggregate edges into
-/// `co_edit_edges` via the shared mirror connection.
-pub fn build(
-    conn: &Arc<Mutex<Connection>>,
-    repo_root: &Path,
+/// Fold a commit stream into the in-memory pair accumulator. Pulled
+/// out of [`build`] so unit tests can feed hand-crafted `Commit`
+/// streams without having to synthesise a fast-import repo.
+pub(crate) fn accumulate(
+    commits: Vec<git_cli::Commit>,
     cfg: CoEditConfig,
-) -> Result<CoEditBuildStats, CoEditError> {
-    let t0 = Instant::now();
-
-    if !git_cli::is_git_repo(repo_root) {
-        return Err(CoEditError::NotARepo(repo_root.to_path_buf()));
-    }
-
-    let commits = git_cli::recent_commits(repo_root, cfg.window)?;
+) -> (Accumulator, CoEditBuildStats) {
     let mut stats = CoEditBuildStats {
         commits_walked: commits.len() as u32,
         ..Default::default()
     };
-
     let mut pairs: Accumulator = HashMap::new();
     let mut edge_count: u32 = 0;
+
     for commit in commits {
-        let n = commit.files.len();
+        // PR #7 review (codex P2): dedupe BEFORE normalising and
+        // BEFORE the skip_large check. Git can list the same path
+        // twice — renames that collapse to the same name on case-
+        // insensitive filesystems, or pathological `--name-only`
+        // edge cases. Using the raw `commit.files.len()` here
+        // would make `1 / max(1, n-1)` too small (e.g. `[a,a,b]`
+        // emits one edge at 0.5 instead of 1.0) and can also trip
+        // `skip_large_commits` on inflated counts.
+        let mut uniq: Vec<&str> = commit.files.iter().map(String::as_str).collect();
+        uniq.sort_unstable();
+        uniq.dedup();
+        let n = uniq.len();
+
         if cfg.skip_large_commits > 0 && n as u32 > cfg.skip_large_commits {
             stats.commits_skipped_large += 1;
             continue;
@@ -129,14 +133,6 @@ pub fn build(
         }
         stats.commits_contributed += 1;
         let increment = 1.0_f32 / (n as f32 - 1.0).max(1.0);
-
-        // Dedupe within a commit. Git can list the same path twice
-        // if a rename turns into "delete old + add new" under the
-        // same name due to a case-only change on case-insensitive
-        // filesystems.
-        let mut uniq: Vec<&str> = commit.files.iter().map(String::as_str).collect();
-        uniq.sort_unstable();
-        uniq.dedup();
 
         for i in 0..uniq.len() {
             for j in (i + 1)..uniq.len() {
@@ -180,6 +176,25 @@ pub fn build(
     }
 
     stats.edges_written = edge_count;
+    (pairs, stats)
+}
+
+/// Build the co-edit graph by walking the last `cfg.window` commits
+/// in `repo_root` and writing the aggregate edges into
+/// `co_edit_edges` via the shared mirror connection.
+pub fn build(
+    conn: &Arc<Mutex<Connection>>,
+    repo_root: &Path,
+    cfg: CoEditConfig,
+) -> Result<CoEditBuildStats, CoEditError> {
+    let t0 = Instant::now();
+
+    if !git_cli::is_git_repo(repo_root) {
+        return Err(CoEditError::NotARepo(repo_root.to_path_buf()));
+    }
+
+    let commits = git_cli::recent_commits(repo_root, cfg.window)?;
+    let (pairs, mut stats) = accumulate(commits, cfg);
 
     let mut guard = conn.lock().map_err(|_| CoEditError::Poisoned)?;
     let tx = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -205,7 +220,58 @@ pub fn build(
 
 #[cfg(test)]
 mod tests {
+    use super::git_cli::Commit;
     use super::*;
+
+    fn c(sha: &str, files: &[&str]) -> Commit {
+        Commit {
+            sha: sha.to_string(),
+            committed_at: 0,
+            files: files.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    fn pair_weight(pairs: &Accumulator, a: &str, b: &str) -> Option<f32> {
+        let (p, q) = if a < b { (a, b) } else { (b, a) };
+        pairs
+            .get(p)
+            .and_then(|inner| inner.get(q))
+            .map(|a| a.weight)
+    }
+
+    #[test]
+    fn dedupes_before_normalising_weight_formula() {
+        // PR #7 review (codex P2): a commit with files [a, a, b]
+        // must behave like a 2-file commit, emitting one edge of
+        // weight 1.0 — not an inflated 3-file denominator of 0.5.
+        let (pairs, stats) = accumulate(
+            vec![c("s1", &["a.rs", "a.rs", "b.rs"])],
+            CoEditConfig::default(),
+        );
+        assert_eq!(stats.commits_contributed, 1);
+        assert_eq!(stats.edges_written, 1);
+        let w = pair_weight(&pairs, "a.rs", "b.rs").expect("edge present");
+        assert!(
+            (w - 1.0).abs() < 1e-6,
+            "expected weight 1.0 after dedupe, got {w}"
+        );
+    }
+
+    #[test]
+    fn skip_large_commits_uses_deduped_count() {
+        // Pre-PR-#7-review: skip_large=3 + files=[a,a,b] (raw n=3)
+        // would SKIP a 2-file commit. Post-fix: dedupe first, n=2,
+        // commit contributes.
+        let cfg = CoEditConfig {
+            window: 10,
+            skip_large_commits: 3,
+        };
+        let (pairs, stats) = accumulate(vec![c("s1", &["a.rs", "a.rs", "b.rs"])], cfg);
+        assert_eq!(stats.commits_skipped_large, 0);
+        assert_eq!(stats.commits_contributed, 1);
+        assert_eq!(stats.edges_written, 1);
+        assert!(pair_weight(&pairs, "a.rs", "b.rs").is_some());
+    }
 
     #[test]
     fn pair_key_sort_matches_canonical_form() {
