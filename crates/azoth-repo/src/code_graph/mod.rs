@@ -12,5 +12,5 @@
 pub mod index;
 pub mod rust;
 
-pub use index::{replace_symbols_for_path, SqliteSymbolIndex};
-pub use rust::{extract_rust, ExtractError, ExtractedSymbol};
+pub use index::{replace_symbols_for_path, SqliteSymbolIndex, SymbolWriter};
+pub use rust::{extract_rust, rust_parser, ExtractError, ExtractedSymbol};

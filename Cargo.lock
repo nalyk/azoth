@@ -187,9 +187,11 @@ version = "1.5.0"
 dependencies = [
  "async-trait",
  "azoth-core",
+ "hex",
  "ignore",
  "rusqlite",
  "serde",
+ "sha2",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",

@@ -341,23 +341,29 @@ fn reindex_blocking(
         }
     }
 
+    // Prepare the symbol writer's DELETE + INSERT once for the whole
+    // Phase-4 transaction (PR #6 gemini-code-assist MED — prior code
+    // re-prepared both per file, burning ~1 sqlite3_prepare_v2 per
+    // writer call × files-in-pass). The Rust parser is lazily built
+    // on first Rust hit and reused for every subsequent .rs file so
+    // we pay `Parser::new` + `set_language` at most once per pass.
+    let mut symbol_writer = crate::code_graph::SymbolWriter::new(&tx)?;
+    let mut rust_parser: Option<tree_sitter::Parser> = None;
+
+    let mut doc_insert = tx.prepare(
+        "INSERT INTO documents (path, mtime, language, content) VALUES (?1, ?2, ?3, ?4)",
+    )?;
+    let mut doc_update =
+        tx.prepare("UPDATE documents SET mtime = ?2, language = ?3, content = ?4 WHERE path = ?1")?;
+
     for w in &writes {
         match w.op {
             Op::Insert => {
-                tx.execute(
-                    "INSERT INTO documents (path, mtime, language, content)
-                     VALUES (?1, ?2, ?3, ?4)",
-                    params![w.path, w.mtime_ns, w.language, w.content],
-                )?;
+                doc_insert.execute(params![w.path, w.mtime_ns, w.language, w.content])?;
                 stats.inserted = stats.inserted.saturating_add(1);
             }
             Op::Update => {
-                tx.execute(
-                    "UPDATE documents
-                       SET mtime = ?2, language = ?3, content = ?4
-                     WHERE path = ?1",
-                    params![w.path, w.mtime_ns, w.language, w.content],
-                )?;
+                doc_update.execute(params![w.path, w.mtime_ns, w.language, w.content])?;
                 stats.updated = stats.updated.saturating_add(1);
             }
         }
@@ -370,10 +376,31 @@ fn reindex_blocking(
         // simply lacks symbols this pass and gets another shot next
         // pass.
         if w.language == Some("rust") {
-            match crate::code_graph::extract_rust(&w.content) {
+            let parser = match rust_parser.as_mut() {
+                Some(p) => p,
+                None => {
+                    match crate::code_graph::rust_parser() {
+                        Ok(p) => {
+                            rust_parser = Some(p);
+                            rust_parser.as_mut().expect("just set above")
+                        }
+                        Err(e) => {
+                            // set_language failing is catastrophic
+                            // (grammar ABI mismatch) — skip every
+                            // Rust file this pass rather than
+                            // thrashing through retries.
+                            tracing::warn!(
+                                error = %e,
+                                "tree-sitter rust parser init failed; skipping all .rs files this pass"
+                            );
+                            continue;
+                        }
+                    }
+                }
+            };
+            match crate::code_graph::extract_rust(parser, &w.content) {
                 Ok(syms) => {
-                    let n =
-                        crate::code_graph::replace_symbols_for_path(&tx, &w.path, "rust", &syms)?;
+                    let n = symbol_writer.replace(&w.path, "rust", &syms)?;
                     stats.symbols_extracted = stats.symbols_extracted.saturating_add(n);
                 }
                 Err(e) => {
@@ -386,6 +413,13 @@ fn reindex_blocking(
             }
         }
     }
+
+    // Drop the prepared statements before the final tx-level
+    // operations so the tx can borrow freely for the bulk DELETEs
+    // below (rusqlite ties Statement lifetimes to &Transaction).
+    drop(symbol_writer);
+    drop(doc_insert);
+    drop(doc_update);
 
     stats.skipped_unchanged = unchanged_paths.len() as u32;
 

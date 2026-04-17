@@ -23,7 +23,7 @@
 use std::sync::{Arc, Mutex};
 
 use azoth_core::retrieval::{RetrievalError, Symbol, SymbolId, SymbolKind, SymbolRetrieval};
-use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use rusqlite::{params, Connection, OptionalExtension, Statement, Transaction};
 
 use crate::indexer::IndexerError;
 
@@ -142,38 +142,56 @@ fn row_to_symbol(row: &rusqlite::Row<'_>) -> rusqlite::Result<Symbol> {
     })
 }
 
-/// Writer: drop every symbol row for `path` and re-insert the newly
-/// extracted set. Called inside the indexer's Phase-4 transaction so
-/// the documents write and symbol refresh commit atomically together.
-///
-/// Returns the number of rows inserted.
-pub fn replace_symbols_for_path(
-    tx: &Transaction<'_>,
-    path: &str,
-    language: &str,
-    extracted: &[ExtractedSymbol],
-) -> Result<u32, IndexerError> {
-    // ON DELETE CASCADE on parent_id fires *only* if foreign_keys is
-    // enabled for this connection. Our Phase-4 writer doesn't enable
-    // it, so we drop rows top-down and let the flat `path = ?` match
-    // pick up every child too.
-    tx.execute("DELETE FROM symbols WHERE path = ?1", params![path])?;
+/// Transaction-scoped writer that owns the prepared DELETE and INSERT
+/// statements so the Phase-4 loop prepares once per reindex pass, not
+/// once per file (PR #6 gemini-code-assist MED). Construct with
+/// [`SymbolWriter::new`] inside a Phase-4 transaction, then call
+/// [`SymbolWriter::replace`] per affected path.
+pub struct SymbolWriter<'tx> {
+    delete: Statement<'tx>,
+    insert: Statement<'tx>,
+}
 
-    if extracted.is_empty() {
-        return Ok(0);
-    }
-
-    // Map the extractor's positional parent_idx → freshly-assigned
-    // rowid. Parents come before children in the extraction order
-    // (walker pushes self before recursing) so this is a single pass.
-    let mut rowids: Vec<i64> = Vec::with_capacity(extracted.len());
-    let mut inserted: u32 = 0;
-    {
-        let mut stmt = tx.prepare(
+impl<'tx> SymbolWriter<'tx> {
+    pub fn new(tx: &'tx Transaction<'_>) -> Result<Self, IndexerError> {
+        let delete = tx.prepare("DELETE FROM symbols WHERE path = ?1")?;
+        let insert = tx.prepare(
             "INSERT INTO symbols
              (name, kind, path, start_line, end_line, parent_id, language, digest)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         )?;
+        Ok(Self { delete, insert })
+    }
+
+    /// Drop every symbol row for `path` and re-insert the newly
+    /// extracted set. Called inside the owning Phase-4 transaction so
+    /// the documents write and symbol refresh commit atomically
+    /// together. Returns the number of rows inserted.
+    ///
+    /// Statements stay compiled across calls — the single biggest
+    /// cost (`sqlite3_prepare_v2`) runs once in `SymbolWriter::new`.
+    pub fn replace(
+        &mut self,
+        path: &str,
+        language: &str,
+        extracted: &[ExtractedSymbol],
+    ) -> Result<u32, IndexerError> {
+        // ON DELETE CASCADE on parent_id fires *only* if foreign_keys
+        // is enabled for this connection. Our Phase-4 writer doesn't
+        // enable it, so we drop rows top-down and let the flat
+        // `path = ?` match pick up every child too.
+        self.delete.execute(params![path])?;
+
+        if extracted.is_empty() {
+            return Ok(0);
+        }
+
+        // Map the extractor's positional parent_idx → freshly-
+        // assigned rowid. Parents come before children in the
+        // extraction order (walker pushes self before recursing) so
+        // this is a single pass.
+        let mut rowids: Vec<i64> = Vec::with_capacity(extracted.len());
+        let mut inserted: u32 = 0;
         for (i, sym) in extracted.iter().enumerate() {
             let parent_rowid: Option<i64> = match sym.parent_idx {
                 Some(idx) => rowids.get(idx).copied().map(Some).unwrap_or_else(|| {
@@ -186,7 +204,10 @@ pub fn replace_symbols_for_path(
                 }),
                 None => None,
             };
-            stmt.execute(params![
+            // `Statement::insert` executes the INSERT and returns the
+            // new rowid in one call — avoids plumbing a `&Transaction`
+            // just to reach `last_insert_rowid()` on the connection.
+            let rowid = self.insert.insert(params![
                 sym.name,
                 sym.kind.as_str(),
                 path,
@@ -196,11 +217,24 @@ pub fn replace_symbols_for_path(
                 language,
                 sym.digest,
             ])?;
-            rowids.push(tx.last_insert_rowid());
+            rowids.push(rowid);
             inserted += 1;
         }
+        Ok(inserted)
     }
-    Ok(inserted)
+}
+
+/// Back-compat wrapper for one-shot call sites (unit tests). Prepares
+/// a fresh `SymbolWriter` and applies it — one path, one tx. Not the
+/// hot path; the indexer's Phase-4 loop uses the writer directly so
+/// prepare cost amortises across every file.
+pub fn replace_symbols_for_path(
+    tx: &Transaction<'_>,
+    path: &str,
+    language: &str,
+    extracted: &[ExtractedSymbol],
+) -> Result<u32, IndexerError> {
+    SymbolWriter::new(tx)?.replace(path, language, extracted)
 }
 
 #[cfg(test)]

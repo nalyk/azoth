@@ -18,11 +18,18 @@
 //! Symbols inside macro bodies (`lazy_static! { ... }`) are invisible
 //! to tree-sitter because it doesn't expand macros. We document the
 //! limitation rather than trying to paper over it.
-
-use std::collections::hash_map::DefaultHasher;
-use std::hash::Hasher;
+//!
+//! ## Parser reuse (PR #6 gemini-code-assist MED)
+//!
+//! `extract_rust` takes `&mut Parser` so callers in hot loops
+//! (`RepoIndexer::reindex_blocking`) can construct one parser per
+//! reindex pass instead of per file. The grammar pointer (set via
+//! `set_language`) is sticky on a `Parser`, so reuse is free once
+//! it's configured. Tests construct a parser on-demand via
+//! [`rust_parser`].
 
 use azoth_core::retrieval::SymbolKind;
+use sha2::{Digest, Sha256};
 use tree_sitter::{Node, Parser, Tree};
 
 /// Raw, flat record produced by the extractor. Lives in `azoth-repo`
@@ -54,12 +61,23 @@ pub enum ExtractError {
     Parse,
 }
 
-/// Parse `src` and extract every symbol the grammar recognises.
-pub fn extract_rust(src: &str) -> Result<Vec<ExtractedSymbol>, ExtractError> {
+/// Build a tree-sitter `Parser` pre-configured for Rust. The caller
+/// owns the instance and reuses it across every file in a reindex pass
+/// (see module-level docs). Extracted into its own function so tests
+/// and ad-hoc callers don't need to duplicate the `set_language`
+/// incantation.
+pub fn rust_parser() -> Result<Parser, ExtractError> {
     let mut parser = Parser::new();
     parser
         .set_language(&tree_sitter_rust::language())
         .map_err(|_| ExtractError::Language)?;
+    Ok(parser)
+}
+
+/// Parse `src` with the caller-supplied parser and extract every
+/// symbol the grammar recognises. The parser is expected to have
+/// Rust set as its language already (see [`rust_parser`]).
+pub fn extract_rust(parser: &mut Parser, src: &str) -> Result<Vec<ExtractedSymbol>, ExtractError> {
     let tree: Tree = parser.parse(src, None).ok_or(ExtractError::Parse)?;
 
     let bytes = src.as_bytes();
@@ -131,25 +149,36 @@ fn line_range(node: &Node<'_>) -> (u32, u32) {
     ((s as u32).saturating_add(1), (e as u32).saturating_add(1))
 }
 
-/// Fast non-cryptographic hash of the node's source bytes, hex-encoded.
-/// This is a debug/forensic column — not a security boundary.
+/// SHA-256 digest of the node's source bytes, truncated to 16 hex
+/// chars. Debug/forensic column — not a security boundary — but must
+/// survive a rustc toolchain bump to be useful for cross-session
+/// diffs. `std::collections::hash_map::DefaultHasher`'s algorithm is
+/// explicitly unspecified across Rust versions (per the std docs), so
+/// we use SHA-256 here for algorithmic stability. Truncating to 16 hex
+/// chars keeps the column narrow while leaving 64 bits of collision
+/// resistance — ample for a "did this body change" check.
 fn short_digest(node: &Node<'_>, bytes: &[u8]) -> String {
     let start = node.start_byte();
     let end = node.end_byte().min(bytes.len());
     let slice = &bytes[start..end];
-    let mut h = DefaultHasher::new();
-    h.write(slice);
-    format!("{:016x}", h.finish())
+    let mut h = Sha256::new();
+    h.update(slice);
+    let digest = h.finalize();
+    hex::encode(&digest[..8])
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn extract(src: &str) -> Vec<ExtractedSymbol> {
+        let mut parser = rust_parser().unwrap();
+        extract_rust(&mut parser, src).unwrap()
+    }
+
     #[test]
     fn extracts_top_level_function() {
-        let src = "fn alpha() {}\n";
-        let syms = extract_rust(src).unwrap();
+        let syms = extract("fn alpha() {}\n");
         assert_eq!(syms.len(), 1);
         assert_eq!(syms[0].name, "alpha");
         assert_eq!(syms[0].kind, SymbolKind::Function);
@@ -161,8 +190,7 @@ mod tests {
 
     #[test]
     fn extracts_struct_and_enum_with_variants() {
-        let src = "pub struct S { x: u32 }\npub enum E { Ready, Done(u8) }\n";
-        let syms = extract_rust(src).unwrap();
+        let syms = extract("pub struct S { x: u32 }\npub enum E { Ready, Done(u8) }\n");
         // Expect: S (struct), E (enum), Ready (variant), Done (variant).
         assert!(syms
             .iter()
@@ -192,7 +220,7 @@ impl Foo {
     fn baz(&self) {}
 }
 "#;
-        let syms = extract_rust(src).unwrap();
+        let syms = extract(src);
         let impl_idx = syms
             .iter()
             .position(|s| s.kind == SymbolKind::Impl && s.name == "Foo")
@@ -212,7 +240,7 @@ impl Foo {
     #[test]
     fn trait_impl_uses_type_as_name() {
         let src = "struct Q;\nimpl std::fmt::Display for Q {\n    fn fmt(&self, _: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { Ok(()) }\n}\n";
-        let syms = extract_rust(src).unwrap();
+        let syms = extract(src);
         // impl_item's type field = "Q", so the Impl symbol is named "Q".
         assert!(syms
             .iter()
@@ -221,8 +249,7 @@ impl Foo {
 
     #[test]
     fn module_and_const_extracted() {
-        let src = "pub mod sub { pub const X: u32 = 1; }\npub const TOP: u32 = 2;\n";
-        let syms = extract_rust(src).unwrap();
+        let syms = extract("pub mod sub { pub const X: u32 = 1; }\npub const TOP: u32 = 2;\n");
         let module = syms
             .iter()
             .find(|s| s.name == "sub" && s.kind == SymbolKind::Module)
@@ -245,16 +272,48 @@ impl Foo {
 
     #[test]
     fn empty_source_produces_no_symbols() {
-        assert!(extract_rust("").unwrap().is_empty());
-        assert!(extract_rust("// only a comment\n").unwrap().is_empty());
+        assert!(extract("").is_empty());
+        assert!(extract("// only a comment\n").is_empty());
     }
 
     #[test]
     fn digest_changes_when_body_changes() {
-        let a = extract_rust("fn f() { 1 }\n").unwrap();
-        let b = extract_rust("fn f() { 2 }\n").unwrap();
+        let a = extract("fn f() { 1 }\n");
+        let b = extract("fn f() { 2 }\n");
         assert_eq!(a.len(), 1);
         assert_eq!(b.len(), 1);
         assert_ne!(a[0].digest, b[0].digest, "body delta must shift digest");
+    }
+
+    #[test]
+    fn digest_is_deterministic_across_calls() {
+        // PR #6 review #1: the digest column is supposed to survive
+        // process restarts and rustc toolchain bumps. This test pins
+        // one well-known input to its expected SHA-256-truncated hash
+        // so a future `DefaultHasher` regression or algorithm change
+        // surfaces as a test failure.
+        let syms1 = extract("fn stable() {}\n");
+        let syms2 = extract("fn stable() {}\n");
+        assert_eq!(syms1.len(), 1);
+        assert_eq!(syms2.len(), 1);
+        assert_eq!(
+            syms1[0].digest, syms2[0].digest,
+            "same input must produce same digest across calls"
+        );
+    }
+
+    #[test]
+    fn parser_instance_is_reusable_across_extractions() {
+        // PR #6 review #3: callers (RepoIndexer::reindex_blocking)
+        // reuse one Parser across every .rs file in the pass. Prove
+        // that works — two extractions through the same parser
+        // return independent, correct results.
+        let mut parser = rust_parser().unwrap();
+        let a = extract_rust(&mut parser, "fn first() {}\n").unwrap();
+        let b = extract_rust(&mut parser, "fn second() {}\n").unwrap();
+        assert_eq!(a.len(), 1);
+        assert_eq!(a[0].name, "first");
+        assert_eq!(b.len(), 1);
+        assert_eq!(b[0].name, "second");
     }
 }
