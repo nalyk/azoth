@@ -134,6 +134,21 @@ impl SqliteMirror {
                 // TestPlan::is_well_formed.
                 self.upsert_impact(turn_id, ran_at, selected_tests, rationale, confidence)?;
             }
+            SessionEvent::EvalSampled {
+                turn_id,
+                metric,
+                value,
+                k,
+                sampled_at,
+                task_id,
+            } => {
+                // Sprint 6: eval_runs mirror. Identical fallback
+                // discipline to m0005's ran_at: a pre-review emitter
+                // that omits `sampled_at` still lands under a sentinel
+                // so the NOT NULL column is honoured.
+                let run_id = self.run_id_for_upsert();
+                self.upsert_eval(&run_id, turn_id, metric, *value, *k, task_id, sampled_at)?;
+            }
             _ => {}
         }
         Ok(())
@@ -185,6 +200,47 @@ impl SqliteMirror {
                 ts,
             ])?;
         }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn upsert_eval(
+        &self,
+        run_id: &str,
+        turn_id: &TurnId,
+        metric: &str,
+        value: f64,
+        k: u32,
+        task_id: &str,
+        sampled_at: &str,
+    ) -> Result<(), MirrorError> {
+        // `sampled_at` is NOT NULL in m0006; fall back to the same
+        // epoch sentinel m0005 uses for pre-review emitters.
+        let ts = if sampled_at.is_empty() {
+            "1970-01-01T00:00:00Z"
+        } else {
+            sampled_at
+        };
+        self.conn.execute(
+            r#"
+            INSERT INTO eval_runs (
+                run_id, turn_id, metric, value, k, task_id, sampled_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            ON CONFLICT(run_id, turn_id, metric, task_id) DO UPDATE SET
+                value = excluded.value,
+                k = excluded.k,
+                sampled_at = excluded.sampled_at
+            "#,
+            params![
+                run_id,
+                turn_id.as_str(),
+                metric,
+                value,
+                k as i64,
+                task_id,
+                ts,
+            ],
+        )?;
         Ok(())
     }
 
@@ -246,6 +302,9 @@ impl SqliteMirror {
         // insert rows from every ImpactComputed event in the
         // forensic projection.
         self.conn.execute("DELETE FROM test_impact", [])?;
+        // Sprint 6: same truncate-then-reapply discipline for the
+        // eval_runs mirror.
+        self.conn.execute("DELETE FROM eval_runs", [])?;
         self.current_run = None;
         // Forensic projection includes aborted turns; replayable would
         // drop them, and those are exactly the terminal-negative rows we
@@ -262,6 +321,15 @@ impl SqliteMirror {
         let n: i64 = self
             .conn
             .query_row("SELECT COUNT(*) FROM test_impact", [], |r| r.get(0))?;
+        Ok(n)
+    }
+
+    /// Count rows in the `eval_runs` mirror — exposed for tests and
+    /// the `azoth eval run` reporter.
+    pub fn eval_row_count(&self) -> Result<i64, MirrorError> {
+        let n: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM eval_runs", [], |r| r.get(0))?;
         Ok(n)
     }
 
@@ -370,6 +438,147 @@ mod tests {
             rationale: rationale.iter().map(|s| s.to_string()).collect(),
             confidence: confidence.to_vec(),
         }
+    }
+
+    fn eval_sampled(
+        tid: &str,
+        metric: &str,
+        value: f64,
+        k: u32,
+        sampled_at: &str,
+        task_id: &str,
+    ) -> SessionEvent {
+        SessionEvent::EvalSampled {
+            turn_id: TurnId::from(tid.to_string()),
+            metric: metric.to_string(),
+            value,
+            k,
+            sampled_at: sampled_at.to_string(),
+            task_id: task_id.to_string(),
+        }
+    }
+
+    #[test]
+    fn mirror_projects_eval_sampled_into_eval_runs() {
+        // Sprint 6: seed-sweep rows (non-empty task_id) and turn-
+        // embedded rows (empty task_id) both land, and per-
+        // (run, turn, metric, task_id) upsert is idempotent.
+        let mut m = SqliteMirror::open_in_memory().unwrap();
+        m.apply(&run_started("run_eval")).unwrap();
+        m.apply(&turn_started("run_eval", "t_eval")).unwrap();
+        m.apply(&eval_sampled(
+            "t_eval",
+            "localization_precision_at_k",
+            0.8,
+            5,
+            "2026-04-17T15:00:00Z",
+            "loc01",
+        ))
+        .unwrap();
+        m.apply(&eval_sampled(
+            "t_eval",
+            "localization_precision_at_k",
+            0.6,
+            5,
+            "2026-04-17T15:00:00Z",
+            "loc02",
+        ))
+        .unwrap();
+        m.apply(&eval_sampled(
+            "t_eval",
+            "regression_rate",
+            0.0,
+            0,
+            "2026-04-17T15:00:01Z",
+            "", // turn-embedded signal
+        ))
+        .unwrap();
+
+        assert_eq!(m.eval_row_count().unwrap(), 3);
+
+        // Replay of the same (run, turn, metric, task_id) tuple must
+        // update-in-place, not double-count — mirrors the
+        // ImpactComputed upsert guarantee.
+        m.apply(&eval_sampled(
+            "t_eval",
+            "localization_precision_at_k",
+            1.0,
+            5,
+            "2026-04-17T16:00:00Z",
+            "loc01",
+        ))
+        .unwrap();
+        assert_eq!(m.eval_row_count().unwrap(), 3);
+
+        let (run_id, val, k, ts): (String, f64, i64, String) = m
+            .conn
+            .query_row(
+                "SELECT run_id, value, k, sampled_at FROM eval_runs \
+                 WHERE turn_id = ?1 AND metric = ?2 AND task_id = ?3",
+                params!["t_eval", "localization_precision_at_k", "loc01"],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(run_id, "run_eval");
+        assert!((val - 1.0).abs() < 1e-9);
+        assert_eq!(k, 5);
+        assert_eq!(ts, "2026-04-17T16:00:00Z");
+    }
+
+    #[test]
+    fn mirror_eval_runs_fallback_sampled_at_on_empty() {
+        // Pre-review fixtures may omit `sampled_at`. m0006 defines the
+        // column as NOT NULL — the projector backfills with the same
+        // epoch sentinel m0005's `upsert_impact` uses.
+        let mut m = SqliteMirror::open_in_memory().unwrap();
+        m.apply(&run_started("run_eval_b")).unwrap();
+        m.apply(&eval_sampled(
+            "t_b",
+            "localization_precision_at_k",
+            0.5,
+            5,
+            "",
+            "x",
+        ))
+        .unwrap();
+        let ts: String = m
+            .conn
+            .query_row(
+                "SELECT sampled_at FROM eval_runs WHERE turn_id = ?1",
+                params!["t_b"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(ts, "1970-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn mirror_rebuild_wipes_eval_runs_before_reapply() {
+        // Sprint 6 parity with m0005: rebuild_from truncates eval_runs
+        // so back-to-back rebuilds converge instead of accumulating.
+        let dir = tempdir().unwrap();
+        let session_path = dir.path().join("s.jsonl");
+        let mut w = JsonlWriter::open(&session_path).unwrap();
+        w.append(&run_started("run_eval_c")).unwrap();
+        w.append(&turn_started("run_eval_c", "t_c")).unwrap();
+        w.append(&eval_sampled(
+            "t_c",
+            "localization_precision_at_k",
+            0.75,
+            5,
+            "2026-04-17T17:00:00Z",
+            "seed01",
+        ))
+        .unwrap();
+        w.append(&committed("t_c", 1, 1)).unwrap();
+        drop(w);
+
+        let mut m = SqliteMirror::open(dir.path().join("mirror.sqlite")).unwrap();
+        let reader = JsonlReader::open(&session_path);
+        m.rebuild_from(&reader).unwrap();
+        assert_eq!(m.eval_row_count().unwrap(), 1);
+        m.rebuild_from(&reader).unwrap();
+        assert_eq!(m.eval_row_count().unwrap(), 1);
     }
 
     #[test]
@@ -595,8 +804,8 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(
-            v, 5,
-            "Sprint 5 ships m0005 (test_impact) on top of m0004 (co_edit_edges) on top of m0003 (symbols) on top of m0002 (FTS) on top of m0001 (turns)"
+            v, 6,
+            "Sprint 6 ships m0006 (eval_runs) on top of m0005 (test_impact) / m0004 (co_edit_edges) / m0003 (symbols) / m0002 (FTS) / m0001 (turns)"
         );
     }
 }

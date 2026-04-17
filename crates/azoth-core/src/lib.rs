@@ -15,6 +15,7 @@ pub mod artifacts;
 pub mod authority;
 pub mod context;
 pub mod contract;
+pub mod eval;
 pub mod event_store;
 pub mod execution;
 pub mod impact;
