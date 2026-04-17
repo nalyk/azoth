@@ -281,14 +281,16 @@ fn write_event_line<W: std::io::Write>(
             selector_version,
             changed_files,
             selected_tests,
+            ran_at,
             ..
         } => writeln!(
             out,
-            "{prefix}{turn} impact_computed  selector={}@v{} changed={} selected={}",
+            "{prefix}{turn} impact_computed  selector={}@v{} changed={} selected={} ran_at={}",
             selector,
             selector_version,
             changed_files.len(),
-            selected_tests.len()
+            selected_tests.len(),
+            if ran_at.is_empty() { "-" } else { ran_at }
         ),
     }
 }

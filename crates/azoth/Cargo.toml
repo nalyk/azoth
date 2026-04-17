@@ -14,6 +14,11 @@ tui = ["dep:ratatui", "dep:crossterm", "dep:tui-textarea"]
 
 [dependencies]
 azoth-core = { path = "../azoth-core" }
+# Sprint 5 TDAD — the TUI worker instantiates concrete
+# `CargoTestImpact` + `GitStatusDiffSource` when
+# `AZOTH_IMPACT_ENABLED=true`; azoth-repo houses the real impls so
+# azoth-core stays dep-thin.
+azoth-repo = { path = "../azoth-repo" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }

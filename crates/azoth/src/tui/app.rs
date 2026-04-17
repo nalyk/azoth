@@ -33,6 +33,7 @@ use azoth_core::context::{
 };
 use azoth_core::event_store::{JsonlReader, JsonlWriter, SqliteMirror};
 use azoth_core::execution::{ExecutionContext, ToolDispatcher};
+use azoth_core::impact::{DiffSource, ImpactConfig, ImpactSelector};
 use azoth_core::retrieval::{
     LexicalRetrieval, RetrievalConfig, RetrievalMode, RipgrepLexicalRetrieval,
 };
@@ -44,7 +45,9 @@ use azoth_core::tools::{
     BashTool, FsWriteTool, RepoReadFileTool, RepoReadSpansTool, RepoSearchTool,
 };
 use azoth_core::turn::TurnDriver;
-use azoth_core::validators::{ContractGoalValidator, Validator};
+use azoth_core::validators::{
+    ContractGoalValidator, ImpactValidator, SelectorBackedImpactValidator, Validator,
+};
 
 use super::input::SlashCommand;
 use super::render;
@@ -750,6 +753,51 @@ pub async fn run_app(resume: Option<String>) -> io::Result<()> {
             "retrieval mode resolved"
         );
 
+        // Sprint 5 TDAD — opt-in impact selection. PR #9 codex P1:
+        // the TUI worker used to hard-code `impact_validators: &[]`
+        // and `diff_source: None`, which made the whole pipeline
+        // unreachable outside tests. When `AZOTH_IMPACT_ENABLED=true`
+        // we now construct a concrete selector + diff source at
+        // worker startup — `CargoTestImpact::discover` shells out
+        // to `cargo test --no-run` once, then the selector reuses
+        // the universe for every turn. Default stays `false` through
+        // v2 ship (plan-only); Sprint 7 will flip the default along
+        // with `retrieval.lexical_backend` and `retrieval.mode`.
+        let impact_cfg = ImpactConfig::from_env();
+        let (impact_selector, diff_source_opt): (
+            Option<Arc<SelectorBackedImpactValidator>>,
+            Option<Arc<azoth_repo::GitStatusDiffSource>>,
+        ) = if impact_cfg.enabled {
+            match azoth_repo::CargoTestImpact::discover(worker_cwd.clone()).await {
+                Ok(sel) => {
+                    tracing::info!(
+                        universe_size = sel.universe().len(),
+                        "impact selector ready"
+                    );
+                    let sel: Arc<dyn ImpactSelector> = Arc::new(sel);
+                    let validator =
+                        Arc::new(SelectorBackedImpactValidator::new("impact:cargo_test", sel));
+                    let src = Arc::new(azoth_repo::GitStatusDiffSource::new(worker_cwd.clone()));
+                    (Some(validator), Some(src))
+                }
+                Err(e) => {
+                    // Discovery failure is non-fatal — log loudly
+                    // and fall back to a no-op pipeline so a broken
+                    // workspace doesn't prevent `azoth` from booting.
+                    // The empty slice keeps the validate phase
+                    // byte-identical to pre-Sprint-5.
+                    tracing::warn!(
+                        error = %e,
+                        "impact enabled but cargo discovery failed; pipeline disabled for this session"
+                    );
+                    (None, None)
+                }
+            }
+        } else {
+            (None, None)
+        };
+        tracing::info!(enabled = impact_cfg.enabled, "impact pipeline resolved");
+
         // Stash the last accepted contract from JSONL on startup/resume.
         // The writer tap replays ContractAccepted into the UI, but the
         // driver needs its own handle — the tap is one-way and never
@@ -919,6 +967,19 @@ pub async fn run_app(resume: Option<String>) -> io::Result<()> {
 
             history.push(Message::user_text(user_text));
 
+            // Materialise the TurnDriver's impact slice + diff ref
+            // from the Arc-owned handles each turn. The references
+            // live only for this `drive_turn` call; the Arcs own
+            // the underlying objects across turns. `Option::as_slice`
+            // gives us the single-or-zero element view without an
+            // allocation — clippy idiom.
+            let iv_opt: Option<&dyn ImpactValidator> = impact_selector
+                .as_deref()
+                .map(|v| v as &dyn ImpactValidator);
+            let iv_slice: &[&dyn ImpactValidator] = iv_opt.as_slice();
+            let diff_source_ref: Option<&dyn DiffSource> =
+                diff_source_opt.as_deref().map(|s| s as &dyn DiffSource);
+
             let mut driver = TurnDriver {
                 run_id: worker_run_id.clone(),
                 adapter: adapter.as_ref(),
@@ -933,8 +994,16 @@ pub async fn run_app(resume: Option<String>) -> io::Result<()> {
                 validators,
                 effects_consumed: &mut effects_consumed,
                 evidence_collector: Some(evidence_collector),
-                impact_validators: &[],
-                diff_source: None,
+                // Bind the impact validator slice at each turn —
+                // `impact_selector` owns the `Arc`, we hand out a
+                // reference-slice that lives for this `drive_turn`
+                // call only. Empty slice when the knob is off or
+                // discovery failed, matching pre-Sprint-5 wire
+                // shape. No unsafe: the `Arc` outlives the borrow
+                // by construction (it's held in the enclosing
+                // worker task).
+                impact_validators: iv_slice,
+                diff_source: diff_source_ref,
             };
 
             let result = driver

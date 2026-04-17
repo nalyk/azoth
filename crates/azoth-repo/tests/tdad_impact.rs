@@ -24,7 +24,7 @@ use azoth_core::schemas::{Contract, ContractId, EffectBudget, Scope, ValidatorSt
 use azoth_core::validators::{ImpactValidator, SelectorBackedImpactValidator};
 use azoth_repo::history::{build, CoEditGraphRetrieval};
 use azoth_repo::impact::{
-    parse_porcelain_for_tests, CargoTestImpact, GitStatusDiffSource, TestUniverse,
+    parse_porcelain_z_for_tests, CargoTestImpact, GitStatusDiffSource, TestUniverse,
 };
 use rusqlite::Connection;
 use tempfile::TempDir;
@@ -306,15 +306,15 @@ async fn git_status_diff_source_reports_working_tree_changes() {
     assert_eq!(src.name(), "git_status");
 }
 
-/// Regression guard: the porcelain parser must tolerate the exact
-/// wire shape `git status --porcelain=v1` emits, including rename
-/// `old -> new` lines and quoted paths with spaces. Kept here (not
-/// in the unit module) so this test survives a refactor that moves
-/// the parser's visibility.
+/// Regression guard: the `-z` porcelain parser must tolerate the
+/// exact wire shape `git status --porcelain -z` emits, including
+/// rename pairs (two NUL-terminated tokens per logical rename) and
+/// untracked files. Kept here (not in the unit module) so this test
+/// survives a refactor that moves the parser's visibility.
 #[test]
-fn porcelain_parser_tolerates_rename_and_untracked() {
-    let txt = " M src/a.rs\nR  src/old.rs -> src/new.rs\n?? src/fresh.rs\n";
-    let d = parse_porcelain_for_tests(txt);
+fn porcelain_z_parser_tolerates_rename_and_untracked() {
+    let bytes = b" M src/a.rs\0R  src/new.rs\0src/old.rs\0?? src/fresh.rs\0";
+    let d = parse_porcelain_z_for_tests(bytes);
     assert_eq!(
         d.changed_files,
         vec!["src/a.rs", "src/new.rs", "src/fresh.rs"]

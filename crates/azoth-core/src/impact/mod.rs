@@ -7,6 +7,9 @@
 //! `TestPlan` — the ordered list of tests the runtime would schedule
 //! under a real `TestRunner` (runner impl is deferred to v2.1).
 //!
+//! The runtime-level `ImpactConfig` knob lives in [`config`] and
+//! defaults to `enabled = false` (plan-only); Sprint 7 flips it on.
+//!
 //! Why a new trait family rather than extending `Validator`:
 //! - `Validator::check(&Contract) -> ValidatorReport` is synchronous
 //!   and pure-contract. Impact selection needs `async` to shell out
@@ -21,7 +24,9 @@
 //! The concrete `CargoTestImpact` lives in `azoth-repo` so
 //! `azoth-core` stays free of tree-sitter, sqlite, and git deps.
 
+pub mod config;
 pub use crate::schemas::{Diff, TestId, TestPlan};
+pub use config::ImpactConfig;
 
 use crate::schemas::Contract;
 use async_trait::async_trait;

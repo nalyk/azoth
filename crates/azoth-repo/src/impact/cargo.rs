@@ -235,11 +235,16 @@ pub fn select_impacted_tests(
 /// plain-text format emitted by libtest on stable — `--format=json`
 /// is nightly-only, not an acceptable v2 dep.
 ///
-/// Returns `ImpactError::CargoMetadata` on non-zero cargo exit so
-/// the `ImpactValidator` can report the failure instead of
+/// Returns `ImpactError::CargoMetadata` (compile phase) or
+/// `ImpactError::TestDiscovery` (list phase) on non-zero cargo exit
+/// so the `ImpactValidator` can report the failure instead of
 /// silently producing an empty plan (an empty plan looks the same
 /// as "no impact" on the wire — we want the failure to be
 /// distinguishable).
+///
+/// PR #9 gemini MED: cargo stderr is captured (truncated to 4KB) and
+/// folded into the error detail so a failure on a large workspace
+/// produces a diagnosable message instead of a bare exit code.
 pub async fn discover_cargo_tests(repo_root: &Path) -> Result<TestUniverse, ImpactError> {
     let compile = Command::new("cargo")
         .arg("test")
@@ -248,13 +253,15 @@ pub async fn discover_cargo_tests(repo_root: &Path) -> Result<TestUniverse, Impa
         .arg("-q")
         .current_dir(repo_root)
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
+        .stderr(Stdio::piped())
+        .output()
         .await
         .map_err(|e| ImpactError::CargoMetadata(format!("cargo --no-run spawn: {e}")))?;
-    if !compile.success() {
+    if !compile.status.success() {
         return Err(ImpactError::CargoMetadata(format!(
-            "cargo test --no-run failed ({compile})"
+            "cargo test --no-run failed ({status}): {stderr}",
+            status = compile.status,
+            stderr = truncate_stderr(&compile.stderr)
         )));
     }
 
@@ -265,19 +272,47 @@ pub async fn discover_cargo_tests(repo_root: &Path) -> Result<TestUniverse, Impa
         .arg("--")
         .arg("--list")
         .current_dir(repo_root)
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .output()
         .await
         .map_err(|e| ImpactError::TestDiscovery(format!("cargo --list spawn: {e}")))?;
     if !list.status.success() {
         return Err(ImpactError::TestDiscovery(format!(
-            "cargo test -- --list failed ({})",
-            list.status
+            "cargo test -- --list failed ({status}): {stderr}",
+            status = list.status,
+            stderr = truncate_stderr(&list.stderr)
         )));
     }
 
     let text = String::from_utf8_lossy(&list.stdout);
     Ok(parse_cargo_list(&text))
+}
+
+/// Render captured stderr bytes for inclusion in an `ImpactError`
+/// detail string. UTF-8 is lossy-decoded so a binary accident never
+/// crashes the error path; output is capped at `MAX_STDERR_BYTES`
+/// with an explicit truncation marker so users can tell when the
+/// upstream message is longer than what they see.
+const MAX_STDERR_BYTES: usize = 4096;
+
+fn truncate_stderr(bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    let trimmed = text.trim();
+    if trimmed.len() <= MAX_STDERR_BYTES {
+        trimmed.to_string()
+    } else {
+        let cutoff = trimmed
+            .char_indices()
+            .take_while(|(i, _)| *i < MAX_STDERR_BYTES)
+            .last()
+            .map(|(i, c)| i + c.len_utf8())
+            .unwrap_or(0);
+        format!(
+            "{head}…[truncated {more} bytes]",
+            head = &trimmed[..cutoff],
+            more = trimmed.len() - cutoff
+        )
+    }
 }
 
 /// Pure parser for `cargo test -- --list` plain-text output.
@@ -348,6 +383,32 @@ mod tests {
         let u = parse_cargo_list(out);
         assert_eq!(u.len(), 1);
         assert_eq!(u.tests[0].as_str(), "azoth::a::b");
+    }
+
+    #[test]
+    fn truncate_stderr_folds_small_output_intact() {
+        let out = "error[E0425]: cannot find value `x`\n   --> src/lib.rs:1:1\n";
+        let rendered = truncate_stderr(out.as_bytes());
+        assert!(rendered.contains("error[E0425]"), "{rendered}");
+        assert!(!rendered.contains("[truncated"), "{rendered}");
+    }
+
+    #[test]
+    fn truncate_stderr_caps_massive_output_with_marker() {
+        let big = "x".repeat(MAX_STDERR_BYTES + 500);
+        let rendered = truncate_stderr(big.as_bytes());
+        assert!(rendered.contains("[truncated"), "{rendered}");
+        assert!(rendered.len() <= MAX_STDERR_BYTES + 64); // 64 = marker slack
+    }
+
+    #[test]
+    fn truncate_stderr_handles_invalid_utf8_without_panicking() {
+        // PR #9 gemini MED: lossy-decode so binary stderr (e.g. a
+        // linker that dumped raw bytes) never crashes the error
+        // path — the reason this sits at a system boundary.
+        let bytes = vec![0xff, 0xfe, 0xfd, b'\n', b'o', b'k'];
+        let rendered = truncate_stderr(&bytes);
+        assert!(rendered.contains("ok"), "{rendered}");
     }
 
     #[test]

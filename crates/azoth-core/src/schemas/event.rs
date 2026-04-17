@@ -181,18 +181,48 @@ pub enum SessionEvent {
     /// names the concrete impl (`cargo_test`, future `pytest`,
     /// `jest`, `go_test`), and `selector_version` bumps on heuristic
     /// changes so replay can detect plan drift without re-running.
+    ///
+    /// `rationale` and `confidence` mirror the selector's per-test
+    /// provenance from `TestPlan`, positionally aligned with
+    /// `selected_tests`. They let the SQLite `test_impact` mirror
+    /// populate its `selected_because` / `confidence` columns without
+    /// re-running the selector, and preserve forensic detail
+    /// (PR #9 codex P2: plan payload would otherwise be dropped).
+    ///
+    /// `ran_at` is the ISO-8601 UTC timestamp captured when the
+    /// validator emitted the plan. Required because the `test_impact`
+    /// table defines `ran_at` as `NOT NULL` (m0005) — without it the
+    /// mirror cannot insert a consistent row (PR #9 gemini HIGH).
+    ///
     /// All non-essential fields carry `#[serde(default)]` for
-    /// forward-compat: older binaries can tolerate future extensions.
+    /// forward-compat: older binaries tolerate future extensions, and
+    /// the vec fields use `skip_serializing_if = Vec::is_empty` so
+    /// pre-Sprint-5 JSONL byte shape stays cache-prefix-stable.
     ImpactComputed {
         turn_id: TurnId,
         #[serde(default)]
         selector: String,
         #[serde(default)]
         selector_version: u32,
-        #[serde(default)]
+        /// ISO-8601 UTC wall-clock at emit time. Empty only for
+        /// forward-compat fixtures that predate this field; real
+        /// writers MUST populate it.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        ran_at: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
         changed_files: Vec<String>,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
         selected_tests: Vec<String>,
+        /// Positionally aligned with `selected_tests`: `rationale[i]`
+        /// explains why `selected_tests[i]` was picked. Empty when
+        /// the selector returned no rationale — older writers, or
+        /// a future minimal writer.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        rationale: Vec<String>,
+        /// Positionally aligned with `selected_tests`. Empty when the
+        /// selector produced no confidence scores.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        confidence: Vec<f32>,
     },
 }
 
@@ -315,18 +345,24 @@ mod tests {
             turn_id: TurnId::from("t_77".to_string()),
             selector: "cargo_test".to_string(),
             selector_version: 1,
+            ran_at: "2026-04-17T13:45:00Z".to_string(),
             changed_files: vec!["src/foo.rs".into()],
             selected_tests: vec!["azoth_core::foo::tests::bar".into()],
+            rationale: vec!["direct filename match".into()],
+            confidence: vec![1.0],
         };
         let s = serde_json::to_string(&ev).unwrap();
         assert!(s.contains(r#""type":"impact_computed""#), "{s}");
+        assert!(s.contains(r#""ran_at":"2026-04-17T13:45:00Z""#), "{s}");
+        assert!(s.contains(r#""rationale""#), "{s}");
         let back: SessionEvent = serde_json::from_str(&s).unwrap();
         assert_eq!(back, ev);
         assert_eq!(back.turn_id().map(|t| t.as_str()), Some("t_77"));
 
-        // Forward-compat: a future minimal writer that drops every
-        // non-essential field must still deserialise under the current
-        // schema.
+        // Forward-compat: a minimal writer (e.g. the pre-Sprint-5
+        // PR-#9-snapshot of this event, which had no ran_at /
+        // rationale / confidence) must still deserialise under the
+        // current schema.
         let wire = r#"{
             "type":"impact_computed",
             "turn_id":"t_78"
@@ -336,17 +372,51 @@ mod tests {
             SessionEvent::ImpactComputed {
                 selector,
                 selector_version,
+                ran_at,
                 changed_files,
                 selected_tests,
+                rationale,
+                confidence,
                 ..
             } => {
                 assert!(selector.is_empty());
                 assert_eq!(selector_version, 0);
+                assert!(ran_at.is_empty());
                 assert!(changed_files.is_empty());
                 assert!(selected_tests.is_empty());
+                assert!(rationale.is_empty());
+                assert!(confidence.is_empty());
             }
             other => panic!("expected ImpactComputed, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn impact_computed_empty_vecs_omit_from_wire_for_cache_stability() {
+        // When a selector emits a plan with no rationale or
+        // confidence (e.g. NullImpactSelector, or a custom selector
+        // that doesn't score), the wire shape must NOT include empty
+        // `rationale: []` / `confidence: []` arrays — leaving them in
+        // would shift the byte prefix and break Anthropic prompt-
+        // cache hit rate on any event-replay context. See memory:
+        // pattern_serde_skip_serializing_if_for_cache_stability.
+        let ev = SessionEvent::ImpactComputed {
+            turn_id: TurnId::from("t_90".to_string()),
+            selector: "null".into(),
+            selector_version: 0,
+            ran_at: "2026-04-17T00:00:00Z".into(),
+            changed_files: vec!["src/a.rs".into()],
+            selected_tests: Vec::new(),
+            rationale: Vec::new(),
+            confidence: Vec::new(),
+        };
+        let s = serde_json::to_string(&ev).unwrap();
+        assert!(!s.contains("\"rationale\""), "wire leaked rationale: {s}");
+        assert!(!s.contains("\"confidence\""), "wire leaked confidence: {s}");
+        assert!(
+            !s.contains("\"selected_tests\""),
+            "wire leaked selected_tests: {s}"
+        );
     }
 
     #[test]

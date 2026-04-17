@@ -18,4 +18,4 @@ pub mod cargo;
 pub mod git_status;
 
 pub use cargo::{discover_cargo_tests, CargoTestImpact, TestUniverse, CARGO_TEST_IMPACT_VERSION};
-pub use git_status::{parse_porcelain as parse_porcelain_for_tests, GitStatusDiffSource};
+pub use git_status::{parse_porcelain_z as parse_porcelain_z_for_tests, GitStatusDiffSource};

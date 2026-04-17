@@ -18,6 +18,7 @@ use crate::schemas::{
 };
 use crate::telemetry;
 use crate::validators::{ImpactValidator, Validator};
+use futures::future::join_all;
 use thiserror::Error;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
@@ -703,40 +704,66 @@ impl<'a> TurnDriver<'a> {
                             return Ok(TurnOutcome::aborted(total_usage));
                         }
 
-                        // Sprint 5: TDAD impact validators. Compute the
-                        // diff once (default empty when no source is
-                        // wired), then walk impact_validators in order.
-                        // Each call emits ImpactComputed (plan detail)
-                        // plus ValidatorResult (pass/fail). A Fail
-                        // aborts the turn under the same
-                        // AbortReason::ValidatorFail the classical
-                        // path uses — forensic diffs across subsystems
-                        // stay consistent.
+                        // Sprint 5: TDAD impact validators. Compute
+                        // the diff once (default empty when no source
+                        // is wired), then fan-out to the validator
+                        // slice. Each produces an `ImpactComputed`
+                        // (plan detail) plus a `ValidatorResult`
+                        // (pass/fail). A `Fail` aborts the turn under
+                        // the same `AbortReason::ValidatorFail` the
+                        // classical path uses — forensic diffs across
+                        // subsystems stay consistent.
+                        //
+                        // PR #9 reviews addressed in this block:
+                        //  - gemini MED: diff_source failures were
+                        //    recorded as ValidatorStatus::Fail without
+                        //    triggering abort, which was inconsistent.
+                        //    Now emitted as Skip (degraded-mode marker)
+                        //    + detail; we proceed with empty diff.
+                        //  - gemini MED: validators ran sequentially.
+                        //    Now driven via `futures::future::join_all`
+                        //    so concurrent I/O (cargo, git, graph
+                        //    queries) overlap. `join_all` preserves
+                        //    input order in its result Vec, so JSONL
+                        //    emission stays deterministic even when
+                        //    validator wall-clock completion orders
+                        //    vary — cache-prefix stability preserved.
+                        //  - codex P2: events now carry full TestPlan
+                        //    payload (rationale + confidence +
+                        //    selector_version + ran_at).
+                        //  - gemini HIGH: ran_at timestamp populated
+                        //    at emission time so the SQLite mirror can
+                        //    project into `test_impact.ran_at NOT NULL`.
                         if !self.impact_validators.is_empty() {
                             let diff: Diff = match self.diff_source {
                                 Some(src) => match src.diff().await {
                                     Ok(d) => d,
                                     Err(e) => {
-                                        // Diff source errors are not a turn kill
-                                        // in isolation — we proceed with an empty
-                                        // diff and record the failure as a
-                                        // ValidatorResult so eval can see it.
                                         tracing::warn!(
                                             error = %e,
                                             source = src.name(),
                                             "diff_source failed; proceeding with empty diff"
                                         );
+                                        // Skip, not Fail: the subsystem
+                                        // is opt-in and a diff-source
+                                        // outage is genuinely
+                                        // non-fatal. The event still
+                                        // lands in JSONL so eval can
+                                        // measure how often it fires.
+                                        let vname = format!("diff_source:{}", src.name());
                                         self.writer.append(&SessionEvent::ValidatorResult {
                                             turn_id: turn_id.clone(),
-                                            validator: format!("diff_source:{}", src.name()),
-                                            status: ValidatorStatus::Fail,
-                                            detail: Some(format!("{e}")),
+                                            validator: vname.clone(),
+                                            status: ValidatorStatus::Skip,
+                                            detail: Some(format!(
+                                                "{e}; proceeding with empty diff"
+                                            )),
                                         })?;
                                         telemetry::emit_validator_result(
                                             &self.run_id.0,
                                             &turn_id.0,
-                                            &format!("diff_source:{}", src.name()),
-                                            ValidatorStatus::Fail,
+                                            &vname,
+                                            ValidatorStatus::Skip,
                                         );
                                         Diff::empty()
                                     }
@@ -744,16 +771,29 @@ impl<'a> TurnDriver<'a> {
                                 None => Diff::empty(),
                             };
 
-                            let mut impact_failed: Option<(String, Option<String>)> = None;
-                            for iv in self.impact_validators.iter() {
-                                let report = iv.validate(contract, &diff).await;
-                                let vname = report.name.to_string();
+                            // Fan-out. join_all returns reports in
+                            // input order regardless of completion
+                            // order, so the emission loop below stays
+                            // deterministic. First-fail-wins semantics
+                            // preserved by iterating the ordered Vec.
+                            let reports = join_all(
+                                self.impact_validators
+                                    .iter()
+                                    .map(|iv| iv.validate(contract, &diff)),
+                            )
+                            .await;
 
-                                // Always persist plan detail when the
-                                // validator produced one — including
-                                // empty plans, so forensics can
-                                // distinguish "no impact" from
-                                // "selector errored before planning".
+                            let mut impact_failed: Option<(String, Option<String>)> = None;
+                            for report in reports {
+                                let vname = report.name.to_string();
+                                let ran_at = now_iso();
+
+                                // Persist plan detail whenever the
+                                // validator produced one (including
+                                // empty plans). Rationale +
+                                // confidence preserve forensic
+                                // provenance; ran_at is required by
+                                // the SQLite mirror's m0005 schema.
                                 if let Some(plan) = report.plan.as_ref() {
                                     let selected_tests: Vec<String> =
                                         plan.tests.iter().map(|t| t.0.clone()).collect();
@@ -761,8 +801,11 @@ impl<'a> TurnDriver<'a> {
                                         turn_id: turn_id.clone(),
                                         selector: vname.clone(),
                                         selector_version: plan.selector_version,
+                                        ran_at: ran_at.clone(),
                                         changed_files: diff.changed_files.clone(),
                                         selected_tests,
+                                        rationale: plan.rationale.clone(),
+                                        confidence: plan.confidence.clone(),
                                     })?;
                                 }
 
