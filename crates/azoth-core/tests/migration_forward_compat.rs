@@ -157,6 +157,81 @@ fn v1_5_mirror_opens_under_v2_migrator_with_rows_preserved() {
 }
 
 #[test]
+fn v1_5_partial_init_is_healed_on_v2_boot() {
+    // Regression guard for PR #4 Codex P2: v1.5 `ensure_schema` used
+    //   CREATE TABLE IF NOT EXISTS turns (...);
+    //   CREATE INDEX IF NOT EXISTS turns_by_run ON turns(run_id);
+    //   PRAGMA user_version = 1;
+    // inside a non-transactional `execute_batch`. Each statement is
+    // atomic on its own; the batch is not. If v1.5 crashed between the
+    // CREATE TABLE and the CREATE INDEX, the next boot's `if current == 0`
+    // branch would re-run the batch and the `IF NOT EXISTS` clauses
+    // would heal the missing index.
+    //
+    // The v2 migrator must preserve that self-heal semantic. An earlier
+    // draft of m0001 short-circuited on table existence, which regressed
+    // this case: the index stayed missing AND user_version got bumped to
+    // 1, permanently freezing the broken state.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.sqlite");
+
+    // Seed the v1.5 partial-init state: table present, index MISSING,
+    // user_version still at 0 (the post-CREATE-TABLE, pre-PRAGMA moment).
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE turns (
+                run_id                TEXT NOT NULL,
+                turn_id               TEXT NOT NULL PRIMARY KEY,
+                outcome               TEXT NOT NULL,
+                detail                TEXT,
+                input_tokens          INTEGER NOT NULL DEFAULT 0,
+                output_tokens         INTEGER NOT NULL DEFAULT 0,
+                cache_read_tokens     INTEGER NOT NULL DEFAULT 0,
+                cache_creation_tokens INTEGER NOT NULL DEFAULT 0
+            );
+            "#,
+        )
+        .unwrap();
+        // user_version deliberately left at 0.
+
+        let idx_before: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='turns_by_run'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(idx_before, 0, "seed precondition: index must be absent");
+    }
+
+    // Boot under the v2 migrator. Codex's regression scenario.
+    {
+        let _m = SqliteMirror::open(&path).unwrap();
+    }
+
+    // Post-boot: index MUST exist, user_version MUST have advanced to 1.
+    let conn = Connection::open(&path).unwrap();
+    let idx_after: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='turns_by_run'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        idx_after, 1,
+        "v2 migrator must heal missing turns_by_run index (PR #4 Codex P2)"
+    );
+
+    let v: i32 = conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(v, 1, "user_version must advance to 1 after self-heal");
+}
+
+#[test]
 fn fresh_db_lands_at_same_schema_as_v1_5_seed() {
     // Zero-state convergence: an empty file must end up at the same
     // user_version as a pre-populated v1.5 DB after the migrator runs.
