@@ -45,3 +45,20 @@ fn regression_rate_zero_on_empty_baseline() {
     let current = [pass("v1")];
     assert_eq!(regression_rate(&prior, &current), 0.0);
 }
+
+/// PR #10 codex P2 regression guard (integration layer): skip on the
+/// current side must not dilute the denominator. A mixed snapshot
+/// (one Pass → Skip, one Pass → Fail) reports the full 1.0 rate.
+#[test]
+fn skip_is_excluded_from_baseline_so_mixed_snapshot_rates_one() {
+    fn skip(n: &str) -> (String, ValidatorStatus) {
+        (n.to_string(), ValidatorStatus::Skip)
+    }
+    let prior = [pass("v1"), pass("v2")];
+    let current = [skip("v1"), fail("v2")];
+    let r = regression_rate(&prior, &current);
+    assert!(
+        (r - 1.0).abs() < 1e-9,
+        "skip on current side must not dilute baseline; expected 1.0, got {r}"
+    );
+}

@@ -72,6 +72,17 @@ pub fn regression_rate(prior: &[Outcome], current: &[Outcome]) -> f64 {
         let Some(curr_status) = current.get(name) else {
             continue;
         };
+        // PR #10 codex P2: prior=Pass AND current=Skip is "no signal"
+        // per the module-level doc, so it must NOT contribute to the
+        // denominator. Leaving it in diluted the rate — e.g. one
+        // Pass→Skip + one Pass→Fail reported 0.5 instead of the
+        // intended 1.0, masking real regressions behind flaky/skipped
+        // validators. The baseline counts *evaluable* at-risk
+        // validators, not every prior Pass that kept a name slot
+        // under any status on the new side.
+        if matches!(curr_status, ValidatorStatus::Skip) {
+            continue;
+        }
         baseline += 1;
         if matches!(curr_status, ValidatorStatus::Fail) {
             regressed += 1;
@@ -138,10 +149,24 @@ mod tests {
         // Pass → Skip: not a regression (no signal).
         let prior = [pass("v1"), pass("v2")];
         let current = [skip("v1"), pass("v2")];
-        // Baseline excludes skips on the current side → v1 drops
-        // into "skip means no signal": baseline still counts v1 as
-        // at-risk, but it did not flip to Fail.
+        // Skip on the current side is "no signal" → v1 drops out of
+        // the baseline entirely. Only v2 (pass → pass) remains, and
+        // it did not flip to Fail → 0/1 = 0.0.
         assert_eq!(regression_rate(&prior, &current), 0.0);
+    }
+
+    /// PR #10 codex P2 regression guard: a mixed snapshot where one
+    /// validator flips Pass → Skip and another flips Pass → Fail
+    /// must report the full regression rate (1.0) — the skip is "no
+    /// signal" and must not dilute the denominator.
+    #[test]
+    fn mixed_skip_and_fail_does_not_dilute_rate() {
+        let prior = [pass("v1"), pass("v2")];
+        let current = [skip("v1"), fail("v2")];
+        // v1 pass → skip: excluded from baseline.
+        // v2 pass → fail: baseline=1, regressed=1 → 1.0.
+        let r = regression_rate(&prior, &current);
+        assert!((r - 1.0).abs() < 1e-9, "expected 1.0, got {r}");
     }
 
     #[test]
