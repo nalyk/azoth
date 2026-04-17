@@ -1,6 +1,9 @@
 //! Retrieval traits. Split from day one (HIGH-2): lexical ships in v1,
 //! graph is a trait-only stub so v2 can land without touching signatures.
 
+pub mod config;
+pub use config::{LexicalBackend, RetrievalConfig};
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;

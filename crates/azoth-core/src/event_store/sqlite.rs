@@ -375,6 +375,9 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 1, "Sprint 0 ships exactly one migration (m0001)");
+        assert_eq!(
+            v, 2,
+            "Sprint 1 ships m0002 (FTS schema) on top of m0001 (turns)"
+        );
     }
 }

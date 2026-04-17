@@ -145,6 +145,21 @@ pub enum SessionEvent {
         #[serde(default)]
         partial_usage: UsageDelta,
     },
+    /// A lexical/fts retrieval call completed. Emitted from retrieval
+    /// call sites so the eval plane (Sprint 6) can measure precision@k
+    /// and compare backends without re-running queries. `backend` names
+    /// the concrete impl (`ripgrep`, `fts`, or future `composite`).
+    /// All numeric fields carry `#[serde(default)]` so older binaries
+    /// can tolerate forward-compat additions.
+    RetrievalQueried {
+        turn_id: TurnId,
+        backend: String,
+        query: String,
+        #[serde(default)]
+        result_count: u32,
+        #[serde(default)]
+        latency_ms: u64,
+    },
 }
 
 impl SessionEvent {
@@ -167,7 +182,8 @@ impl SessionEvent {
             | Checkpoint { turn_id, .. }
             | TurnCommitted { turn_id, .. }
             | TurnAborted { turn_id, .. }
-            | TurnInterrupted { turn_id, .. } => Some(turn_id),
+            | TurnInterrupted { turn_id, .. }
+            | RetrievalQueried { turn_id, .. } => Some(turn_id),
         }
     }
 
@@ -202,4 +218,54 @@ pub enum ApprovalScope {
     Once,
     Session,
     ScopedPaths { paths: Vec<String> },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retrieval_queried_round_trips() {
+        let ev = SessionEvent::RetrievalQueried {
+            turn_id: TurnId::from("t_9".to_string()),
+            backend: "fts".to_string(),
+            query: "TurnDriver".to_string(),
+            result_count: 7,
+            latency_ms: 42,
+        };
+        let s = serde_json::to_string(&ev).unwrap();
+        assert!(s.contains(r#""type":"retrieval_queried""#), "{s}");
+        let back: SessionEvent = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, ev);
+        assert_eq!(
+            back.turn_id().map(|t| t.as_str()),
+            Some("t_9"),
+            "new variant must be covered by turn_id() match"
+        );
+    }
+
+    #[test]
+    fn retrieval_queried_tolerates_missing_optional_numeric_fields() {
+        // Forward-compat guard: the v2 Sprint 1 plan marks numeric
+        // fields `#[serde(default)]` so a future binary writing without
+        // them still deserialises here.
+        let wire = r#"{
+            "type":"retrieval_queried",
+            "turn_id":"t_x",
+            "backend":"ripgrep",
+            "query":"needle"
+        }"#;
+        let ev: SessionEvent = serde_json::from_str(wire).unwrap();
+        match ev {
+            SessionEvent::RetrievalQueried {
+                result_count,
+                latency_ms,
+                ..
+            } => {
+                assert_eq!(result_count, 0);
+                assert_eq!(latency_ms, 0);
+            }
+            other => panic!("expected RetrievalQueried, got {other:?}"),
+        }
+    }
 }

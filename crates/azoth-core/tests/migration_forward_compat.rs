@@ -228,7 +228,10 @@ fn v1_5_partial_init_is_healed_on_v2_boot() {
     let v: i32 = conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(v, 1, "user_version must advance to 1 after self-heal");
+    assert_eq!(
+        v, 2,
+        "user_version advances past both migrations on self-heal (m0001 turns + m0002 fts)"
+    );
 }
 
 #[test]
