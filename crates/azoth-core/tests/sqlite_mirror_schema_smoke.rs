@@ -75,7 +75,10 @@ fn fresh_open_creates_v1_schema_and_accepts_terminal_events() {
     let user_version: i32 = conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(user_version, 1);
+    assert_eq!(
+        user_version, 2,
+        "Sprint 1 ships m0002 (FTS schema) on top of m0001 (turns)"
+    );
 
     let mut cols: Vec<String> = {
         let mut stmt = conn.prepare("PRAGMA table_info(turns)").unwrap();

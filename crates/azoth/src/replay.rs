@@ -250,6 +250,20 @@ fn write_event_line<W: std::io::Write>(
         SessionEvent::TurnInterrupted { reason, .. } => {
             writeln!(out, "{prefix}{turn} turn_interrupted reason={:?}", reason)
         }
+        SessionEvent::RetrievalQueried {
+            backend,
+            query,
+            result_count,
+            latency_ms,
+            ..
+        } => writeln!(
+            out,
+            "{prefix}{turn} retrieval_queried backend={} hits={} latency_ms={} query={:?}",
+            backend,
+            result_count,
+            latency_ms,
+            truncate(query, 60)
+        ),
     }
 }
 

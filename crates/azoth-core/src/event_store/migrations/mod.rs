@@ -41,11 +41,12 @@ use rusqlite::{Connection, Transaction, TransactionBehavior};
 use crate::event_store::sqlite::MirrorError;
 
 mod m0001_initial;
+mod m0002_fts_schema;
 
 type MigrationStep = fn(&Transaction) -> Result<(), MirrorError>;
 
 fn all_steps() -> &'static [MigrationStep] {
-    &[m0001_initial::up]
+    &[m0001_initial::up, m0002_fts_schema::up]
 }
 
 /// Bring `conn` up to the latest schema version. Returns the new
