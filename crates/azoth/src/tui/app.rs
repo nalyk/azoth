@@ -726,7 +726,15 @@ pub async fn run_app(resume: Option<String>) -> io::Result<()> {
                     RetrievalMode::Legacy => Arc::new(IdentityReranker),
                 },
                 budget: TokenBudget::v2_default(),
-                per_lane_limit: 8,
+                // Match TurnDriver's ask of 20 so the single-lane
+                // Sprint 4 wiring doesn't silently cap recall below
+                // legacy mode (PR #8 review P1). With one lane wired,
+                // `per_lane_limit` is effectively a global cap — the
+                // per-lane-floor guarantees only matter once multiple
+                // lanes exist (Sprint 7). Sprint 7 can tune this down
+                // when graph+symbol+fts come online and dedupe starts
+                // doing real work.
+                per_lane_limit: 20,
             };
             // Only one lane wired in Sprint 4; keep budget ceiling
             // relaxed so the single lane doesn't hit artificial caps.

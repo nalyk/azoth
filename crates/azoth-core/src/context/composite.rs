@@ -25,8 +25,14 @@
 //!
 //! The reranker returns a parallel `Vec<f32>` aligned with the input
 //! slice. Composite copies each score onto `item.rerank_score` *in
-//! place* before sorting — forensic replay keeps the score that
-//! drove the ordering.
+//! place*, then dedupes cross-lane duplicates by `label` — the
+//! retained item's `rerank_score` is the *sum* of each lane's
+//! contribution. This reproduces the canonical RRF definition
+//! `Σ_{L ∈ lanes(d)} 1/(k + rank_L(d))`: a document that shows up in
+//! two lanes gets a fused score higher than either lane alone, which
+//! is exactly the cross-lane-agreement signal RRF is designed to
+//! surface. Forensic replay keeps the fused score that drove the
+//! ordering.
 //!
 //! ## Budget semantics
 //!
@@ -144,6 +150,37 @@ impl EvidenceCollector for CompositeEvidenceCollector {
         for (it, s) in combined.iter_mut().zip(scores.iter().copied()) {
             it.rerank_score = Some(s);
         }
+
+        // Canonical RRF fusion — dedupe by `label`, summing the
+        // per-lane rerank contributions into a single item.
+        //
+        // Standard RRF is `Σ_{L ∈ lanes(d)} 1/(k + rank_L(d))`. Our
+        // `Reranker::score` returns the *per-item* contribution
+        // `1/(k + rank_L(item))`; composite is where the cross-lane
+        // sum happens. Without this step, a document that surfaces in
+        // both the lexical and FTS lanes would double-spend the token
+        // budget (PR #8 review P2) and the expected "cross-lane
+        // agreement boosts relevance" signal would never materialise.
+        //
+        // Determinism: we keep the *first* occurrence's metadata
+        // (walking the lane-ordered `combined` list). That's stable
+        // across runs because the outer collection loop is ordered
+        // and each sub-collector is deterministic.
+        let mut by_label: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        let mut fused: Vec<EvidenceItem> = Vec::with_capacity(combined.len());
+        for item in combined.drain(..) {
+            if let Some(&idx) = by_label.get(&item.label) {
+                let add = item.rerank_score.unwrap_or(0.0);
+                let existing = &mut fused[idx];
+                let cur = existing.rerank_score.unwrap_or(0.0);
+                existing.rerank_score = Some(cur + add);
+            } else {
+                by_label.insert(item.label.clone(), fused.len());
+                fused.push(item);
+            }
+        }
+        combined = fused;
 
         // Stable sort so ties fall back on original order → deterministic.
         // Sort by rerank_score desc.
@@ -346,6 +383,56 @@ mod tests {
         c.lexical = Some(lex);
         let out = c.collect("q", 10).await.unwrap();
         assert_eq!(out[0].inline.as_deref(), Some(snippet));
+    }
+
+    #[tokio::test]
+    async fn cross_lane_duplicates_fuse_rrf_scores_and_dedupe() {
+        // PR #8 review P2: same `label` from two lanes must fuse into
+        // a single item whose rerank_score is the sum of per-lane RRF
+        // contributions — the canonical RRF definition. Before the
+        // fix, duplicates survived as separate items and double-spent
+        // the token budget.
+        let shared = "src/foo.rs:42";
+        let lex = Arc::new(StaticCollector(vec![item(shared, 10)]));
+        let fts = Arc::new(StaticCollector(vec![item(shared, 9)]));
+        let mut c = CompositeEvidenceCollector::empty(Arc::new(ReciprocalRankFusion::default()));
+        c.lexical = Some(lex);
+        c.fts = Some(fts);
+        let out = c.collect("q", 10).await.unwrap();
+        // Single surviving item (deduped).
+        assert_eq!(out.len(), 1, "cross-lane duplicates must dedupe");
+        assert_eq!(out[0].label, shared);
+        // Fused score ≈ 1/61 (from lexical rank 1) + 1/61 (from fts rank 1).
+        let expected = 2.0f32 * (1.0 / 61.0);
+        let got = out[0].rerank_score.unwrap();
+        assert!(
+            (got - expected).abs() < 1e-6,
+            "fused RRF score should sum lane contributions: got {got}, expected {expected}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fused_doc_ranks_above_single_lane_doc() {
+        // A doc that surfaces in two lanes should outrank a doc that
+        // surfaces in only one lane with equal per-lane rank — that's
+        // the cross-lane-agreement signal RRF is designed to surface.
+        let shared = "src/hot.rs:1";
+        let only_fts = "src/cold.rs:1";
+        let lex = Arc::new(StaticCollector(vec![item(shared, 10)]));
+        let fts = Arc::new(StaticCollector(vec![
+            item(shared, 10),  // same doc, rank 1 in fts
+            item(only_fts, 9), // different doc, rank 2 in fts
+        ]));
+        let mut c = CompositeEvidenceCollector::empty(Arc::new(ReciprocalRankFusion::default()));
+        c.lexical = Some(lex);
+        c.fts = Some(fts);
+        let out = c.collect("q", 10).await.unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(
+            out[0].label, shared,
+            "the fused doc must sort ahead of the single-lane doc"
+        );
+        assert_eq!(out[1].label, only_fts);
     }
 
     #[tokio::test]
