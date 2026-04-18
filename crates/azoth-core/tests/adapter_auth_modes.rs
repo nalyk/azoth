@@ -41,6 +41,19 @@ impl Match for HeaderAbsent {
     }
 }
 
+/// Asserts a specific header appears EXACTLY `n` times. The built-in
+/// `header()` matcher only inspects the first value for a given name,
+/// so it cannot catch "sent twice" regressions. Pinned here so the
+/// pre-v2.0.0 duplicate `anthropic-version` bug (gemini MED on PR
+/// #12) can't return through a future profile-extras edit.
+struct HeaderCount(&'static str, usize);
+
+impl Match for HeaderCount {
+    fn matches(&self, request: &Request) -> bool {
+        request.headers.get_all(self.0).iter().count() == self.1
+    }
+}
+
 fn empty_request() -> ModelTurnRequest {
     ModelTurnRequest {
         system: String::new(),
@@ -76,6 +89,7 @@ async fn api_key_token_emits_x_api_key_and_no_oauth_headers() {
         .and(header("x-api-key", "sk-ant-api03-demo"))
         .and(HeaderAbsent("authorization"))
         .and(HeaderAbsent("anthropic-beta"))
+        .and(HeaderCount("anthropic-version", 1))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_bytes(body)
@@ -107,6 +121,7 @@ async fn oauth_token_emits_bearer_plus_beta_header_and_no_x_api_key() {
         .and(header("authorization", "Bearer sk-ant-oat01-demo"))
         .and(header("anthropic-beta", "oauth-2025-04-20"))
         .and(HeaderAbsent("x-api-key"))
+        .and(HeaderCount("anthropic-version", 1))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_bytes(body)

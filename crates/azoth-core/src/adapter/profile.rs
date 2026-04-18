@@ -48,7 +48,12 @@ impl ProviderProfile {
             max_context_tokens: 200_000,
             max_output_tokens: 8_192,
             tool_use_shape: ToolUseShape::ContentBlock,
-            extra_headers: vec![("anthropic-version".into(), "2023-06-01".into())],
+            // `anthropic-version` is set unconditionally by the adapter's
+            // `invoke()` — it's a protocol requirement, not a per-profile
+            // knob. Pre-v2 shipped it in `extra_headers` AND in the
+            // builder chain, sending the header twice on every request.
+            // Gemini MED on PR #12 caught the duplicate; cleaned up here.
+            extra_headers: vec![],
         }
     }
 
@@ -93,7 +98,11 @@ impl ProviderProfile {
             max_context_tokens: 32_768,
             max_output_tokens: 8_192,
             tool_use_shape: ToolUseShape::ContentBlock,
-            extra_headers: vec![("anthropic-version".into(), "2023-06-01".into())],
+            // See `anthropic_default` for why this is empty — the adapter
+            // sends `anthropic-version` itself; leaving it in extras
+            // caused a duplicate on every outgoing request (gemini MED
+            // on PR #12).
+            extra_headers: vec![],
         }
     }
 
