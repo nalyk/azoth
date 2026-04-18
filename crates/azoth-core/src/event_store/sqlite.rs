@@ -358,6 +358,9 @@ fn abort_reason_label(r: AbortReason) -> &'static str {
         AbortReason::TokenBudget => "aborted_token_budget",
         AbortReason::RuntimeError => "aborted_runtime_error",
         AbortReason::Crash => "aborted_crash",
+        AbortReason::ModelTruncated => "aborted_model_truncated",
+        AbortReason::ContextOverflow => "aborted_context_overflow",
+        AbortReason::SandboxDenied => "aborted_sandbox_denied",
     }
 }
 

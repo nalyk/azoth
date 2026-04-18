@@ -18,9 +18,31 @@ pub enum AbortReason {
     AdapterError,
     ValidatorFail,
     ApprovalDenied,
+    /// The contract's side-effect / turn-count budget was exhausted.
+    /// Deterministic stop requested by Azoth's own policy, not the
+    /// provider. Pre-Sprint-7.5 this also fired when the model's
+    /// `StopReason::MaxTokens` came back — that case now uses
+    /// `ModelTruncated` instead.
     TokenBudget,
     RuntimeError,
     Crash,
+    /// Sprint 7.5 (2026-04-18): the model's `StopReason::MaxTokens`
+    /// path — provider-side output truncation mid-stream. Distinct
+    /// from `TokenBudget` because the remediation differs
+    /// (continue via `/continue` or raise max_tokens vs. amend the
+    /// contract's side-effect budget).
+    ModelTruncated,
+    /// Sprint 7.5 (2026-04-18): TurnDriver pre-flight estimate of
+    /// the outgoing `ModelTurnRequest` would exceed the active
+    /// profile's `max_context_tokens`. Aborted before any network
+    /// call; no `model_request` is emitted. Remediation: truncate
+    /// history, switch profile, or raise the profile cap.
+    ContextOverflow,
+    /// Sprint 7.5 (2026-04-18): the sandbox layer refused to
+    /// prepare for this effect class — either the class is not
+    /// available in v2 (Tier C/D) or a runtime dependency is
+    /// missing. The turn never dispatched the tool.
+    SandboxDenied,
 }
 
 /// Union of every line that can appear in a session's JSONL log.

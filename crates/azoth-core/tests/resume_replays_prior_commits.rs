@@ -27,7 +27,7 @@ fn scripted_search(query: &str) -> MockScript {
             ModelTurnResponse {
                 content: vec![ContentBlock::ToolUse {
                     id: ToolUseId::new(),
-                    name: "repo.search".into(),
+                    name: "repo_search".into(),
                     input: serde_json::json!({ "q": query, "limit": 3 }),
                     call_group: None,
                 }],

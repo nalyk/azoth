@@ -1,4 +1,4 @@
-//! `fs.write` — the canonical `ApplyLocal` tool. Writes bytes to a path
+//! `fs_write` — the canonical `ApplyLocal` tool. Writes bytes to a path
 //! inside the repo root. Refuses path traversal by canonicalizing the
 //! parent directory and asserting it stays under the canonical repo root.
 
@@ -29,7 +29,7 @@ impl Tool for FsWriteTool {
     type Output = FsWriteOutput;
 
     fn name(&self) -> &'static str {
-        "fs.write"
+        "fs_write"
     }
 
     fn effect_class(&self) -> EffectClass {
@@ -125,7 +125,7 @@ mod tests {
             Origin::ModelOutput,
             json!({ "path": "sub/hello.txt", "contents": "hi from fs.write" }),
         );
-        let out = dispatch_tool(&disp, "fs.write", raw, &ctx).await.unwrap();
+        let out = dispatch_tool(&disp, "fs_write", raw, &ctx).await.unwrap();
         assert_eq!(out["bytes_written"], 16);
         let body = tokio::fs::read_to_string(root.join("sub/hello.txt"))
             .await
@@ -145,7 +145,7 @@ mod tests {
             Origin::ModelOutput,
             json!({ "path": "../escape.txt", "contents": "nope" }),
         );
-        let err = dispatch_tool(&disp, "fs.write", raw, &ctx)
+        let err = dispatch_tool(&disp, "fs_write", raw, &ctx)
             .await
             .expect_err("traversal must be rejected");
         match err {

@@ -317,7 +317,7 @@ mod tests {
                 index: 0,
                 block: ContentBlock::ToolUse {
                     id: ToolUseId::from("tu_a".to_string()),
-                    name: "repo.search".into(),
+                    name: "repo_search".into(),
                     input: serde_json::json!({"q": "auth"}),
                     call_group: None,
                 },
@@ -375,7 +375,7 @@ mod tests {
         assert!(s.contains("please fix the auth bug"));
         assert!(s.contains("### Assistant"));
         assert!(s.contains("Found the fix in auth.rs."));
-        assert!(s.contains("**Tool call:** `repo.search`"));
+        assert!(s.contains("**Tool call:** `repo_search`"));
         assert!(s.contains("42 in / 17 out"));
     }
 

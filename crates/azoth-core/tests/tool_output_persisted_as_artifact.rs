@@ -42,7 +42,7 @@ async fn tool_result_event_carries_artifact_id_and_blob_lands_on_disk() {
             ModelTurnResponse {
                 content: vec![ContentBlock::ToolUse {
                     id: ToolUseId::from("tu_search".to_string()),
-                    name: "repo.search".into(),
+                    name: "repo_search".into(),
                     input: serde_json::json!({ "q": "sentinel", "limit": 3 }),
                     call_group: None,
                 }],

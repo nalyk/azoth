@@ -45,7 +45,7 @@ async fn tui_worker_pipeline_drives_full_turn_sequence() {
             ModelTurnResponse {
                 content: vec![ContentBlock::ToolUse {
                     id: ToolUseId::new(),
-                    name: "repo.search".into(),
+                    name: "repo_search".into(),
                     input: serde_json::json!({ "q": "sentinel", "limit": 3 }),
                     call_group: None,
                 }],
@@ -134,7 +134,7 @@ async fn tui_worker_pipeline_drives_full_turn_sequence() {
             e,
             SessionEvent::ContentBlock {
                 block: ContentBlock::ToolUse { name, .. }, ..
-            } if name == "repo.search"
+            } if name == "repo_search"
         )
     });
     assert!(

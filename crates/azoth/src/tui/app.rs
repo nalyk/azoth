@@ -140,6 +140,8 @@ impl AppState {
                     .push("  /approve [tool]    pre-approve a tool for the session".into());
                 self.transcript
                     .push("  /resume <run_id>   (restart required in v1)".into());
+                self.transcript
+                    .push("  /continue          nudge the model to resume a truncated turn".into());
                 self.transcript.push("  /quit              exit".into());
             }
             SlashCommand::Status => {
@@ -204,7 +206,7 @@ impl AppState {
                         .push("  pre-grants a session-scoped capability token".into());
                     self.transcript
                         .push("  so the tool will not prompt for approval.".into());
-                    self.transcript.push("  registered tools: fs.write, bash, repo.search, repo.read_file, repo.read_spans".into());
+                    self.transcript.push("  registered tools: fs_write, bash, repo_search, repo_read_file, repo_read_spans".into());
                 }
             },
             SlashCommand::Quit => {
@@ -221,6 +223,22 @@ impl AppState {
                     self.transcript.push("! usage: /resume <run_id>".into());
                 }
             },
+            SlashCommand::Continue => {
+                // Sprint 7.5: queue a synthetic user prompt asking the
+                // model to resume where it left off. Meaningful after a
+                // `turn_aborted { reason: "model_truncated" }` where the
+                // model hit max_tokens mid-generation; the next turn
+                // starts with this nudge and the model's own
+                // conversation history still contains the partial
+                // output.
+                self.transcript.push("· /continue".into());
+                self.pending_user_text = Some(
+                    "Please continue from where you left off — pick up the \
+                     partial output and finish."
+                        .to_string(),
+                );
+                self.dirty = true;
+            }
             SlashCommand::Unknown(name) => {
                 self.transcript.push(format!("! unknown command: /{name}"));
             }
@@ -1368,10 +1386,10 @@ mod tests {
     #[test]
     fn slash_approve_with_arg_queues_tool_name() {
         let mut state = AppState::new();
-        state.handle_slash(SlashCommand::Approve(Some("fs.write".into())));
+        state.handle_slash(SlashCommand::Approve(Some("fs_write".into())));
         let tool = state.take_pending_approve().expect("pending approve");
-        assert_eq!(tool, "fs.write");
-        assert!(state.transcript.iter().any(|l| l.contains("fs.write")));
+        assert_eq!(tool, "fs_write");
+        assert!(state.transcript.iter().any(|l| l.contains("fs_write")));
     }
 
     #[test]

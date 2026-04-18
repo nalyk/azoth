@@ -4,6 +4,7 @@
 
 use super::context::ExecutionContext;
 use crate::authority::{ExtractionError, Extractor, JsonExtractor, Origin, Tainted};
+use crate::sandbox::sandbox_for;
 use crate::schemas::EffectClass;
 use async_trait::async_trait;
 use futures::future::BoxFuture;
@@ -80,6 +81,42 @@ impl<T: Tool + 'static> ErasedTool for T {
         ctx: &'a ExecutionContext,
     ) -> BoxFuture<'a, Result<Value, ToolError>> {
         Box::pin(async move {
+            // Sprint 7.5: sandbox gate. Ask the sandbox layer to
+            // prepare for the tool's effect class. Tier A/B return
+            // Ok (prepare is a no-op for in-process dispatch today —
+            // `spawn_jailed` for subprocess isolation is v2.1+
+            // scope). Tier C/D return `EffectNotAvailable` as
+            // documented by the plan. Either way this puts the
+            // seam in place so future tier-B exec-under-sandbox
+            // wiring has a call site to hook into, and it prevents
+            // ApplyRemote* / ApplyIrreversible tools from silently
+            // executing past the documented v2 scope fence.
+            //
+            // Opt-out: `AZOTH_SANDBOX=off` skips the check — dev-
+            // only escape hatch for hosts where the sandbox layer
+            // can't initialise. Default is on.
+            let ec = Tool::effect_class(self);
+            let sandbox_disabled = matches!(
+                std::env::var("AZOTH_SANDBOX").as_deref(),
+                Ok("off") | Ok("0") | Ok("false")
+            );
+            if !sandbox_disabled {
+                if let Err(e) = sandbox_for(ec).and_then(|s| s.prepare()) {
+                    tracing::warn!(
+                        tool = Tool::name(self),
+                        effect_class = ?ec,
+                        error = %e,
+                        "sandbox denied"
+                    );
+                    return Err(ToolError::SandboxDenied(e.to_string()));
+                }
+                tracing::debug!(
+                    tool = Tool::name(self),
+                    effect_class = ?ec,
+                    "sandbox prepared"
+                );
+            }
+
             // Taint gate: Tool::permitted_origins() drives the JsonExtractor's
             // allowlist. We can't easily pass that into `JsonExtractor::new`
             // since it wants a 'static slice, so we check manually here.
@@ -112,6 +149,12 @@ impl ToolDispatcher {
 
     pub fn register<T: ErasedTool + 'static>(&mut self, tool: T) {
         let name = tool.name().to_string();
+        assert!(
+            is_valid_provider_tool_name(&name),
+            "tool name {name:?} violates the provider tool-name regex \
+             ^[a-zA-Z0-9_-]{{1,128}}$ (Anthropic Messages API). Rename \
+             to use only ASCII letters, digits, underscore, or hyphen."
+        );
         self.tools.insert(name, Arc::new(tool));
     }
 
@@ -150,4 +193,22 @@ pub async fn dispatch_tool(
         return Err(ToolError::Cancelled);
     }
     tool.dispatch(raw, ctx).await
+}
+
+/// Checks that `name` satisfies Anthropic Messages API's tool-name
+/// regex `^[a-zA-Z0-9_-]{1,128}$`. Enforced by `ToolDispatcher::register`
+/// so a built-in tool with a dotted / special-char name (which the
+/// Anthropic API rejects as `invalid_request_error`) cannot reach
+/// production — the worker crashes at startup instead of 400-ing on
+/// the first live request.
+///
+/// The same regex is the narrowest common denominator across provider
+/// tool-name validators we've encountered; OpenAI/OpenRouter are
+/// permissive, so satisfying Anthropic covers the rest.
+pub(crate) fn is_valid_provider_tool_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }

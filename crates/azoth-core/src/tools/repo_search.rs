@@ -1,4 +1,4 @@
-//! `repo.search` — literal substring scan of the repo root.
+//! `repo_search` — literal substring scan of the repo root.
 //!
 //! A stand-in for the ripgrep-backed LexicalRetrieval; functional enough for
 //! the ToolDispatcher smoke test without pulling in an external binary.
@@ -38,7 +38,10 @@ impl Tool for RepoSearchTool {
     type Output = RepoSearchOutput;
 
     fn name(&self) -> &'static str {
-        "repo.search"
+        // Must match `^[a-zA-Z0-9_-]{1,128}$` — Anthropic Messages API
+        // rejects any other shape. `tool_names_satisfy_provider_regex`
+        // integration test pins this at CI time.
+        "repo_search"
     }
 
     fn schema(&self) -> Value {
