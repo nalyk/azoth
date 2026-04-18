@@ -20,20 +20,35 @@
 //!      benign to the caller.
 //!   3. The taint gate in `ErasedTool::dispatch` rejects
 //!      `Origin::Indexer` for tools that only permit `ModelOutput`.
+//!
+//! ## Why this lives inside `src/` under `#[cfg(test)]`
+//!
+//! `Tainted::new` is `pub(crate)` by design so only the dispatcher and
+//! adapter shims can mint provenance. Integration tests under
+//! `tests/` would need a public constructor to simulate hostile
+//! origins — but any public constructor (even `#[doc(hidden)]`) is
+//! compilation-visible to downstream consumers and lets them forge
+//! `Origin::User`/`Origin::ModelOutput` payloads, collapsing the
+//! provenance gate from an enforced API constraint to a convention.
+//! Keeping the tests inside the library under `#[cfg(test)] mod
+//! red_team` gives them `pub(crate)` access via the normal
+//! crate-internal path and lets us delete the public constructor
+//! entirely (Codex P1 on PR #11 fixup a3726b1).
 
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
 
-use azoth_core::artifacts::ArtifactStore;
-use azoth_core::authority::{ExtractionError, Origin, Tainted};
-use azoth_core::context::{EvidenceCollector, LexicalEvidenceCollector, SymbolEvidenceCollector};
-use azoth_core::execution::{dispatch_tool, ExecutionContext, Tool, ToolDispatcher, ToolError};
-use azoth_core::retrieval::{
+use tempfile::TempDir;
+
+use crate::artifacts::ArtifactStore;
+use crate::authority::{ExtractionError, Origin, Tainted};
+use crate::context::{EvidenceCollector, LexicalEvidenceCollector, SymbolEvidenceCollector};
+use crate::execution::{dispatch_tool, ExecutionContext, Tool, ToolDispatcher, ToolError};
+use crate::retrieval::{
     LexicalRetrieval, RetrievalError, Span, Symbol, SymbolId, SymbolKind, SymbolRetrieval,
 };
-use azoth_core::schemas::{EffectClass, RunId, TurnId};
-use tempfile::TempDir;
+use crate::schemas::{EffectClass, RunId, TurnId};
 
 // ---------- Fakes ----------------------------------------------------------
 
@@ -145,7 +160,7 @@ async fn dispatcher_rejects_indexer_payload_on_model_only_tool() {
     let mut disp = ToolDispatcher::new();
     disp.register(ModelOnlyEcho);
     let (ctx, _tmp) = build_ctx();
-    let raw = Tainted::for_injection_test(Origin::Indexer, json!({"msg": "hi"}));
+    let raw = Tainted::new(Origin::Indexer, json!({"msg": "hi"}));
     let err = dispatch_tool(&disp, "model_only_echo", raw, &ctx)
         .await
         .expect_err("Indexer must be rejected by a ModelOutput-only tool");
@@ -321,7 +336,7 @@ async fn indexer_origin_is_accepted_by_tool_that_explicitly_permits_it() {
     let mut disp = ToolDispatcher::new();
     disp.register(IndexerTool);
     let (ctx, _tmp) = build_ctx();
-    let raw = Tainted::for_injection_test(Origin::Indexer, json!({"x": 41}));
+    let raw = Tainted::new(Origin::Indexer, json!({"x": 41}));
     let out = dispatch_tool(&disp, "indexer_tool", raw, &ctx)
         .await
         .unwrap();

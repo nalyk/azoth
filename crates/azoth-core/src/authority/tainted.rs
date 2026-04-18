@@ -41,21 +41,6 @@ impl<T> Tainted<T> {
         Self { origin, inner }
     }
 
-    /// TEST-ONLY constructor used exclusively by injection-surface tests
-    /// (`tests/v2_injection_surface.rs`) and eval harnesses that need to
-    /// simulate cross-origin payloads without routing through an adapter
-    /// or dispatcher shim. Production code MUST go through the dispatcher
-    /// or adapter entry points — arbitrary minting bypasses the trust
-    /// discipline `Tainted` exists to enforce.
-    ///
-    /// `#[doc(hidden)]` so it does not surface in docs; every caller is
-    /// expected to carry a comment justifying why the real seams cannot
-    /// be used. If you are reading this from production code, stop.
-    #[doc(hidden)]
-    pub fn for_injection_test(origin: Origin, inner: T) -> Self {
-        Self { origin, inner }
-    }
-
     pub fn origin(&self) -> Origin {
         self.origin
     }

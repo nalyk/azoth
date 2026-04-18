@@ -27,4 +27,12 @@ pub mod tools;
 pub mod turn;
 pub mod validators;
 
+/// Injection-surface red-team tests (Sprint 7 + PR #11 Codex P1).
+/// Lives inside `src/` under `#[cfg(test)]` so the tests can reach
+/// `pub(crate) Tainted::new` without forcing a public constructor
+/// whose compilation visibility would re-open the provenance gate
+/// to downstream consumers.
+#[cfg(test)]
+mod red_team;
+
 pub use schemas::*;
