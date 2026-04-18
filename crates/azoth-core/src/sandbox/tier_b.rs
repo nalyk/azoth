@@ -155,20 +155,57 @@ impl OverlayWorkspace {
     }
 }
 
+/// Walk `dir` (non-recursive into symlinked dirs — see SECURITY
+/// note) and push every file-like entry as a path relative to
+/// `root`.
+///
+/// ## Security — symlink-directory traversal (codex round-6 P1 on PR #14)
+///
+/// The previous implementation used `path.is_dir()`, which FOLLOWS
+/// symlinks. A Tier-B command like `ln -s /etc leak` placed a
+/// symlink in the overlay upper layer; `path.is_dir()` resolved
+/// to `/etc` and returned true, so the walker descended into
+/// `/etc` and returned entries like `leak/passwd`. The downstream
+/// `stage_overlay_back` then copied `ws.upper.join("leak/passwd")`
+/// (which resolves through the symlink to `/etc/passwd`) into the
+/// real repo. **Host files leaked into the repo via a
+/// model-issued bash command — a data-integrity breach.**
+///
+/// Fix: use `symlink_metadata()` which does NOT follow symlinks.
+/// Symlinks are recorded as entries (stage_overlay_back recreates
+/// them via `std::os::unix::fs::symlink`) but never recursed
+/// into. Regular directories recurse as before; regular files are
+/// recorded; other file types (sockets, fifos, block/char
+/// devices) are also recorded as entries so the whiteout logic
+/// in stage-back can handle char-device whiteouts.
 #[cfg(target_os = "linux")]
 fn collect_files(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
-    if !dir.is_dir() {
+    let dir_meta = match std::fs::symlink_metadata(dir) {
+        Ok(m) => m,
+        Err(_) => return Ok(()),
+    };
+    if !dir_meta.file_type().is_dir() {
         return Ok(());
     }
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
-        if path.is_dir() {
-            collect_files(root, &path, out)?;
-        } else {
+        let meta = match std::fs::symlink_metadata(&path) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let ft = meta.file_type();
+        if ft.is_symlink() {
+            // Record the symlink itself; DO NOT follow into it.
             if let Ok(rel) = path.strip_prefix(root) {
                 out.push(rel.to_path_buf());
             }
+        } else if ft.is_dir() {
+            // Real directory — recurse.
+            collect_files(root, &path, out)?;
+        } else if let Ok(rel) = path.strip_prefix(root) {
+            // Regular file, char device, fifo, socket — record.
+            out.push(rel.to_path_buf());
         }
     }
     Ok(())

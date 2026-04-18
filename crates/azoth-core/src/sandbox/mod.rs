@@ -31,11 +31,13 @@ pub trait Sandbox: Send + Sync {
     fn prepare(&self) -> Result<(), SandboxError>;
 }
 
+pub mod policy;
 pub mod probe;
 pub mod tier_a;
 pub mod tier_b;
 pub mod tier_cd;
 
+pub use policy::SandboxPolicy;
 pub use probe::probe_unprivileged_userns;
 pub use tier_a::TierA;
 #[cfg(target_os = "linux")]

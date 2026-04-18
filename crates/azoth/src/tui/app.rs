@@ -28,8 +28,8 @@ use tui_textarea::{Input as TaInput, TextArea};
 use azoth_core::artifacts::ArtifactStore;
 use azoth_core::authority::{ApprovalRequestMsg, ApprovalResponse, CapabilityStore};
 use azoth_core::context::{
-    CompositeEvidenceCollector, EvidenceCollector, IdentityReranker, LexicalEvidenceCollector,
-    ReciprocalRankFusion, SymbolEvidenceCollector, TokenBudget,
+    CompositeEvidenceCollector, EvidenceCollector, GraphEvidenceCollector, IdentityReranker,
+    LexicalEvidenceCollector, ReciprocalRankFusion, SymbolEvidenceCollector, TokenBudget,
 };
 use azoth_core::event_store::{JsonlReader, JsonlWriter, SqliteMirror};
 use azoth_core::execution::{ExecutionContext, ToolDispatcher};
@@ -560,10 +560,15 @@ impl AppState {
 struct IndexerBackends {
     fts: Arc<FtsLexicalRetrieval>,
     symbols: Arc<SqliteSymbolIndex>,
-    /// Held for liveness so Sprint 7.1 can bolt on a
-    /// `GraphEvidenceCollector` without reopening the Connection.
-    #[allow(dead_code)]
-    graph: Arc<CoEditGraphRetrieval>,
+    /// Wired into the composite's `graph` lane via
+    /// `GraphEvidenceCollector` (PR B, v2 Sprint 7.1 closure).
+    /// **Option so that co-edit build failures result in the
+    /// graph lane being unwired for the session** (codex round-6
+    /// P2 on PR #14). Previously this was always `Arc<...>` —
+    /// build failure only logged, and stale `co_edit_edges` data
+    /// from a previous run kept being queried, silently skewing
+    /// retrieval. Same gating shape as `eval_live::build_collector`.
+    graph: Option<Arc<CoEditGraphRetrieval>>,
 }
 
 /// Open the mirror DB through a writer-role `RepoIndexer`, run the
@@ -611,7 +616,11 @@ async fn build_indexer_backends(
         co_edit::build(&co_edit_conn, &co_edit_root, co_edit_cfg)
     })
     .await;
-    match co_edit_res {
+    // Codex round-6 P2: track build success so the graph lane
+    // wiring below can SKIP opening CoEditGraphRetrieval when the
+    // build failed. Previously we logged and then opened anyway,
+    // so stale co_edit_edges from a prior run kept being queried.
+    let co_edit_build_ok = match co_edit_res {
         Ok(Ok(stats)) => {
             tracing::info!(
                 commits_walked = stats.commits_walked,
@@ -621,14 +630,17 @@ async fn build_indexer_backends(
                 elapsed_ms = stats.elapsed_ms,
                 "co_edit graph built"
             );
+            true
         }
         Ok(Err(e)) => {
-            tracing::warn!(error = %e, "co_edit graph build skipped");
+            tracing::warn!(error = %e, "co_edit graph build skipped; graph lane will be unwired");
+            false
         }
         Err(join_err) => {
-            tracing::warn!(error = %join_err, "co_edit graph build join failed");
+            tracing::warn!(error = %join_err, "co_edit graph build join failed; graph lane will be unwired");
+            false
         }
-    }
+    };
     // Release the writer handle before opening the reader trio so the
     // Connection doesn't linger unnecessarily.
     drop(indexer);
@@ -651,12 +663,16 @@ async fn build_indexer_backends(
             return None;
         }
     };
-    let graph = match CoEditGraphRetrieval::open(db_path) {
-        Ok(g) => Arc::new(g),
-        Err(e) => {
-            tracing::warn!(error = %e, "graph retrieval open failed; composite lanes will be ripgrep-only");
-            return None;
+    let graph: Option<Arc<CoEditGraphRetrieval>> = if co_edit_build_ok {
+        match CoEditGraphRetrieval::open(db_path) {
+            Ok(g) => Some(Arc::new(g)),
+            Err(e) => {
+                tracing::warn!(error = %e, "graph retrieval open failed; graph lane unwired");
+                None
+            }
         }
+    } else {
+        None
     };
 
     Some(IndexerBackends {
@@ -922,12 +938,30 @@ pub async fn run_app(resume: Option<String>) -> io::Result<()> {
                 let sym_dyn: Arc<dyn SymbolRetrieval> = sym.clone();
                 Arc::new(SymbolEvidenceCollector::new(sym_dyn)) as Arc<dyn EvidenceCollector>
             });
+        // v2 Sprint 7.1 Gap 1 closure: GraphEvidenceCollector wraps
+        // the co-edit graph retrieval built on worker startup. Seed
+        // extraction is greedy path-regex over the query — good
+        // enough to surface neighbours when the prompt references a
+        // file or directory; smart seeding (symbol-resolver-driven)
+        // is v2.5 with the policy DSL.
+        //
+        // Codex round-6 P2: `b.graph` is now `Option<...>` —
+        // `None` when the co-edit build failed so we skip wiring
+        // the lane entirely. Flat-mapping through both levels of
+        // Option yields `Some(Arc<dyn EvidenceCollector>)` only
+        // when indexer_backends is present AND the graph itself
+        // built cleanly this session.
+        let graph_lane_collector: Option<Arc<dyn EvidenceCollector>> = indexer_backends
+            .as_ref()
+            .and_then(|b| b.graph.as_ref())
+            .map(|g| {
+                let graph_dyn: Arc<dyn azoth_core::retrieval::GraphRetrieval> = g.clone();
+                Arc::new(GraphEvidenceCollector::new(graph_dyn)) as Arc<dyn EvidenceCollector>
+            });
 
         let composite_collector: Arc<dyn EvidenceCollector> = {
             let mut c = CompositeEvidenceCollector {
-                graph: None, // Sprint 7.1: GraphEvidenceCollector needs a
-                // seed-path policy; the co-edit graph is built but not
-                // yet queried from the composite lane.
+                graph: graph_lane_collector.clone(),
                 symbol: symbol_lane_collector.clone(),
                 lexical: Some(ripgrep_lane_collector),
                 fts: fts_lane_collector.clone(),
@@ -953,6 +987,7 @@ pub async fn run_app(resume: Option<String>) -> io::Result<()> {
             legacy_backend = legacy_backend_in_use,
             fts_lane_wired = fts_lane_collector.is_some(),
             symbol_lane_wired = symbol_lane_collector.is_some(),
+            graph_lane_wired = graph_lane_collector.is_some(),
             indexer_ready = indexer_backends.is_some(),
             "retrieval mode resolved"
         );

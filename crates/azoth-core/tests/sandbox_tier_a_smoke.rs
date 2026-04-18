@@ -27,6 +27,7 @@ fn spawn_jailed_runs_bin_true() {
             PathBuf::from("/etc"),
         ],
         allow_write: vec![],
+        strict_seccomp: true,
     };
     let mut child = spawn_jailed(&["/bin/true"], &opts).expect("spawn_jailed");
     let status = child.wait().expect("wait");

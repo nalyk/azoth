@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 
 mod eval;
+mod eval_live;
 mod export;
 mod replay;
 
@@ -94,6 +95,13 @@ enum EvalCommand {
         /// file's sha256.
         #[arg(long)]
         run_id: Option<String>,
+        /// Run a real composite retrieval pass against `<repo>` and
+        /// overwrite each task's `predicted_files` before scoring.
+        /// Flips the emitted metric to
+        /// `localization_precision_at_k_live` so forensic consumers
+        /// can split seed-vs-seed and live-retrieval runs.
+        #[arg(long, value_name = "REPO")]
+        live_retrieval: Option<PathBuf>,
     },
 }
 
@@ -199,6 +207,7 @@ fn main() {
                 out,
                 sessions_dir,
                 run_id,
+                live_retrieval,
             } => {
                 let sessions_dir =
                     sessions_dir.unwrap_or_else(|| PathBuf::from(".azoth").join("sessions"));
@@ -208,6 +217,7 @@ fn main() {
                     out,
                     sessions_dir,
                     run_id,
+                    live_retrieval,
                 };
                 let stdout = std::io::stdout();
                 let mut lock = stdout.lock();
