@@ -32,7 +32,7 @@ fn fs_write_then_end() -> MockScript {
             ModelTurnResponse {
                 content: vec![ContentBlock::ToolUse {
                     id: ToolUseId::new(),
-                    name: "fs.write".into(),
+                    name: "fs_write".into(),
                     input: serde_json::json!({
                         "path": ".azoth/tmp/budget.txt",
                         "contents": "over budget",
@@ -234,7 +234,7 @@ async fn first_apply_local_under_cap_succeeds_and_bumps_counter() {
     // round-trip is needed to prove the under-cap bump.
     let mut caps = CapabilityStore::new();
     caps.mint(mint_from_approval(
-        "fs.write",
+        "fs_write",
         EffectClass::ApplyLocal,
         ApprovalScope::Session,
     ));

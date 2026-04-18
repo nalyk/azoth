@@ -105,7 +105,7 @@ mod tests {
         let caps = CapabilityStore::new();
         let eng = AuthorityEngine::new(&caps, ApprovalPolicyV1);
         assert_eq!(
-            eng.authorize("repo.search", EffectClass::Observe, None),
+            eng.authorize("repo_search", EffectClass::Observe, None),
             AuthorityDecision::Auto
         );
     }
@@ -114,13 +114,13 @@ mod tests {
     fn apply_local_requires_approval_when_no_token() {
         let caps = CapabilityStore::new();
         let eng = AuthorityEngine::new(&caps, ApprovalPolicyV1);
-        match eng.authorize("fs.write", EffectClass::ApplyLocal, Some("/tmp/x")) {
+        match eng.authorize("fs_write", EffectClass::ApplyLocal, Some("/tmp/x")) {
             AuthorityDecision::RequireApproval {
                 tool_name,
                 effect_class,
                 ..
             } => {
-                assert_eq!(tool_name, "fs.write");
+                assert_eq!(tool_name, "fs_write");
                 assert_eq!(effect_class, EffectClass::ApplyLocal);
             }
             other => panic!("unexpected decision: {:?}", other),
@@ -140,11 +140,11 @@ mod tests {
     #[test]
     fn existing_session_token_is_reused() {
         let mut caps = CapabilityStore::new();
-        let tok = mint_from_approval("fs.write", EffectClass::ApplyLocal, ApprovalScope::Session);
+        let tok = mint_from_approval("fs_write", EffectClass::ApplyLocal, ApprovalScope::Session);
         caps.mint(tok);
         let eng = AuthorityEngine::new(&caps, ApprovalPolicyV1);
         assert!(matches!(
-            eng.authorize("fs.write", EffectClass::ApplyLocal, Some("/tmp/x")),
+            eng.authorize("fs_write", EffectClass::ApplyLocal, Some("/tmp/x")),
             AuthorityDecision::Reuse(_)
         ));
     }

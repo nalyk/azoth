@@ -445,7 +445,7 @@ mod tests {
             index: 0,
             block: ContentBlock::ToolUse {
                 id: ToolUseId::from("tu_b".to_string()),
-                name: "repo.search".into(),
+                name: "repo_search".into(),
                 input: serde_json::json!({"q":"x"}),
                 call_group: None,
             },

@@ -111,8 +111,8 @@ mod tests {
             Some(SlashCommand::Approve(None))
         );
         assert_eq!(
-            SlashCommand::parse("/approve fs.write"),
-            Some(SlashCommand::Approve(Some("fs.write".to_string())))
+            SlashCommand::parse("/approve fs_write"),
+            Some(SlashCommand::Approve(Some("fs_write".to_string())))
         );
         assert_eq!(SlashCommand::parse("/quit"), Some(SlashCommand::Quit));
     }

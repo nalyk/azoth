@@ -70,7 +70,7 @@ fn committed_run_progress_counts_only_committed_turn_effects() {
     .unwrap();
     w.append(&SessionEvent::EffectRecord {
         turn_id: t1.clone(),
-        effect: effect(EffectClass::ApplyLocal, "fs.write"),
+        effect: effect(EffectClass::ApplyLocal, "fs_write"),
     })
     .unwrap();
     w.append(&SessionEvent::TurnCommitted {
@@ -117,7 +117,7 @@ fn committed_run_progress_counts_only_committed_turn_effects() {
     .unwrap();
     w.append(&SessionEvent::EffectRecord {
         turn_id: t3.clone(),
-        effect: effect(EffectClass::ApplyLocal, "fs.write"),
+        effect: effect(EffectClass::ApplyLocal, "fs_write"),
     })
     .unwrap();
     w.append(&SessionEvent::EffectRecord {
@@ -128,7 +128,7 @@ fn committed_run_progress_counts_only_committed_turn_effects() {
     // An Observe effect — must NOT move any counter (network_reads stays 0).
     w.append(&SessionEvent::EffectRecord {
         turn_id: t3.clone(),
-        effect: effect(EffectClass::Observe, "repo.search"),
+        effect: effect(EffectClass::Observe, "repo_search"),
     })
     .unwrap();
     w.append(&SessionEvent::TurnCommitted {

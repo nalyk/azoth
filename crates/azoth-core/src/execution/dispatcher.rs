@@ -112,6 +112,12 @@ impl ToolDispatcher {
 
     pub fn register<T: ErasedTool + 'static>(&mut self, tool: T) {
         let name = tool.name().to_string();
+        assert!(
+            is_valid_provider_tool_name(&name),
+            "tool name {name:?} violates the provider tool-name regex \
+             ^[a-zA-Z0-9_-]{{1,128}}$ (Anthropic Messages API). Rename \
+             to use only ASCII letters, digits, underscore, or hyphen."
+        );
         self.tools.insert(name, Arc::new(tool));
     }
 
@@ -150,4 +156,22 @@ pub async fn dispatch_tool(
         return Err(ToolError::Cancelled);
     }
     tool.dispatch(raw, ctx).await
+}
+
+/// Checks that `name` satisfies Anthropic Messages API's tool-name
+/// regex `^[a-zA-Z0-9_-]{1,128}$`. Enforced by `ToolDispatcher::register`
+/// so a built-in tool with a dotted / special-char name (which the
+/// Anthropic API rejects as `invalid_request_error`) cannot reach
+/// production — the worker crashes at startup instead of 400-ing on
+/// the first live request.
+///
+/// The same regex is the narrowest common denominator across provider
+/// tool-name validators we've encountered; OpenAI/OpenRouter are
+/// permissive, so satisfying Anthropic covers the rest.
+pub(crate) fn is_valid_provider_tool_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }

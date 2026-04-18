@@ -1,5 +1,5 @@
-//! `repo.read_file` — read a single file from the repo root. Supports
-//! optional line-range slicing. Same path-traversal guard as `fs.write`.
+//! `repo_read_file` — read a single file from the repo root. Supports
+//! optional line-range slicing. Same path-traversal guard as `fs_write`.
 
 use crate::execution::{ExecutionContext, Tool, ToolError};
 use crate::schemas::EffectClass;
@@ -32,7 +32,7 @@ impl Tool for RepoReadFileTool {
     type Output = RepoReadFileOutput;
 
     fn name(&self) -> &'static str {
-        "repo.read_file"
+        "repo_read_file"
     }
 
     fn effect_class(&self) -> EffectClass {
@@ -143,7 +143,7 @@ mod tests {
         let mut disp = ToolDispatcher::new();
         disp.register(RepoReadFileTool);
         let raw = Tainted::new(Origin::ModelOutput, json!({ "path": "hello.txt" }));
-        let out = dispatch_tool(&disp, "repo.read_file", raw, &ctx)
+        let out = dispatch_tool(&disp, "repo_read_file", raw, &ctx)
             .await
             .unwrap();
         assert_eq!(out["total_lines"], 3);
@@ -169,7 +169,7 @@ mod tests {
             Origin::ModelOutput,
             json!({ "path": "big.txt", "start_line": 5, "end_line": 8 }),
         );
-        let out = dispatch_tool(&disp, "repo.read_file", raw, &ctx)
+        let out = dispatch_tool(&disp, "repo_read_file", raw, &ctx)
             .await
             .unwrap();
         let content = out["content"].as_str().unwrap();
@@ -190,7 +190,7 @@ mod tests {
         let mut disp = ToolDispatcher::new();
         disp.register(RepoReadFileTool);
         let raw = Tainted::new(Origin::ModelOutput, json!({ "path": "../../etc/passwd" }));
-        let err = dispatch_tool(&disp, "repo.read_file", raw, &ctx)
+        let err = dispatch_tool(&disp, "repo_read_file", raw, &ctx)
             .await
             .expect_err("traversal must fail");
         match err {

@@ -23,7 +23,7 @@ fn fs_write_script() -> MockScript {
             ModelTurnResponse {
                 content: vec![ContentBlock::ToolUse {
                     id: ToolUseId::new(),
-                    name: "fs.write".into(),
+                    name: "fs_write".into(),
                     input: serde_json::json!({
                         "path": ".azoth/tmp/hello.txt",
                         "contents": "hello from approval path",
@@ -130,7 +130,7 @@ async fn drive_with_responder(
             .expect("driver returns Ok even on deny");
         had_any_cap = caps
             .find(
-                "fs.write",
+                "fs_write",
                 EffectClass::ApplyLocal,
                 Some(".azoth/tmp/hello.txt"),
             )

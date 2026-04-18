@@ -1,4 +1,4 @@
-data: {"id":"chatcmpl-2","choices":[{"index":0,"delta":{"role":"assistant","content":null,"tool_calls":[{"index":0,"id":"tu_a","type":"function","function":{"name":"repo.search","arguments":""}}]},"finish_reason":null}]}
+data: {"id":"chatcmpl-2","choices":[{"index":0,"delta":{"role":"assistant","content":null,"tool_calls":[{"index":0,"id":"tu_a","type":"function","function":{"name":"repo_search","arguments":""}}]},"finish_reason":null}]}
 
 data: {"id":"chatcmpl-2","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"q\":"}}]},"finish_reason":null}]}
 

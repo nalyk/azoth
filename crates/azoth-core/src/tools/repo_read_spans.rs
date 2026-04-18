@@ -1,4 +1,4 @@
-//! `repo.read_spans` — read named line ranges from one or more files.
+//! `repo_read_spans` — read named line ranges from one or more files.
 //! Each span is a (path, start_line, end_line) triple. Useful for reading
 //! specific functions or regions without pulling entire files into context.
 
@@ -41,7 +41,7 @@ impl Tool for RepoReadSpansTool {
     type Output = RepoReadSpansOutput;
 
     fn name(&self) -> &'static str {
-        "repo.read_spans"
+        "repo_read_spans"
     }
 
     fn effect_class(&self) -> EffectClass {
@@ -186,7 +186,7 @@ mod tests {
                 ]
             }),
         );
-        let out = dispatch_tool(&disp, "repo.read_spans", raw, &ctx)
+        let out = dispatch_tool(&disp, "repo_read_spans", raw, &ctx)
             .await
             .unwrap();
         let results = out["results"].as_array().unwrap();
@@ -222,7 +222,7 @@ mod tests {
                 ]
             }),
         );
-        let err = dispatch_tool(&disp, "repo.read_spans", raw, &ctx)
+        let err = dispatch_tool(&disp, "repo_read_spans", raw, &ctx)
             .await
             .expect_err("traversal must fail");
         match err {

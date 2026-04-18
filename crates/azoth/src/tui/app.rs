@@ -204,7 +204,7 @@ impl AppState {
                         .push("  pre-grants a session-scoped capability token".into());
                     self.transcript
                         .push("  so the tool will not prompt for approval.".into());
-                    self.transcript.push("  registered tools: fs.write, bash, repo.search, repo.read_file, repo.read_spans".into());
+                    self.transcript.push("  registered tools: fs_write, bash, repo_search, repo_read_file, repo_read_spans".into());
                 }
             },
             SlashCommand::Quit => {
@@ -1368,10 +1368,10 @@ mod tests {
     #[test]
     fn slash_approve_with_arg_queues_tool_name() {
         let mut state = AppState::new();
-        state.handle_slash(SlashCommand::Approve(Some("fs.write".into())));
+        state.handle_slash(SlashCommand::Approve(Some("fs_write".into())));
         let tool = state.take_pending_approve().expect("pending approve");
-        assert_eq!(tool, "fs.write");
-        assert!(state.transcript.iter().any(|l| l.contains("fs.write")));
+        assert_eq!(tool, "fs_write");
+        assert!(state.transcript.iter().any(|l| l.contains("fs_write")));
     }
 
     #[test]

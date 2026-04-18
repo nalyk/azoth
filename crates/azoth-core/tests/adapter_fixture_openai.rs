@@ -144,7 +144,7 @@ async fn parallel_tool_calls_fixture_yields_two_tool_uses() {
     match &resp.content[0] {
         ContentBlock::ToolUse { id, name, .. } => {
             assert_eq!(id.as_str(), "tu_a");
-            assert_eq!(name, "repo.search");
+            assert_eq!(name, "repo_search");
         }
         other => panic!("expected ToolUse block, got {other:?}"),
     }

@@ -558,7 +558,7 @@ mod tests {
                 id, name, input, ..
             } => {
                 assert_eq!(id.as_str(), "tu_a");
-                assert_eq!(name, "repo.search");
+                assert_eq!(name, "repo_search");
                 assert_eq!(input.get("q").and_then(Value::as_str), Some("x"));
             }
             other => panic!("expected tool_use block, got {other:?}"),

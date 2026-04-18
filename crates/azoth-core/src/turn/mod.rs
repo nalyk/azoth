@@ -943,7 +943,7 @@ fn approval_hint(tool_name: &str, input: &serde_json::Value) -> String {
                 return truncate_single_line(cmd, 80);
             }
         }
-        "repo.search" => {
+        "repo_search" => {
             if let Some(q) = input.get("q").and_then(|v| v.as_str()) {
                 return format!("q={}", truncate_single_line(q, 60));
             }
@@ -986,13 +986,13 @@ mod approval_hint_tests {
     #[test]
     fn path_based_tool_prefers_path() {
         let v = serde_json::json!({ "path": "src/foo.rs", "command": "ignored" });
-        assert_eq!(approval_hint("fs.write", &v), "src/foo.rs");
+        assert_eq!(approval_hint("fs_write", &v), "src/foo.rs");
     }
 
     #[test]
     fn search_hint_shows_query() {
         let v = serde_json::json!({ "q": "refresh_token" });
-        assert_eq!(approval_hint("repo.search", &v), "q=refresh_token");
+        assert_eq!(approval_hint("repo_search", &v), "q=refresh_token");
     }
 
     #[test]

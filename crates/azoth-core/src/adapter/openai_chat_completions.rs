@@ -230,7 +230,7 @@ mod tests {
                     role: Role::Assistant,
                     content: vec![ContentBlock::ToolUse {
                         id: ToolUseId::from("tu_a".to_string()),
-                        name: "repo.search".into(),
+                        name: "repo_search".into(),
                         input: json!({"q": "x"}),
                         call_group: None,
                     }],
