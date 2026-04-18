@@ -177,9 +177,13 @@ pub fn extract_seed_paths(query: &str) -> Vec<String> {
         if !looks_like_path {
             continue;
         }
-        // Filter out likely noise: pure ext (".rs") or leading-only
-        // prefix ("crates/").
-        if trimmed.len() <= 5 {
+        // Filter out pure noise tokens: a bare extension (".rs")
+        // or a leading-only prefix ("crates/"). Earlier versions
+        // used `trimmed.len() <= 5`, which also skipped legitimate
+        // short filenames like `a.rs` (gemini MEDIUM on PR #14).
+        // Exact-equality against the known-noise vocabulary is the
+        // precise filter.
+        if EXTENSIONS.contains(&trimmed) || PREFIXES.contains(&trimmed) {
             continue;
         }
         if !seen.insert(trimmed.to_string()) {
@@ -221,6 +225,30 @@ mod tests {
                 .any(|s| s == "crates/azoth-repo/src/history"
                     || s == "crates/azoth-repo/src/history/"),
             "expected a crates/... fragment, got {seeds:?}"
+        );
+    }
+
+    #[test]
+    #[test]
+    fn seed_extraction_accepts_short_valid_filenames() {
+        // PR #14 gemini MEDIUM regression guard: the previous
+        // `trimmed.len() <= 5` filter dropped short legitimate
+        // filenames (e.g. `a.rs`, `lib.rs`) along with actual
+        // noise (`.rs`, `crates/`). Exact-equality against the
+        // noise vocabulary fixes it.
+        let q = "fix a.rs and b.md, also crates/x.toml";
+        let seeds = extract_seed_paths(q);
+        assert!(
+            seeds.iter().any(|s| s == "a.rs"),
+            "short filename `a.rs` must survive the noise filter; got {seeds:?}"
+        );
+        assert!(
+            seeds.iter().any(|s| s == "b.md"),
+            "short filename `b.md` must survive the noise filter; got {seeds:?}"
+        );
+        assert!(
+            !seeds.iter().any(|s| s == ".rs" || s == "crates/"),
+            "bare extension/prefix must still be filtered; got {seeds:?}"
         );
     }
 

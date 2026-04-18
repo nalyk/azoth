@@ -52,6 +52,17 @@ pub struct BashOutput {
     pub stderr: String,
     pub truncated: bool,
     pub timed_out: bool,
+    /// Relative paths of files bash wrote during this invocation.
+    /// Under `SandboxPolicy::TierB`, these are the files the tool
+    /// staged from the fuse-overlayfs upper layer back to the real
+    /// repo root before the overlay was unmounted. Empty for
+    /// `SandboxPolicy::Off` and `SandboxPolicy::TierA` (the real
+    /// repo is written directly; no overlay to reconcile) and for
+    /// failed invocations (non-zero exit, timeout, cancellation)
+    /// where Tier B's discard-on-failure semantics mean nothing
+    /// should leak out of the sandbox.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub staged_files: Vec<String>,
 }
 
 #[async_trait]
@@ -129,12 +140,25 @@ impl Tool for BashTool {
         match result {
             Ok(Ok((status, stdout_buf, stderr_buf))) => {
                 let (stdout, stderr, truncated) = cap_output(&stdout_buf, &stderr_buf);
+                // Tier B closure (PR #14 codex P1 fix): on
+                // successful exit, copy the overlay's upper-layer
+                // writes back into the real repo BEFORE the handle
+                // Drops (which unmounts fuse-overlayfs and deletes
+                // the tmpdir). Failed runs intentionally drop the
+                // overlay untouched — that's the isolation
+                // contract: bad turns leave the repo pristine.
+                let staged_files = if status.success() {
+                    stage_overlay_back(overlay_handle.as_ref(), &ctx.repo_root)?
+                } else {
+                    Vec::new()
+                };
                 Ok(BashOutput {
                     exit_code: status.code(),
                     stdout,
                     stderr,
                     truncated,
                     timed_out: false,
+                    staged_files,
                 })
             }
             Ok(Err(e)) => Err(ToolError::Failed(format!("wait: {e}"))),
@@ -146,10 +170,44 @@ impl Tool for BashTool {
                     stderr: format!("timed out after {}ms", timeout.as_millis()),
                     truncated: false,
                     timed_out: true,
+                    staged_files: Vec::new(),
                 })
             }
         }
     }
+}
+
+/// Copy every file that the bash child wrote into the overlay's
+/// upper layer back into `repo_root`, preserving relative paths.
+/// Creates parent directories as needed. Called only when bash
+/// exits with status 0 under Tier B — failed runs do not stage.
+#[cfg(target_os = "linux")]
+fn stage_overlay_back(
+    overlay: Option<&crate::sandbox::OverlayWorkspace>,
+    repo_root: &std::path::Path,
+) -> Result<Vec<String>, ToolError> {
+    let Some(ws) = overlay else {
+        return Ok(Vec::new());
+    };
+    let rels = ws
+        .changed_files()
+        .map_err(|e| ToolError::Failed(format!("overlay changed_files: {e}")))?;
+    let mut staged: Vec<String> = Vec::with_capacity(rels.len());
+    for rel in &rels {
+        let src = ws.upper.join(rel);
+        let dst = repo_root.join(rel);
+        if let Some(parent) = dst.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| ToolError::Failed(format!("stage mkdir_p: {e}")))?;
+        }
+        std::fs::copy(&src, &dst).map_err(|e| {
+            ToolError::Failed(format!("stage {} → {}: {e}", src.display(), dst.display()))
+        })?;
+        staged.push(rel.display().to_string());
+    }
+    // Deterministic order so forensic replay is byte-stable.
+    staged.sort();
+    Ok(staged)
 }
 
 fn cap_output(stdout: &[u8], stderr: &[u8]) -> (String, String, bool) {
@@ -241,9 +299,20 @@ fn build_bash_command(
             std::path::PathBuf::from("/dev"),
             cwd.clone(),
         ];
+        // Narrow `/dev` allow-write down to the handful of device
+        // nodes bash genuinely needs for stdio + randomness, rather
+        // than granting write access to every device node under
+        // `/dev` (PR #14 gemini SECURITY-MEDIUM). Missing paths
+        // on a given host are silently dropped by Landlock — the
+        // ruleset builder only fails on fs-ops-level errors, not
+        // on individual path presence.
         let mut allow_write: Vec<std::path::PathBuf> = vec![
             std::path::PathBuf::from("/tmp"),
-            std::path::PathBuf::from("/dev"),
+            std::path::PathBuf::from("/dev/null"),
+            std::path::PathBuf::from("/dev/tty"),
+            std::path::PathBuf::from("/dev/urandom"),
+            std::path::PathBuf::from("/dev/random"),
+            std::path::PathBuf::from("/dev/zero"),
         ];
 
         // Tier B: mount overlay; bash's cwd becomes the merged view
@@ -287,7 +356,8 @@ fn build_bash_command(
             // Landlock is the effective enforcement here.
             strict_seccomp: false,
         };
-        let cmd = build_jailed_tokio_command("bash", &["-c", command_str], &opts, Some(&final_cwd));
+        let cmd = build_jailed_tokio_command("bash", &["-c", command_str], &opts, Some(&final_cwd))
+            .map_err(|e| ToolError::Failed(format!("sandbox jail build: {e}")))?;
         Ok(apply_env(cmd))
     }
 }
@@ -501,7 +571,13 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn bash_tier_b_isolates_writes_in_overlay_when_fuse_overlayfs_present() {
+    async fn bash_tier_b_stages_writes_back_to_repo_on_success() {
+        // PR #14 codex P1 fix regression guard. Previous semantics
+        // let overlay writes DROP silently on scope exit — bash
+        // reported success, file never reached the real repo.
+        // This test pins the corrected contract: success → write
+        // committed, `staged_files` lists it; failure → nothing
+        // leaks (covered by `bash_tier_b_discards_writes_on_failure`).
         use crate::sandbox::tier_b::probe_fuse_overlayfs;
         if sandbox_skip() {
             return;
@@ -530,16 +606,13 @@ mod tests {
         let out = dispatch_tool(&disp, "bash", raw, &ctx).await.unwrap();
         std::env::remove_var("AZOTH_SANDBOX");
 
-        assert_eq!(
-            out["exit_code"], 0,
-            "Tier B should let writes land in the overlay upper layer"
-        );
-        // Real repo stays pristine — no `staged.txt` leaked
-        // through after the overlay tear-down.
+        assert_eq!(out["exit_code"], 0, "bash succeeded");
         assert!(
-            !root.join("staged.txt").exists(),
-            "Tier B leaked overlay writes to the real repo; expected pristine lower layer"
+            root.join("staged.txt").exists(),
+            "Tier B must stage overlay writes back to real repo on success (codex P1 fix)"
         );
+        let contents = std::fs::read_to_string(root.join("staged.txt")).unwrap();
+        assert_eq!(contents.trim(), "sandbox");
         // Bash could still read the pre-existing file through the
         // merged view.
         let stdout = out["stdout"].as_str().unwrap_or("");
@@ -547,5 +620,62 @@ mod tests {
             stdout.contains("original"),
             "bash should read `existing.txt` through the merged overlay view; got stdout={stdout:?}"
         );
+        // staged_files surfaces the commit explicitly so the
+        // caller knows what landed.
+        let staged = out["staged_files"].as_array().expect("staged_files array");
+        assert!(
+            staged.iter().any(|v| v == "staged.txt"),
+            "expected staged_files to contain 'staged.txt'; got {staged:?}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn bash_tier_b_discards_writes_on_failure() {
+        // Complement to the success-stages test: on non-zero
+        // exit, the overlay's upper layer is dropped and the
+        // real repo stays pristine. That's Tier B's isolation
+        // contract — a bad turn leaves no trace.
+        use crate::sandbox::tier_b::probe_fuse_overlayfs;
+        if sandbox_skip() {
+            return;
+        }
+        if !probe_fuse_overlayfs() {
+            eprintln!("skip: fuse-overlayfs not on PATH");
+            return;
+        }
+        std::env::set_var("AZOTH_SANDBOX", "tier_b");
+
+        let dir = tempdir().unwrap();
+        let root = tokio::fs::canonicalize(dir.path()).await.unwrap();
+        let ctx = ctx_for(root.clone());
+
+        let mut disp = ToolDispatcher::new();
+        disp.register(BashTool);
+        // Write, then exit non-zero. The write landed in the
+        // overlay upper layer, but because exit was non-zero,
+        // stage_overlay_back refuses to commit.
+        let raw = Tainted::new(
+            Origin::ModelOutput,
+            json!({
+                "command": "echo fail > should_not_leak.txt; exit 17"
+            }),
+        );
+        let out = dispatch_tool(&disp, "bash", raw, &ctx).await.unwrap();
+        std::env::remove_var("AZOTH_SANDBOX");
+
+        assert_eq!(out["exit_code"], 17);
+        assert!(
+            !root.join("should_not_leak.txt").exists(),
+            "Tier B must discard overlay writes on failed exit; expected pristine repo"
+        );
+        let staged = out["staged_files"].as_array();
+        // `skip_serializing_if = Vec::is_empty` may drop the
+        // field entirely — either None or an empty array both
+        // satisfy the contract.
+        match staged {
+            None => {} // dropped entirely — fine
+            Some(arr) => assert!(arr.is_empty(), "no files staged on failure; got {arr:?}"),
+        }
     }
 }

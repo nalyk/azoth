@@ -283,20 +283,63 @@ fn child_jail(tool_argv: &[&str], opts: &SpawnOptions, outer_uid: u32, outer_gid
 /// before `execve()`. The closure must be async-signal-safe, which
 /// matches the `child_jail` sequence: `unshare`, `write`, and
 /// seccomp-bpf / Landlock loads are all permitted in that context.
+/// Async-signal-safe jail sequence invoked from `pre_exec` in the
+/// forked child. Error path uses `io::Error::from_raw_os_error` so
+/// failures allocate nothing either.
 #[cfg(target_os = "linux")]
-fn jail_preexec_inner(opts: &SpawnOptions, outer_uid: u32, outer_gid: u32) -> std::io::Result<()> {
+fn jail_preexec_async_signal_safe(
+    uid_map: &[u8],
+    gid_map: &[u8],
+    landlock_opt: &mut Option<landlock::RulesetCreated>,
+    seccomp_bpf: Option<&seccompiler::BpfProgram>,
+) -> std::io::Result<()> {
     use nix::sched::{unshare, CloneFlags};
-    use std::io::Error;
 
-    unshare(CloneFlags::CLONE_NEWUSER)
-        .map_err(|e| Error::other(format!("unshare(NEWUSER): {e}")))?;
-    std::fs::write("/proc/self/setgroups", "deny")?;
-    std::fs::write("/proc/self/uid_map", format!("0 {outer_uid} 1\n"))?;
-    std::fs::write("/proc/self/gid_map", format!("0 {outer_gid} 1\n"))?;
-    unshare(CloneFlags::CLONE_NEWNET).map_err(|e| Error::other(format!("unshare(NEWNET): {e}")))?;
-    install_landlock(opts).map_err(|_| Error::other("landlock install failed"))?;
-    if opts.strict_seccomp {
-        install_seccomp().map_err(|_| Error::other("seccomp install failed"))?;
+    unshare(CloneFlags::CLONE_NEWUSER).map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
+    write_proc_path(PROC_SETGROUPS, b"deny")?;
+    write_proc_path(PROC_UID_MAP, uid_map)?;
+    write_proc_path(PROC_GID_MAP, gid_map)?;
+    unshare(CloneFlags::CLONE_NEWNET).map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
+    if let Some(rs) = landlock_opt.take() {
+        let status = rs
+            .restrict_self()
+            .map_err(|_| std::io::Error::from_raw_os_error(nix::libc::EPERM))?;
+        if status.ruleset == landlock::RulesetStatus::NotEnforced {
+            return Err(std::io::Error::from_raw_os_error(nix::libc::EPERM));
+        }
+    }
+    if let Some(bpf) = seccomp_bpf {
+        seccompiler::apply_filter(bpf)
+            .map_err(|_| std::io::Error::from_raw_os_error(nix::libc::EPERM))?;
+    }
+    Ok(())
+}
+
+/// Compile-time CStr constants for `/proc` writes — the child
+/// allocates nothing.
+#[cfg(target_os = "linux")]
+const PROC_SETGROUPS: &std::ffi::CStr = c"/proc/self/setgroups";
+#[cfg(target_os = "linux")]
+const PROC_UID_MAP: &std::ffi::CStr = c"/proc/self/uid_map";
+#[cfg(target_os = "linux")]
+const PROC_GID_MAP: &std::ffi::CStr = c"/proc/self/gid_map";
+
+/// `open → write → close` via raw libc. Every step is
+/// async-signal-safe per POSIX. No Rust allocation, no `std::fs`
+/// indirection.
+#[cfg(target_os = "linux")]
+fn write_proc_path(path: &std::ffi::CStr, bytes: &[u8]) -> std::io::Result<()> {
+    // SAFETY: `path` is a static, valid C string. `bytes` is a
+    // live byte slice with a correct len. `close` is always safe
+    // on an fd returned by `open`.
+    let fd = unsafe { nix::libc::open(path.as_ptr(), nix::libc::O_WRONLY) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let n = unsafe { nix::libc::write(fd, bytes.as_ptr() as *const _, bytes.len()) };
+    unsafe { nix::libc::close(fd) };
+    if n < 0 || (n as usize) != bytes.len() {
+        return Err(std::io::Error::last_os_error());
     }
     Ok(())
 }
@@ -307,44 +350,192 @@ fn jail_preexec_inner(opts: &SpawnOptions, outer_uid: u32, outer_gid: u32) -> st
 /// everything layered on the returned `Command` runs *before* the
 /// fork, which is exactly what you want for stdout/stderr pipes.
 ///
-/// `cwd` is applied *after* `pre_exec` via the `Command` builder,
-/// so it takes effect in the post-exec process. For Tier B wiring,
-/// pass `<OverlayWorkspace>.merged` as the cwd so bash lands inside
-/// the writable merge view.
+/// `cwd` is applied via the `Command` builder, so it takes effect
+/// in the post-exec process. For Tier B wiring, pass
+/// `<OverlayWorkspace>.merged` as the cwd so bash lands inside the
+/// writable merge view.
 ///
-/// This is the v2.1 Gap 2 entrypoint for tools that need async
-/// stdio. The synchronous `spawn_jailed` stays for tests and
-/// non-tokio callers.
+/// Returns `Err` when the Landlock ruleset or seccomp BPF program
+/// cannot be built in the parent — the child never forks in that
+/// case.
+///
+/// ## Async-signal-safety discipline (PR #14 bot HIGH/P1 fix)
+///
+/// `pre_exec` runs post-fork pre-exec. In a multi-threaded Tokio
+/// process, any allocator or libc lock held by another thread at
+/// fork time stays held in the child; calling Rust code that takes
+/// those locks deadlocks the child. So this function does ALL
+/// Rust-level allocation up front in the parent (landlock
+/// `RulesetCreated` with every `add_rule` applied; seccomp
+/// `BpfProgram` built; uid/gid map bytes formatted into owned
+/// `Vec<u8>`). The pre_exec closure itself calls only:
+///
+/// - `nix::sched::unshare` — raw `unshare(2)`, async-signal-safe
+/// - `libc::open` / `libc::write` / `libc::close` — the only
+///   touches to `/proc/self/{setgroups,uid_map,gid_map}`; paths
+///   are compile-time `CStr`s so the child allocates nothing
+/// - `RulesetCreated::restrict_self` — `prctl` + `landlock_restrict_self`
+/// - `seccompiler::apply_filter(&BpfProgram)` — `prctl` + `seccomp`
+///
+/// `std::fs::write`, `format!`, `Vec::push`, `PathBuf::from`, and
+/// any `Error::other(format!(...))` stay in parent-only code above.
 #[cfg(target_os = "linux")]
 pub fn build_jailed_tokio_command(
     program: &str,
     args: &[&str],
     opts: &SpawnOptions,
     cwd: Option<&std::path::Path>,
-) -> tokio::process::Command {
+) -> Result<tokio::process::Command, SandboxError> {
     use nix::unistd::{getgid, getuid};
-    // The `pre_exec` method is provided by
-    // `std::os::unix::process::CommandExt`. We route through
-    // `tokio::process::Command`, which exposes `pre_exec` directly
-    // as an inherent method — no import needed.
 
     let outer_uid = getuid().as_raw();
     let outer_gid = getgid().as_raw();
-    let opts_clone = opts.clone();
+
+    // Parent-side, pre-fork: do ALL Rust allocation here.
+    let uid_map: Vec<u8> = format!("0 {outer_uid} 1\n").into_bytes();
+    let gid_map: Vec<u8> = format!("0 {outer_gid} 1\n").into_bytes();
+    let landlock_rs =
+        build_landlock_ruleset(opts).map_err(|_| SandboxError::MissingDependency("landlock"))?;
+    let seccomp_bpf: Option<seccompiler::BpfProgram> = if opts.strict_seccomp {
+        Some(build_seccomp_program().map_err(|_| SandboxError::Syscall("seccomp build".into()))?)
+    } else {
+        None
+    };
+
     let mut cmd = tokio::process::Command::new(program);
     cmd.args(args);
     if let Some(d) = cwd {
         cmd.current_dir(d);
     }
-    // SAFETY: `pre_exec` runs post-fork pre-exec. The closure owns
-    // `opts_clone` and only calls async-signal-safe operations plus
-    // the Landlock / seccomp crate setup calls — both of which are
-    // deliberately designed for this phase (see the sandboxing
-    // crate docs).
+
+    // `pre_exec` binds the closure as `FnMut`, so consuming
+    // `landlock_rs` directly would trip the borrow checker.
+    // `.take()` from an `Option` is a pure pointer swap — no
+    // allocation — so it stays signal-safe.
+    let mut landlock_opt: Option<landlock::RulesetCreated> = Some(landlock_rs);
+
+    // SAFETY: see the function-level docstring — every operation
+    // in the closure is async-signal-safe, and every artifact it
+    // reads was built pre-fork by the parent.
     unsafe {
-        cmd.pre_exec(move || jail_preexec_inner(&opts_clone, outer_uid, outer_gid));
+        cmd.pre_exec(move || {
+            jail_preexec_async_signal_safe(
+                &uid_map,
+                &gid_map,
+                &mut landlock_opt,
+                seccomp_bpf.as_ref(),
+            )
+        });
     }
-    cmd
+    Ok(cmd)
+}
+
+/// Build the Landlock `RulesetCreated` pre-fork (fd opened + every
+/// `add_rule` applied). `restrict_self()` is the one step deferred
+/// to the child because it's the commit that gags the current
+/// process — calling it in the parent would gag the parent.
+#[cfg(target_os = "linux")]
+fn build_landlock_ruleset(opts: &SpawnOptions) -> Result<landlock::RulesetCreated, ()> {
+    use landlock::{
+        Access, AccessFs, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreatedAttr, ABI,
+    };
+
+    let abi = ABI::V2;
+    let access_all = AccessFs::from_all(abi);
+    let access_read = AccessFs::from_read(abi);
+    let access_write = AccessFs::from_write(abi) | AccessFs::from_read(abi);
+
+    let mut created = Ruleset::default()
+        .handle_access(access_all)
+        .map_err(|_| ())?
+        .create()
+        .map_err(|_| ())?;
+    // Individual `allow_read` / `allow_write` entries may not
+    // exist on every host (e.g. `/dev/random` missing on a bare
+    // container) — skip missing-path entries rather than failing
+    // the whole ruleset build. The cost is a subset of the
+    // intended allow-list; the alternative is the tool refusing
+    // to run at all on a minor FS difference.
+    for p in &opts.allow_read {
+        let Ok(fd) = PathFd::new(p) else { continue };
+        created = created
+            .add_rule(PathBeneath::new(fd, access_read))
+            .map_err(|_| ())?;
+    }
+    for p in &opts.allow_write {
+        let Ok(fd) = PathFd::new(p) else { continue };
+        created = created
+            .add_rule(PathBeneath::new(fd, access_write))
+            .map_err(|_| ())?;
+    }
+    Ok(created)
+}
+
+/// Build the seccomp BPF program pre-fork. `strict_seccomp=false`
+/// skips this entirely (BashTool path).
+#[cfg(target_os = "linux")]
+fn build_seccomp_program() -> Result<seccompiler::BpfProgram, ()> {
+    use seccompiler::{SeccompAction, SeccompFilter};
+    use std::convert::TryInto;
+
+    // Narrow `/bin/true`-grade allowlist — reused by the
+    // `sandbox_tier_a_smoke` integration test. Subprocess-heavy
+    // tools (bash) set `strict_seccomp = false`, so this is never
+    // built for them; Landlock carries the enforcement.
+    let allowed: &[i64] = &[
+        nix::libc::SYS_read,
+        nix::libc::SYS_write,
+        nix::libc::SYS_close,
+        nix::libc::SYS_exit,
+        nix::libc::SYS_exit_group,
+        nix::libc::SYS_rt_sigreturn,
+        nix::libc::SYS_rt_sigaction,
+        nix::libc::SYS_rt_sigprocmask,
+        nix::libc::SYS_execve,
+        nix::libc::SYS_openat,
+        nix::libc::SYS_newfstatat,
+        nix::libc::SYS_fstat,
+        nix::libc::SYS_mmap,
+        nix::libc::SYS_mprotect,
+        nix::libc::SYS_munmap,
+        nix::libc::SYS_brk,
+        nix::libc::SYS_arch_prctl,
+        nix::libc::SYS_set_tid_address,
+        nix::libc::SYS_set_robust_list,
+        nix::libc::SYS_rseq,
+        nix::libc::SYS_prlimit64,
+        nix::libc::SYS_getrandom,
+        nix::libc::SYS_uname,
+        nix::libc::SYS_readlink,
+        nix::libc::SYS_readlinkat,
+        nix::libc::SYS_pread64,
+        nix::libc::SYS_access,
+        nix::libc::SYS_faccessat,
+        nix::libc::SYS_faccessat2,
+        nix::libc::SYS_getuid,
+        nix::libc::SYS_getgid,
+        nix::libc::SYS_geteuid,
+        nix::libc::SYS_getegid,
+        nix::libc::SYS_futex,
+        nix::libc::SYS_gettid,
+        nix::libc::SYS_tgkill,
+        nix::libc::SYS_getpid,
+        nix::libc::SYS_clock_gettime,
+        nix::libc::SYS_poll,
+        nix::libc::SYS_ppoll,
+        nix::libc::SYS_lseek,
+    ];
+    let rules = allowed.iter().map(|s| (*s, vec![])).collect();
+    let bpf: seccompiler::BpfProgram = SeccompFilter::new(
+        rules,
+        SeccompAction::KillProcess,
+        SeccompAction::Allow,
+        std::env::consts::ARCH.try_into().map_err(|_| ())?,
+    )
+    .map_err(|_| ())?
+    .try_into()
+    .map_err(|_| ())?;
+    Ok(bpf)
 }
 
 #[cfg(target_os = "linux")]
