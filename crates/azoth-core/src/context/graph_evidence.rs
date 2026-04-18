@@ -229,7 +229,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn seed_extraction_accepts_short_valid_filenames() {
         // PR #14 gemini MEDIUM regression guard: the previous
         // `trimmed.len() <= 5` filter dropped short legitimate

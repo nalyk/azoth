@@ -36,6 +36,16 @@ use tokio::process::Command;
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 const MAX_OUTPUT_BYTES: usize = 256 * 1024;
 
+/// Platform-portable handle that holds the Tier B overlay on
+/// Linux and is a unit elsewhere. Lets `execute()` declare
+/// `let mut overlay_handle: OverlayHandle = Default::default();`
+/// without scattering `#[cfg]` through the happy path (codex
+/// re-review P1 on PR #14).
+#[cfg(target_os = "linux")]
+type OverlayHandle = Option<crate::sandbox::OverlayWorkspace>;
+#[cfg(not(target_os = "linux"))]
+type OverlayHandle = ();
+
 pub struct BashTool;
 
 #[derive(Debug, Deserialize)]
@@ -103,9 +113,12 @@ impl Tool for BashTool {
         // Build a lazy-mounted overlay for Tier B *only* when the
         // policy asks for it. The handle is held on the stack so
         // `Drop` unmounts when execute() returns, whether the bash
-        // run committed or failed.
+        // run committed or failed. `OverlayHandle` is a
+        // cross-platform type alias (`Option<OverlayWorkspace>` on
+        // Linux, `()` elsewhere) so the outer code stays portable
+        // per codex re-review P1 on PR #14.
         #[allow(unused_mut)]
-        let mut overlay_handle: Option<crate::sandbox::OverlayWorkspace> = None;
+        let mut overlay_handle: OverlayHandle = Default::default();
         let mut child =
             build_bash_command(&input.command, &ctx.repo_root, policy, &mut overlay_handle)?
                 .stdin(Stdio::null())
@@ -148,7 +161,7 @@ impl Tool for BashTool {
                 // overlay untouched — that's the isolation
                 // contract: bad turns leave the repo pristine.
                 let staged_files = if status.success() {
-                    stage_overlay_back(overlay_handle.as_ref(), &ctx.repo_root)?
+                    stage_overlay_back(&overlay_handle, &ctx.repo_root)?
                 } else {
                     Vec::new()
                 };
@@ -181,12 +194,16 @@ impl Tool for BashTool {
 /// upper layer back into `repo_root`, preserving relative paths.
 /// Creates parent directories as needed. Called only when bash
 /// exits with status 0 under Tier B — failed runs do not stage.
+///
+/// Takes the `OverlayHandle` type alias (Option<OverlayWorkspace>
+/// on Linux, `()` on non-Linux) so the caller stays portable
+/// (codex re-review P1 on PR #14).
 #[cfg(target_os = "linux")]
 fn stage_overlay_back(
-    overlay: Option<&crate::sandbox::OverlayWorkspace>,
+    overlay: &OverlayHandle,
     repo_root: &std::path::Path,
 ) -> Result<Vec<String>, ToolError> {
-    let Some(ws) = overlay else {
+    let Some(ws) = overlay.as_ref() else {
         return Ok(Vec::new());
     };
     let rels = ws
@@ -208,6 +225,17 @@ fn stage_overlay_back(
     // Deterministic order so forensic replay is byte-stable.
     staged.sort();
     Ok(staged)
+}
+
+/// Non-Linux stub so the caller's type and control flow stay
+/// portable. No overlay exists on macOS/Windows/etc; nothing to
+/// stage.
+#[cfg(not(target_os = "linux"))]
+fn stage_overlay_back(
+    _overlay: &OverlayHandle,
+    _repo_root: &std::path::Path,
+) -> Result<Vec<String>, ToolError> {
+    Ok(Vec::new())
 }
 
 fn cap_output(stdout: &[u8], stderr: &[u8]) -> (String, String, bool) {
@@ -248,7 +276,7 @@ fn build_bash_command(
     command_str: &str,
     repo_root: &std::path::Path,
     policy: SandboxPolicy,
-    #[allow(unused_variables)] overlay_handle: &mut Option<crate::sandbox::OverlayWorkspace>,
+    #[allow(unused_variables)] overlay_handle: &mut OverlayHandle,
 ) -> Result<Command, ToolError> {
     let cwd = repo_root.to_path_buf();
 
@@ -282,7 +310,24 @@ fn build_bash_command(
     #[cfg(target_os = "linux")]
     {
         use crate::sandbox::tier_a::{build_jailed_tokio_command, SpawnOptions};
-        use crate::sandbox::{probe_fuse_overlayfs, OverlayWorkspace};
+        use crate::sandbox::{probe_fuse_overlayfs, probe_unprivileged_userns, OverlayWorkspace};
+
+        // v2.1 codex re-review P2: Tier A requires unprivileged
+        // CLONE_NEWUSER. Hosts without user-ns support (old
+        // kernels, locked-down containers, some CI runners) have
+        // the probe return false. Hard-failing every bash call in
+        // that environment makes the tool unusable. Tier B already
+        // degrades to Tier A when fuse-overlayfs is missing; apply
+        // the same pattern for Tier A → Off.
+        if !probe_unprivileged_userns() {
+            tracing::warn!(
+                policy = ?policy,
+                "AZOTH_SANDBOX requested but host lacks unprivileged CLONE_NEWUSER; degrading to Off"
+            );
+            let mut cmd = Command::new("bash");
+            cmd.arg("-c").arg(command_str).current_dir(&cwd);
+            return Ok(apply_env(cmd));
+        }
 
         // Landlock allow-list. Broad enough for bash + core utilities
         // to start; writes clamp to /tmp + (Tier B) the overlay upper
@@ -356,9 +401,28 @@ fn build_bash_command(
             // Landlock is the effective enforcement here.
             strict_seccomp: false,
         };
-        let cmd = build_jailed_tokio_command("bash", &["-c", command_str], &opts, Some(&final_cwd))
-            .map_err(|e| ToolError::Failed(format!("sandbox jail build: {e}")))?;
-        Ok(apply_env(cmd))
+        // v2.1 codex re-review P2: the probe above rules out the
+        // most common "host lacks user-ns" case, but jail
+        // construction can still fail on kernels without Landlock
+        // or with seccompiler bugs. Degrade gracefully rather than
+        // turning the tool call into a hard failure.
+        match build_jailed_tokio_command("bash", &["-c", command_str], &opts, Some(&final_cwd)) {
+            Ok(cmd) => Ok(apply_env(cmd)),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    policy = ?policy,
+                    "sandbox jail build failed; degrading to unsandboxed bash for this invocation"
+                );
+                // Drop any overlay we mounted above — we're about
+                // to run against the real repo, so the upper layer
+                // would never be staged.
+                *overlay_handle = None;
+                let mut cmd = Command::new("bash");
+                cmd.arg("-c").arg(command_str).current_dir(&cwd);
+                Ok(apply_env(cmd))
+            }
+        }
     }
 }
 
