@@ -54,6 +54,15 @@ impl Sandbox for TierA {
 pub struct SpawnOptions {
     pub allow_read: Vec<PathBuf>,
     pub allow_write: Vec<PathBuf>,
+    /// When `true`, install the narrow seccomp allowlist designed for
+    /// `/bin/true`-grade workloads (the v1 smoke target). When
+    /// `false`, skip seccomp entirely — Landlock is still active,
+    /// but the child keeps the host's syscall surface. This is what
+    /// v2.1's bash-tool wiring wants: bash fails under the narrow
+    /// allowlist on the first `clone()` or `wait4()`, so the
+    /// effective mechanism is Landlock on the FS namespace rather
+    /// than a syscall deny-list.
+    pub strict_seccomp: bool,
 }
 
 /// A handle to a child spawned via `spawn_jailed`. Built from a raw pid
@@ -241,8 +250,8 @@ fn child_jail(tool_argv: &[&str], opts: &SpawnOptions, outer_uid: u32, outer_gid
         return ERR_LANDLOCK;
     }
 
-    // 6. seccomp.
-    if install_seccomp().is_err() {
+    // 6. seccomp (optional — see SpawnOptions::strict_seccomp).
+    if opts.strict_seccomp && install_seccomp().is_err() {
         return ERR_SECCOMP;
     }
 
@@ -264,6 +273,78 @@ fn child_jail(tool_argv: &[&str], opts: &SpawnOptions, outer_uid: u32, outer_gid
     }
     // Unreachable on success.
     ERR_EXECVP
+}
+
+/// Run the jail sequence inside `std::process::Command::pre_exec`.
+/// Same steps as `child_jail` minus the `execvp` tail — std invokes
+/// `execve` for us after the closure returns.
+///
+/// SAFETY: `pre_exec` runs in the forked child after `fork()` and
+/// before `execve()`. The closure must be async-signal-safe, which
+/// matches the `child_jail` sequence: `unshare`, `write`, and
+/// seccomp-bpf / Landlock loads are all permitted in that context.
+#[cfg(target_os = "linux")]
+fn jail_preexec_inner(opts: &SpawnOptions, outer_uid: u32, outer_gid: u32) -> std::io::Result<()> {
+    use nix::sched::{unshare, CloneFlags};
+    use std::io::Error;
+
+    unshare(CloneFlags::CLONE_NEWUSER)
+        .map_err(|e| Error::other(format!("unshare(NEWUSER): {e}")))?;
+    std::fs::write("/proc/self/setgroups", "deny")?;
+    std::fs::write("/proc/self/uid_map", format!("0 {outer_uid} 1\n"))?;
+    std::fs::write("/proc/self/gid_map", format!("0 {outer_gid} 1\n"))?;
+    unshare(CloneFlags::CLONE_NEWNET).map_err(|e| Error::other(format!("unshare(NEWNET): {e}")))?;
+    install_landlock(opts).map_err(|_| Error::other("landlock install failed"))?;
+    if opts.strict_seccomp {
+        install_seccomp().map_err(|_| Error::other("seccomp install failed"))?;
+    }
+    Ok(())
+}
+
+/// Build a `tokio::process::Command` that will run `program args...`
+/// inside the unprivileged jail sequence. The caller still owns the
+/// stdio setup (piped/null/etc.), the working directory, and env —
+/// everything layered on the returned `Command` runs *before* the
+/// fork, which is exactly what you want for stdout/stderr pipes.
+///
+/// `cwd` is applied *after* `pre_exec` via the `Command` builder,
+/// so it takes effect in the post-exec process. For Tier B wiring,
+/// pass `<OverlayWorkspace>.merged` as the cwd so bash lands inside
+/// the writable merge view.
+///
+/// This is the v2.1 Gap 2 entrypoint for tools that need async
+/// stdio. The synchronous `spawn_jailed` stays for tests and
+/// non-tokio callers.
+#[cfg(target_os = "linux")]
+pub fn build_jailed_tokio_command(
+    program: &str,
+    args: &[&str],
+    opts: &SpawnOptions,
+    cwd: Option<&std::path::Path>,
+) -> tokio::process::Command {
+    use nix::unistd::{getgid, getuid};
+    // The `pre_exec` method is provided by
+    // `std::os::unix::process::CommandExt`. We route through
+    // `tokio::process::Command`, which exposes `pre_exec` directly
+    // as an inherent method — no import needed.
+
+    let outer_uid = getuid().as_raw();
+    let outer_gid = getgid().as_raw();
+    let opts_clone = opts.clone();
+    let mut cmd = tokio::process::Command::new(program);
+    cmd.args(args);
+    if let Some(d) = cwd {
+        cmd.current_dir(d);
+    }
+    // SAFETY: `pre_exec` runs post-fork pre-exec. The closure owns
+    // `opts_clone` and only calls async-signal-safe operations plus
+    // the Landlock / seccomp crate setup calls — both of which are
+    // deliberately designed for this phase (see the sandboxing
+    // crate docs).
+    unsafe {
+        cmd.pre_exec(move || jail_preexec_inner(&opts_clone, outer_uid, outer_gid));
+    }
+    cmd
 }
 
 #[cfg(target_os = "linux")]
