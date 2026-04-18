@@ -172,6 +172,16 @@ pub fn extract_seed_paths(query: &str) -> Vec<String> {
         if trimmed.is_empty() {
             continue;
         }
+        // Codex round-5 P2: tokens like `src/foo.rs:42` or
+        // `src/foo.rs:42:7` (rustc/grep/compile-output
+        // convention) survived the trim above — `:` is
+        // non-alphanumeric but neither `/` nor `.`, and `42` is
+        // alphanumeric, so rstrip stopped at the digit. Graph
+        // nodes are keyed on bare paths (`path:src/foo.rs`), so
+        // the `:line(:col)?` suffix caused every such token to
+        // miss the graph lane silently. Strip up to two trailing
+        // `:number` groups before the extension/prefix check.
+        let trimmed = strip_line_col_suffix(trimmed);
         let looks_like_path = EXTENSIONS.iter().any(|ext| trimmed.ends_with(ext))
             || PREFIXES.iter().any(|p| trimmed.starts_with(p));
         if !looks_like_path {
@@ -193,6 +203,27 @@ pub fn extract_seed_paths(query: &str) -> Vec<String> {
         if out.len() >= MAX_SEEDS {
             break;
         }
+    }
+    out
+}
+
+/// Strip up to two trailing `:<digits>` groups from a token.
+/// Converts `src/foo.rs:42` → `src/foo.rs` and
+/// `src/foo.rs:42:7` → `src/foo.rs`, leaving `src/foo.rs` alone
+/// and refusing to strip `:cfg(test)` etc. (only digit suffixes
+/// are stripped). Keeps the colon-separated-anything form
+/// (e.g. LSP-style `file://path`) intact — those don't end in
+/// `:\d+`.
+fn strip_line_col_suffix(s: &str) -> &str {
+    let mut out = s;
+    for _ in 0..2 {
+        let Some((prefix, suffix)) = out.rsplit_once(':') else {
+            break;
+        };
+        if suffix.is_empty() || !suffix.chars().all(|c| c.is_ascii_digit()) {
+            break;
+        }
+        out = prefix;
     }
     out
 }
@@ -256,6 +287,46 @@ mod tests {
         let q = "the turn driver uses a biased select";
         let seeds = extract_seed_paths(q);
         assert!(seeds.is_empty(), "no path-ish tokens, got {seeds:?}");
+    }
+
+    /// Codex round-5 P2 regression guard: compiler/grep-style
+    /// `path:line` and `path:line:col` tokens must normalise to
+    /// the bare path before NodeRef construction — graph nodes
+    /// are keyed `path:src/foo.rs`, not `path:src/foo.rs:42`.
+    #[test]
+    fn seed_extraction_strips_line_col_suffix() {
+        let q = "stack trace at src/foo.rs:42 and crates/azoth-core/src/mod.rs:120:8";
+        let seeds = extract_seed_paths(q);
+        assert!(
+            seeds.iter().any(|s| s == "src/foo.rs"),
+            "src/foo.rs:42 must normalise to src/foo.rs; got {seeds:?}"
+        );
+        assert!(
+            seeds.iter().any(|s| s == "crates/azoth-core/src/mod.rs"),
+            "crates/.../mod.rs:120:8 must normalise to bare path; got {seeds:?}"
+        );
+        // And we must NOT have kept the line-suffixed form.
+        assert!(
+            !seeds.iter().any(|s| s.contains(':')),
+            "no seed should retain a colon after normalisation; got {seeds:?}"
+        );
+    }
+
+    #[test]
+    fn strip_line_col_suffix_edge_cases() {
+        assert_eq!(strip_line_col_suffix("src/foo.rs"), "src/foo.rs");
+        assert_eq!(strip_line_col_suffix("src/foo.rs:42"), "src/foo.rs");
+        assert_eq!(strip_line_col_suffix("src/foo.rs:42:7"), "src/foo.rs");
+        // Only digit suffixes — don't eat non-digit colon parts.
+        assert_eq!(
+            strip_line_col_suffix("src/cfg(test):bar"),
+            "src/cfg(test):bar"
+        );
+        // At most two strip rounds — `a:1:2:3` → `a:1`.
+        assert_eq!(strip_line_col_suffix("a:1:2:3"), "a:1");
+        // Empty segments: `foo:` → `foo:` (empty suffix fails
+        // the `all-digits` check).
+        assert_eq!(strip_line_col_suffix("foo:"), "foo:");
     }
 
     #[test]

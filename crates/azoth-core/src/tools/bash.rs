@@ -328,6 +328,35 @@ fn stage_overlay_back(
             continue;
         }
 
+        // Symlink — recreate via `std::os::unix::fs::symlink`.
+        // Codex round-5 P1: the previous path called
+        // `std::fs::copy` which dereferences symlinks, so a
+        // successful `ln -s target link` in bash either
+        // materialised the target's bytes as a regular file (wrong
+        // semantic) or failed entirely if the target didn't
+        // exist (turning bash success into a tool failure).
+        if meta.file_type().is_symlink() {
+            let link_target = std::fs::read_link(&src)
+                .map_err(|e| ToolError::Failed(format!("readlink {}: {e}", src.display())))?;
+            if let Some(parent) = dst.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| ToolError::Failed(format!("stage mkdir_p: {e}")))?;
+            }
+            // Remove any prior entry at dst — either lower-layer
+            // file or stale symlink — so `symlink(2)` doesn't
+            // EEXIST.
+            let _ = std::fs::remove_file(&dst);
+            std::os::unix::fs::symlink(&link_target, &dst).map_err(|e| {
+                ToolError::Failed(format!(
+                    "stage symlink {} → {}: {e}",
+                    link_target.display(),
+                    dst.display()
+                ))
+            })?;
+            result.staged.push(rel.display().to_string());
+            continue;
+        }
+
         // Regular file — copy.
         if let Some(parent) = dst.parent() {
             std::fs::create_dir_all(parent)
@@ -941,5 +970,63 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Codex round-5 P1 regression guard: `ln -s target link`
+    /// under Tier B must reproduce a SYMLINK at the real repo,
+    /// not a regular file containing the target's bytes. Prior
+    /// `std::fs::copy` path dereferenced the link.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn bash_tier_b_preserves_symlinks_in_stage_back() {
+        use crate::sandbox::tier_b::probe_fuse_overlayfs;
+        if sandbox_skip() {
+            return;
+        }
+        if !probe_fuse_overlayfs() {
+            eprintln!("skip: fuse-overlayfs not on PATH");
+            return;
+        }
+        std::env::set_var("AZOTH_SANDBOX", "tier_b");
+
+        let dir = tempdir().unwrap();
+        let root = tokio::fs::canonicalize(dir.path()).await.unwrap();
+        // Seed a file the symlink will point at.
+        tokio::fs::write(root.join("target.txt"), "real contents")
+            .await
+            .unwrap();
+        let ctx = ctx_for(root.clone());
+
+        let mut disp = ToolDispatcher::new();
+        disp.register(BashTool);
+        let raw = Tainted::new(
+            Origin::ModelOutput,
+            json!({ "command": "ln -s target.txt link.txt" }),
+        );
+        let out = dispatch_tool(&disp, "bash", raw, &ctx).await.unwrap();
+        std::env::remove_var("AZOTH_SANDBOX");
+
+        assert_eq!(out["exit_code"], 0, "bash ln -s succeeded");
+        // Real repo must now have a symlink at link.txt, not a
+        // regular file. `symlink_metadata` doesn't follow.
+        let link_meta = std::fs::symlink_metadata(root.join("link.txt"))
+            .expect("link.txt should exist in real repo after Tier B stage-back");
+        assert!(
+            link_meta.file_type().is_symlink(),
+            "link.txt must be a symlink; got file_type={:?}",
+            link_meta.file_type()
+        );
+        let resolved = std::fs::read_link(root.join("link.txt")).unwrap();
+        assert_eq!(
+            resolved.as_os_str(),
+            "target.txt",
+            "symlink target must be preserved verbatim"
+        );
+        // staged_files should include the link.
+        let staged = out["staged_files"].as_array().expect("staged_files array");
+        assert!(
+            staged.iter().any(|v| v == "link.txt"),
+            "link.txt must appear in staged_files; got {staged:?}"
+        );
     }
 }

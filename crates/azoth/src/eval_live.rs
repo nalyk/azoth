@@ -181,10 +181,34 @@ async fn build_collector(
 
     let co_edit_conn = indexer.connection();
     let co_edit_root = repo_root.clone();
-    let _ = tokio::task::spawn_blocking(move || {
+    // Codex round-5 P2: the build Result was previously `let _
+    // = ...await` — both JoinError and inner CoEditError dropped
+    // silently, so live retrieval could run against a stale or
+    // empty graph with no signal. Now inspect both outcomes and
+    // disable the graph lane on any failure; the flag is read
+    // below when we decide whether to open CoEditGraphRetrieval.
+    let co_edit_build_ok = match tokio::task::spawn_blocking(move || {
         co_edit::build(&co_edit_conn, &co_edit_root, CoEditConfig::default())
     })
-    .await;
+    .await
+    {
+        Ok(Ok(stats)) => {
+            tracing::info!(
+                edges_written = stats.edges_written,
+                commits_walked = stats.commits_walked,
+                "eval_live: co-edit graph built"
+            );
+            true
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "eval_live: co-edit graph build failed; graph lane will be unwired");
+            false
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "eval_live: co-edit graph build task join failed; graph lane will be unwired");
+            false
+        }
+    };
     drop(indexer);
 
     let fts = FtsLexicalRetrieval::open(&db_path)
@@ -197,14 +221,21 @@ async fn build_collector(
     // via the same `GraphEvidenceCollector` used by the TUI worker.
     // Graph open failures are non-fatal — zero graph signal is
     // strictly better than dropping the whole live-retrieval sweep.
-    let graph_arc: Option<Arc<CoEditGraphRetrieval>> = match CoEditGraphRetrieval::open(&db_path) {
-        Ok(g) => Some(Arc::new(g)),
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                "eval_live: graph retrieval open failed; graph lane unwired"
-            );
-            None
+    // Codex round-5 P2: also skip the open if the build above
+    // failed — better to have no graph signal than to score
+    // against stale data and silently skew localization@k.
+    let graph_arc: Option<Arc<CoEditGraphRetrieval>> = if !co_edit_build_ok {
+        None
+    } else {
+        match CoEditGraphRetrieval::open(&db_path) {
+            Ok(g) => Some(Arc::new(g)),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "eval_live: graph retrieval open failed; graph lane unwired"
+                );
+                None
+            }
         }
     };
 
