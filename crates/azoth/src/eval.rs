@@ -43,6 +43,13 @@ pub struct Args {
     pub out: Option<PathBuf>,
     pub sessions_dir: PathBuf,
     pub run_id: Option<String>,
+    /// When `Some(repo_root)`, run a real composite retrieval pass
+    /// over `repo_root` and overwrite each task's `predicted_files`
+    /// in memory before scoring. Also shifts the emitted
+    /// `EvalSampled.metric` from `localization_precision_at_k` to
+    /// `localization_precision_at_k_live` so the SQLite mirror can
+    /// split the two modes.
+    pub live_retrieval: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -76,8 +83,36 @@ pub fn run<W: Write>(args: Args, out: &mut W) -> Result<EvalReport, EvalError> {
         ))
     })?;
     let seed_digest = seed_digest(&bytes);
-    let tasks: Vec<SeedTask> =
+    let mut tasks: Vec<SeedTask> =
         serde_json::from_slice(&bytes).map_err(|e| EvalError::Parse(e.to_string()))?;
+
+    // v2 Sprint 7.1 Gap 3 closure: when `--live-retrieval <repo>` is
+    // set, a real composite retrieval pass overwrites each task's
+    // `predicted_files` in memory. The seed JSON stays the canonical
+    // ground-truth probe (`relevant_files`); only the model's
+    // predicted set is replaced. Metric label shifts to `_live` so
+    // the mirror's `eval_runs` table can split modes.
+    let metric = if args.live_retrieval.is_some() {
+        crate::eval_live::METRIC_LIVE
+    } else {
+        "localization_precision_at_k"
+    };
+    let live_stats = if let Some(repo) = args.live_retrieval.as_ref() {
+        let repo = crate::eval_live::resolve_repo(repo.clone())
+            .map_err(|e| EvalError::Parse(e.to_string()))?;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(EvalError::Io)?;
+        let stats = rt
+            .block_on(crate::eval_live::apply_live_retrieval(
+                &repo, &mut tasks, args.k,
+            ))
+            .map_err(|e| EvalError::Parse(e.to_string()))?;
+        Some(stats)
+    } else {
+        None
+    };
 
     let scores = score_tasks(&tasks, args.k);
     let mean = mean_precision(&scores);
@@ -86,11 +121,19 @@ pub fn run<W: Write>(args: Args, out: &mut W) -> Result<EvalReport, EvalError> {
     // PR #10 codex P1: fold `k` into the default run_id so sweeping
     // the same seed under different `--k` values does not collide on
     // the mirror's composite PK and silently overwrite prior samples.
+    // v2 Sprint 7.1: the live/seed split is part of the run_id too,
+    // so a seed-vs-seed run and a live-retrieval run against the
+    // same seed+k produce distinct rows in the mirror.
+    let mode_tag = if args.live_retrieval.is_some() {
+        "live"
+    } else {
+        "seed"
+    };
     let run_id = args
         .run_id
         .clone()
-        .unwrap_or_else(|| format!("eval_{}_k{}", &seed_digest[..12], args.k));
-    write_eval_session(&args.sessions_dir, &run_id, &scores, &sampled_at)?;
+        .unwrap_or_else(|| format!("eval_{}_k{}_{}", &seed_digest[..12], args.k, mode_tag));
+    write_eval_session(&args.sessions_dir, &run_id, &scores, &sampled_at, metric)?;
 
     let report = EvalReport {
         localization_precision_at_k: mean,
@@ -113,6 +156,9 @@ pub fn run<W: Write>(args: Args, out: &mut W) -> Result<EvalReport, EvalError> {
     }
 
     render_report(&report, out)?;
+    if let Some(s) = live_stats.as_ref() {
+        writeln!(out, "{}", crate::eval_live::format_stats(s))?;
+    }
     Ok(report)
 }
 
@@ -154,6 +200,7 @@ fn write_eval_session(
     run_id: &str,
     scores: &[TaskScore],
     sampled_at: &str,
+    metric: &str,
 ) -> Result<(), EvalError> {
     std::fs::create_dir_all(sessions_dir)?;
     let path = sessions_dir.join(format!("{run_id}.jsonl"));
@@ -192,7 +239,7 @@ fn write_eval_session(
         writer
             .append(&SessionEvent::EvalSampled {
                 turn_id,
-                metric: "localization_precision_at_k".into(),
+                metric: metric.to_string(),
                 value: s.precision_at_k,
                 k: s.k,
                 sampled_at: sampled_at.to_string(),
@@ -251,6 +298,7 @@ mod tests {
             out: None,
             sessions_dir: sessions_dir.clone(),
             run_id: Some("eval_unit".into()),
+            live_retrieval: None,
         };
 
         let mut buf: Vec<u8> = Vec::new();
@@ -294,6 +342,7 @@ mod tests {
             out: None,
             sessions_dir: sessions_dir.clone(),
             run_id: Some("eval_rerun".into()),
+            live_retrieval: None,
         };
 
         let mut buf: Vec<u8> = Vec::new();
@@ -346,6 +395,7 @@ mod tests {
                 out: None,
                 sessions_dir: sessions_dir.clone(),
                 run_id: None, // exercise default path
+                live_retrieval: None,
             };
             let mut buf: Vec<u8> = Vec::new();
             super::run(args, &mut buf).unwrap();

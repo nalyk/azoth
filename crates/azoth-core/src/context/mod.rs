@@ -11,6 +11,7 @@
 mod budget;
 mod composite;
 mod evidence;
+mod graph_evidence;
 mod kernel;
 mod reranker;
 mod symbol_evidence;
@@ -19,6 +20,7 @@ mod tokenizer;
 pub use budget::{Slot, TokenBudget};
 pub use composite::CompositeEvidenceCollector;
 pub use evidence::{EvidenceCollector, LexicalEvidenceCollector};
+pub use graph_evidence::{extract_seed_paths, GraphEvidenceCollector};
 pub use kernel::{ContextKernel, KernelError, StepInput};
 pub use reranker::{BgeReranker, IdentityReranker, ReciprocalRankFusion, RerankError, Reranker};
 pub use symbol_evidence::SymbolEvidenceCollector;

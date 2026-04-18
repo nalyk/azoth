@@ -28,8 +28,8 @@ use tui_textarea::{Input as TaInput, TextArea};
 use azoth_core::artifacts::ArtifactStore;
 use azoth_core::authority::{ApprovalRequestMsg, ApprovalResponse, CapabilityStore};
 use azoth_core::context::{
-    CompositeEvidenceCollector, EvidenceCollector, IdentityReranker, LexicalEvidenceCollector,
-    ReciprocalRankFusion, SymbolEvidenceCollector, TokenBudget,
+    CompositeEvidenceCollector, EvidenceCollector, GraphEvidenceCollector, IdentityReranker,
+    LexicalEvidenceCollector, ReciprocalRankFusion, SymbolEvidenceCollector, TokenBudget,
 };
 use azoth_core::event_store::{JsonlReader, JsonlWriter, SqliteMirror};
 use azoth_core::execution::{ExecutionContext, ToolDispatcher};
@@ -560,9 +560,11 @@ impl AppState {
 struct IndexerBackends {
     fts: Arc<FtsLexicalRetrieval>,
     symbols: Arc<SqliteSymbolIndex>,
-    /// Held for liveness so Sprint 7.1 can bolt on a
-    /// `GraphEvidenceCollector` without reopening the Connection.
-    #[allow(dead_code)]
+    /// Wired into the composite's `graph` lane via
+    /// `GraphEvidenceCollector` (PR B, v2 Sprint 7.1 closure). Held
+    /// on the struct so the shared `Arc` reaches both the lane
+    /// collector and any downstream consumer that wants direct
+    /// `GraphRetrieval` access.
     graph: Arc<CoEditGraphRetrieval>,
 }
 
@@ -922,12 +924,21 @@ pub async fn run_app(resume: Option<String>) -> io::Result<()> {
                 let sym_dyn: Arc<dyn SymbolRetrieval> = sym.clone();
                 Arc::new(SymbolEvidenceCollector::new(sym_dyn)) as Arc<dyn EvidenceCollector>
             });
+        // v2 Sprint 7.1 Gap 1 closure: GraphEvidenceCollector wraps
+        // the co-edit graph retrieval built on worker startup. Seed
+        // extraction is greedy path-regex over the query — good
+        // enough to surface neighbours when the prompt references a
+        // file or directory; smart seeding (symbol-resolver-driven)
+        // is v2.5 with the policy DSL.
+        let graph_lane_collector: Option<Arc<dyn EvidenceCollector>> =
+            indexer_backends.as_ref().map(|b| {
+                let graph_dyn: Arc<dyn azoth_core::retrieval::GraphRetrieval> = b.graph.clone();
+                Arc::new(GraphEvidenceCollector::new(graph_dyn)) as Arc<dyn EvidenceCollector>
+            });
 
         let composite_collector: Arc<dyn EvidenceCollector> = {
             let mut c = CompositeEvidenceCollector {
-                graph: None, // Sprint 7.1: GraphEvidenceCollector needs a
-                // seed-path policy; the co-edit graph is built but not
-                // yet queried from the composite lane.
+                graph: graph_lane_collector.clone(),
                 symbol: symbol_lane_collector.clone(),
                 lexical: Some(ripgrep_lane_collector),
                 fts: fts_lane_collector.clone(),
@@ -953,6 +964,7 @@ pub async fn run_app(resume: Option<String>) -> io::Result<()> {
             legacy_backend = legacy_backend_in_use,
             fts_lane_wired = fts_lane_collector.is_some(),
             symbol_lane_wired = symbol_lane_collector.is_some(),
+            graph_lane_wired = graph_lane_collector.is_some(),
             indexer_ready = indexer_backends.is_some(),
             "retrieval mode resolved"
         );
