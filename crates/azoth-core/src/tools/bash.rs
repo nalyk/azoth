@@ -73,6 +73,17 @@ pub struct BashOutput {
     /// should leak out of the sandbox.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub staged_files: Vec<String>,
+    /// Relative paths of files bash DELETED during this invocation.
+    /// Under `SandboxPolicy::TierB`, fuse-overlayfs records
+    /// deletions as whiteouts (character-device entries or
+    /// `.wh.<name>` markers) in the upper layer; this field
+    /// surfaces them as first-class "removed" signals after
+    /// `stage_overlay_back` has propagated the delete to the
+    /// real repo root. Empty for Off/TierA and for failed
+    /// invocations. Codex round-4 P1 on PR #14 — without
+    /// whiteout handling, `rm` under Tier B silently reverted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub removed_files: Vec<String>,
 }
 
 #[async_trait]
@@ -197,10 +208,10 @@ impl Tool for BashTool {
                 // the tmpdir). Failed runs intentionally drop the
                 // overlay untouched — that's the isolation
                 // contract: bad turns leave the repo pristine.
-                let staged_files = if status.success() {
+                let stage = if status.success() {
                     stage_overlay_back(&overlay_handle, &ctx.repo_root)?
                 } else {
-                    Vec::new()
+                    StageResult::default()
                 };
                 Ok(BashOutput {
                     exit_code: status.code(),
@@ -208,7 +219,8 @@ impl Tool for BashTool {
                     stderr,
                     truncated,
                     timed_out: false,
-                    staged_files,
+                    staged_files: stage.staged,
+                    removed_files: stage.removed,
                 })
             }
             Ok(Err(e)) => Err(ToolError::Failed(format!("wait: {e}"))),
@@ -221,35 +233,102 @@ impl Tool for BashTool {
                     truncated: false,
                     timed_out: true,
                     staged_files: Vec::new(),
+                    removed_files: Vec::new(),
                 })
             }
         }
     }
 }
 
-/// Copy every file that the bash child wrote into the overlay's
-/// upper layer back into `repo_root`, preserving relative paths.
-/// Creates parent directories as needed. Called only when bash
-/// exits with status 0 under Tier B — failed runs do not stage.
+/// Two-list result surfaced by `stage_overlay_back`: files
+/// written (`staged`) and files deleted (`removed`) by the bash
+/// child. Keeping them separate lets the caller report semantic
+/// changes explicitly rather than conflating "I created X" with
+/// "I deleted X" — both are mutations, but they need different
+/// UI and reasoning.
+#[derive(Debug, Default)]
+struct StageResult {
+    staged: Vec<String>,
+    removed: Vec<String>,
+}
+
+/// Reconcile the overlay's upper layer with `repo_root`.
+/// - Regular files → copy into `repo_root`.
+/// - fuse-overlayfs whiteouts → delete the corresponding path
+///   in `repo_root`.
 ///
-/// Takes the `OverlayHandle` type alias (Option<OverlayWorkspace>
-/// on Linux, `()` on non-Linux) so the caller stays portable
-/// (codex re-review P1 on PR #14).
+/// Called only when bash exits with status 0 under Tier B —
+/// failed runs do not stage.
+///
+/// ## Whiteout conventions (codex round-4 P1 on PR #14)
+///
+/// When bash runs `rm foo.rs` under fuse-overlayfs, the
+/// deletion lands in the upper layer as one of two markers:
+///
+/// 1. **Character device with major:minor = 0:0** — the
+///    standard overlayfs whiteout (mknod c 0 0). Detected via
+///    `FileTypeExt::is_char_device()`.
+/// 2. **`.wh.<name>` regular file** — an alternate naming
+///    convention used by fuse-overlayfs in some modes
+///    (particularly without CAP_MKNOD). Detected by filename
+///    prefix.
+///
+/// Either way the semantic is "delete the corresponding lower
+/// path". Without this handling, the earlier implementation
+/// blindly `std::fs::copy`-d the whiteout: either erroring on
+/// the character-device case or copying a literal `.wh.foo.rs`
+/// artifact into the real repo. Codex P1 verbatim: *"That
+/// leaves the repository state inconsistent with the command's
+/// exit status and can break turn replay/forensics."*
+///
+/// Opaque-directory whiteouts (`.wh..wh..opq` markers, or the
+/// `trusted.overlay.opaque=y` xattr) are NOT handled yet —
+/// reading `trusted.*` xattrs requires `CAP_SYS_ADMIN`, which
+/// the unprivileged user-ns child does not have. Whole-subtree
+/// deletions under Tier B remain a v2.5 scope item; for v2.1,
+/// bash + rm + single-file is the supported semantic.
 #[cfg(target_os = "linux")]
 fn stage_overlay_back(
     overlay: &OverlayHandle,
     repo_root: &std::path::Path,
-) -> Result<Vec<String>, ToolError> {
+) -> Result<StageResult, ToolError> {
+    use std::os::unix::fs::FileTypeExt;
+
+    let mut result = StageResult::default();
     let Some(ws) = overlay.as_ref() else {
-        return Ok(Vec::new());
+        return Ok(result);
     };
     let rels = ws
         .changed_files()
         .map_err(|e| ToolError::Failed(format!("overlay changed_files: {e}")))?;
-    let mut staged: Vec<String> = Vec::with_capacity(rels.len());
     for rel in &rels {
         let src = ws.upper.join(rel);
         let dst = repo_root.join(rel);
+        let meta = std::fs::symlink_metadata(&src)
+            .map_err(|e| ToolError::Failed(format!("stat upper {}: {e}", src.display())))?;
+
+        // Whiteout convention 1: char device (standard overlayfs).
+        if meta.file_type().is_char_device() {
+            remove_at(&dst)?;
+            result.removed.push(rel.display().to_string());
+            continue;
+        }
+
+        // Whiteout convention 2: `.wh.<name>` prefix.
+        if let Some(target_name) = rel
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.strip_prefix(".wh."))
+        {
+            let parent_rel = rel.parent().unwrap_or_else(|| std::path::Path::new(""));
+            let target_rel = parent_rel.join(target_name);
+            let target_dst = repo_root.join(&target_rel);
+            remove_at(&target_dst)?;
+            result.removed.push(target_rel.display().to_string());
+            continue;
+        }
+
+        // Regular file — copy.
         if let Some(parent) = dst.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| ToolError::Failed(format!("stage mkdir_p: {e}")))?;
@@ -257,11 +336,32 @@ fn stage_overlay_back(
         std::fs::copy(&src, &dst).map_err(|e| {
             ToolError::Failed(format!("stage {} → {}: {e}", src.display(), dst.display()))
         })?;
-        staged.push(rel.display().to_string());
+        result.staged.push(rel.display().to_string());
     }
     // Deterministic order so forensic replay is byte-stable.
-    staged.sort();
-    Ok(staged)
+    result.staged.sort();
+    result.removed.sort();
+    Ok(result)
+}
+
+/// Best-effort removal: try file delete first, fall back to
+/// directory removal. Non-existent target is not an error (the
+/// whiteout refers to a lower-layer path that may never have
+/// existed in the real repo — that's still a valid "delete"
+/// from the tool's perspective).
+#[cfg(target_os = "linux")]
+fn remove_at(path: &std::path::Path) -> Result<(), ToolError> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        // `ErrorKind::IsADirectory` only stable in recent rustc
+        // and clippy's MSRV check rejects it at current workspace
+        // MSRV; key on the raw errno (EISDIR) which is stable
+        // across every supported toolchain.
+        Err(e) if e.raw_os_error() == Some(nix::libc::EISDIR) => std::fs::remove_dir_all(path)
+            .map_err(|e| ToolError::Failed(format!("rmdir {}: {e}", path.display()))),
+        Err(e) => Err(ToolError::Failed(format!("rm {}: {e}", path.display()))),
+    }
 }
 
 /// Non-Linux stub so the caller's type and control flow stay
@@ -271,8 +371,8 @@ fn stage_overlay_back(
 fn stage_overlay_back(
     _overlay: &OverlayHandle,
     _repo_root: &std::path::Path,
-) -> Result<Vec<String>, ToolError> {
-    Ok(Vec::new())
+) -> Result<StageResult, ToolError> {
+    Ok(StageResult::default())
 }
 
 fn cap_output(stdout: &[u8], stderr: &[u8]) -> (String, String, bool) {
@@ -777,6 +877,69 @@ mod tests {
         match staged {
             None => {} // dropped entirely — fine
             Some(arr) => assert!(arr.is_empty(), "no files staged on failure; got {arr:?}"),
+        }
+    }
+
+    /// Codex round-4 P1 regression guard: `rm` under Tier B
+    /// writes a fuse-overlayfs whiteout in the upper layer; the
+    /// staging path must detect that and propagate the deletion
+    /// to the real repo rather than blindly copying the whiteout
+    /// artifact. Without this, the repo stays inconsistent with
+    /// bash's exit_code=0 — a silent no-op.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn bash_tier_b_propagates_whiteout_deletion_to_real_repo() {
+        use crate::sandbox::tier_b::probe_fuse_overlayfs;
+        if sandbox_skip() {
+            return;
+        }
+        if !probe_fuse_overlayfs() {
+            eprintln!("skip: fuse-overlayfs not on PATH");
+            return;
+        }
+        std::env::set_var("AZOTH_SANDBOX", "tier_b");
+
+        let dir = tempdir().unwrap();
+        let root = tokio::fs::canonicalize(dir.path()).await.unwrap();
+        // Seed a file in the lower layer (real repo) that bash
+        // will delete through the overlay.
+        tokio::fs::write(root.join("to_delete.txt"), "goodbye")
+            .await
+            .unwrap();
+        let ctx = ctx_for(root.clone());
+
+        let mut disp = ToolDispatcher::new();
+        disp.register(BashTool);
+        let raw = Tainted::new(
+            Origin::ModelOutput,
+            json!({ "command": "rm to_delete.txt && echo gone" }),
+        );
+        let out = dispatch_tool(&disp, "bash", raw, &ctx).await.unwrap();
+        std::env::remove_var("AZOTH_SANDBOX");
+
+        assert_eq!(out["exit_code"], 0, "bash rm succeeded");
+        assert!(
+            !root.join("to_delete.txt").exists(),
+            "Tier B must propagate the deletion to the real repo; got file still present"
+        );
+        let removed = out["removed_files"]
+            .as_array()
+            .expect("removed_files array in output");
+        assert!(
+            removed.iter().any(|v| v == "to_delete.txt"),
+            "removed_files must list the deleted path; got {removed:?}"
+        );
+        // And it should NOT show up in staged_files — deletions
+        // and writes surface through separate fields.
+        let staged = out["staged_files"].as_array();
+        match staged {
+            None => {}
+            Some(arr) => {
+                assert!(
+                    !arr.iter().any(|v| v == "to_delete.txt"),
+                    "deletion must not appear in staged_files; got {arr:?}"
+                );
+            }
         }
     }
 }
