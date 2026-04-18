@@ -301,11 +301,54 @@ fn stage_overlay_back(
     let rels = ws
         .changed_files()
         .map_err(|e| ToolError::Failed(format!("overlay changed_files: {e}")))?;
+    // Belt-and-braces for the symlink-directory traversal defence
+    // (codex round-6 P1): even after fixing the walker in
+    // `collect_files` to stop following symlinked dirs, refuse to
+    // stage any entry whose resolved source path would escape
+    // `ws.upper`. `canonicalize()` resolves every symlink in the
+    // path; if the fully-resolved src leaves the upper layer, we
+    // skip with a warning rather than copying attacker-chosen
+    // host content into the real repo.
+    let upper_canon = ws.upper.canonicalize().map_err(|e| {
+        ToolError::Failed(format!("canonicalize upper {}: {e}", ws.upper.display()))
+    })?;
     for rel in &rels {
         let src = ws.upper.join(rel);
         let dst = repo_root.join(rel);
         let meta = std::fs::symlink_metadata(&src)
             .map_err(|e| ToolError::Failed(format!("stat upper {}: {e}", src.display())))?;
+
+        // Symlinks: canonicalize would follow them, which is
+        // exactly what we DON'T want to check here — we record
+        // symlinks as-is (see the branch below). Regular
+        // non-symlink entries go through the boundary check.
+        if !meta.file_type().is_symlink() {
+            match src.canonicalize() {
+                Ok(canon) if canon.starts_with(&upper_canon) => {}
+                Ok(canon) => {
+                    tracing::warn!(
+                        rel = %rel.display(),
+                        resolved = %canon.display(),
+                        upper = %upper_canon.display(),
+                        "stage-back refused: resolved source escapes overlay upper layer \
+                         (possible symlink-traversal attack)"
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    // Canonicalization can fail for whiteout
+                    // char-devices or broken-link targets —
+                    // both of which are handled by the branches
+                    // below. Fall through; don't treat this as
+                    // fatal.
+                    tracing::debug!(
+                        rel = %rel.display(),
+                        error = %e,
+                        "canonicalize failed; deferring to type-specific branches"
+                    );
+                }
+            }
+        }
 
         // Whiteout convention 1: char device (standard overlayfs).
         if meta.file_type().is_char_device() {
@@ -1028,5 +1071,77 @@ mod tests {
             staged.iter().any(|v| v == "link.txt"),
             "link.txt must appear in staged_files; got {staged:?}"
         );
+    }
+
+    /// Codex round-6 P1 SECURITY regression guard: a Tier-B
+    /// `ln -s /etc leak` used to make `OverlayWorkspace::changed_files()`
+    /// descend into /etc (because `path.is_dir()` followed the
+    /// symlink), and `stage_overlay_back` then copied `/etc/passwd`
+    /// etc. into the real repo. This test exercises the attack:
+    /// bash creates a symlink to a host directory under Tier B,
+    /// then attempts to force the symlink's contents into the
+    /// repo. After the fix, the symlink itself is recreated (ok,
+    /// that's fine — it's a pointer, not a leak) but NO
+    /// host-file contents materialise under the symlink's path
+    /// in the real repo. The canonicalize-boundary check also
+    /// refuses to stage anything whose resolved source escapes
+    /// `ws.upper`.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn bash_tier_b_blocks_symlink_dir_traversal_to_host_files() {
+        use crate::sandbox::tier_b::probe_fuse_overlayfs;
+        if sandbox_skip() {
+            return;
+        }
+        if !probe_fuse_overlayfs() {
+            eprintln!("skip: fuse-overlayfs not on PATH");
+            return;
+        }
+        std::env::set_var("AZOTH_SANDBOX", "tier_b");
+
+        let dir = tempdir().unwrap();
+        let root = tokio::fs::canonicalize(dir.path()).await.unwrap();
+        let ctx = ctx_for(root.clone());
+
+        let mut disp = ToolDispatcher::new();
+        disp.register(BashTool);
+        // Point a symlink at /etc — a readable host directory.
+        // Pre-fix behaviour: `changed_files()` recurses into /etc,
+        // stage_overlay_back copies /etc/passwd etc. into repo.
+        // Post-fix: walker records the symlink itself, never
+        // descends; boundary check in stage_overlay_back also
+        // refuses any entry that resolves outside upper.
+        let raw = Tainted::new(
+            Origin::ModelOutput,
+            json!({ "command": "ln -s /etc leak && ls leak/passwd >/dev/null 2>&1 || true" }),
+        );
+        let out = dispatch_tool(&disp, "bash", raw, &ctx).await.unwrap();
+        std::env::remove_var("AZOTH_SANDBOX");
+
+        assert_eq!(out["exit_code"], 0, "bash ln -s succeeded");
+        // Load-bearing assertion: the symlink may exist in the
+        // real repo (as a dangling or valid pointer), but its
+        // "contents" must not — i.e., there must be no regular
+        // file at `repo_root/leak/passwd`.
+        let leaked = root.join("leak/passwd");
+        assert!(
+            !leaked.exists()
+                || std::fs::symlink_metadata(&leaked)
+                    .map(|m| m.file_type().is_symlink())
+                    .unwrap_or(false),
+            "host file materialised via symlink-dir traversal: {}",
+            leaked.display()
+        );
+        let leaked_file = std::fs::read_to_string(&leaked).ok();
+        // Either we can't read anything (link traverses into a
+        // repo path that doesn't exist) or if we can, it's NOT
+        // real /etc/passwd contents.
+        if let Some(contents) = leaked_file {
+            // /etc/passwd invariably starts with "root:" — reject.
+            assert!(
+                !contents.starts_with("root:"),
+                "leaked /etc/passwd contents into repo: {contents:?}"
+            );
+        }
     }
 }
