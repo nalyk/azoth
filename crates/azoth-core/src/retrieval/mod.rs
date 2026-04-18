@@ -143,7 +143,22 @@ fn ripgrep_scan(
             continue;
         }
         let path = dent.path().to_path_buf();
-        let path_str = path.display().to_string();
+        // v2.1 Gap 3 correctness fix: ripgrep's `ignore::WalkBuilder`
+        // emits absolute paths when `root` is absolute (which it
+        // always is by the time `RipgrepLexicalRetrieval` is
+        // constructed — both TUI worker and eval_live pass
+        // `repo_root.canonicalize()`). FTS stores relative paths.
+        // Mismatched formats cause the composite collector's label
+        // dedup to treat `"/abs/.../foo.rs"` and `"foo.rs"` as
+        // distinct, and cause localization@k scorers to miss every
+        // match when seed ground truth is relative. Strip the
+        // `root` prefix here so Span.path is always relative; fall
+        // back to the absolute form if strip fails (defensive —
+        // shouldn't happen under WalkBuilder contract).
+        let path_str = path
+            .strip_prefix(root)
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| path.display().to_string());
 
         let mut sink = Collector {
             path: path_str,
