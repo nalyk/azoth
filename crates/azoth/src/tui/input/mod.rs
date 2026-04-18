@@ -19,6 +19,11 @@ pub enum SlashCommand {
     Quit,
     /// `/resume <run_id>` — the argument is `None` when no token follows.
     Resume(Option<String>),
+    /// `/continue` — nudge the model to resume a turn that ended in
+    /// `turn_aborted { reason: "model_truncated" }` by sending a
+    /// synthetic user message. Sprint 7.5. Useful after long research
+    /// turns where the model hit `max_tokens` mid-summary.
+    Continue,
     /// Anything beginning with `/` that didn't match a known verb.
     Unknown(String),
 }
@@ -50,6 +55,7 @@ impl SlashCommand {
             "approve" => Self::Approve(rest_of_line()),
             "quit" => Self::Quit,
             "resume" => Self::Resume(parts.next().map(|s| s.to_string())),
+            "continue" => Self::Continue,
             other => Self::Unknown(other.to_string()),
         })
     }
@@ -115,5 +121,18 @@ mod tests {
             Some(SlashCommand::Approve(Some("fs_write".to_string())))
         );
         assert_eq!(SlashCommand::parse("/quit"), Some(SlashCommand::Quit));
+    }
+
+    #[test]
+    fn slash_continue_parses_to_continue_variant() {
+        assert_eq!(
+            SlashCommand::parse("/continue"),
+            Some(SlashCommand::Continue)
+        );
+        // Leading / trailing whitespace tolerated like every other verb.
+        assert_eq!(
+            SlashCommand::parse("  /continue  "),
+            Some(SlashCommand::Continue)
+        );
     }
 }

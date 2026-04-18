@@ -325,6 +325,27 @@ impl<'a> TurnDriver<'a> {
                 },
             };
 
+            // Sprint 7.5 pre-flight: refuse requests that would exceed
+            // the active profile's `max_context_tokens`. Cheap
+            // char-count/4 estimate covers Anthropic and OpenAI-family
+            // tokenizers to first order — accuracy well under the cap
+            // is intentional. A zero cap means "no enforcement".
+            let cap = self.adapter.profile().max_context_tokens;
+            if cap > 0 {
+                let estimate = approximate_input_tokens(&req);
+                if estimate > cap {
+                    self.record_abort(
+                        &turn_id,
+                        AbortReason::ContextOverflow,
+                        Some(format!(
+                            "estimate {estimate} tokens > profile max_context_tokens {cap}"
+                        )),
+                        total_usage.clone(),
+                    )?;
+                    return Ok(TurnOutcome::aborted(total_usage));
+                }
+            }
+
             self.writer.append(&SessionEvent::ModelRequest {
                 turn_id: turn_id.clone(),
                 request_digest: digest(&req),
@@ -864,9 +885,14 @@ impl<'a> TurnDriver<'a> {
                     return Ok(TurnOutcome::committed(total_usage, response.content));
                 }
                 StopReason::MaxTokens => {
+                    // Sprint 7.5: distinct reason from TokenBudget.
+                    // The contract's side-effect budget is unrelated to
+                    // the provider's per-request output cap; conflating
+                    // the two masked the dominant abort mode seen in
+                    // dogfood turns 4–6 of run_d8a236e8e210.
                     self.record_abort(
                         &turn_id,
-                        AbortReason::TokenBudget,
+                        AbortReason::ModelTruncated,
                         Some("model hit max_tokens".into()),
                         total_usage.clone(),
                     )?;
@@ -892,6 +918,44 @@ fn digest<T: serde::Serialize>(value: &T) -> String {
     let mut h = Sha256::new();
     h.update(&bytes);
     format!("sha256:{}", hex::encode(h.finalize()))
+}
+
+/// Cheap pre-flight approximation of input token count for a
+/// `ModelTurnRequest`. Uses bytes/4 — accurate enough to catch
+/// runaway contexts (the dominant use case) without pulling in a
+/// per-provider tokenizer. Accuracy well under the cap is
+/// intentional: we're refusing obvious blow-ups, not billing.
+/// Sprint 7.5.
+fn approximate_input_tokens(req: &ModelTurnRequest) -> u32 {
+    let mut bytes: usize = req.system.len();
+    for m in &req.messages {
+        for block in &m.content {
+            bytes += match block {
+                ContentBlock::Text { text } | ContentBlock::Thinking { text, .. } => text.len(),
+                ContentBlock::ToolUse { input, .. } => {
+                    serde_json::to_string(input).map(|s| s.len()).unwrap_or(0)
+                }
+                ContentBlock::ToolResult { content, .. } => content
+                    .iter()
+                    .map(|sub| match sub {
+                        ContentBlock::Text { text } => text.len(),
+                        _ => 0,
+                    })
+                    .sum(),
+            };
+        }
+    }
+    for t in &req.tools {
+        bytes += t.name.len()
+            + t.description.len()
+            + serde_json::to_string(&t.input_schema)
+                .map(|s| s.len())
+                .unwrap_or(0);
+    }
+    // ~4 bytes per token is the widely-cited approximation; round up
+    // by taking ceil(bytes / 4) so we lean toward refusing overflow
+    // rather than letting it through.
+    bytes.div_ceil(4) as u32
 }
 
 fn now_iso() -> String {

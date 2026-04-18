@@ -342,3 +342,159 @@ async fn indexer_origin_is_accepted_by_tool_that_explicitly_permits_it() {
         .unwrap();
     assert_eq!(out, json!(42));
 }
+
+// ---------- Sprint 7.5 — sandbox gate --------------------------------------
+//
+// These tests live here (rather than tests/) because they must mint a
+// `Tainted<Value>` via the crate-internal `Tainted::new` to exercise the
+// dispatcher's sandbox gate. Keeping the minting capability `pub(crate)`
+// is a v2 security invariant (see PR #11 Codex P1 disposition in
+// `pattern_doc_hidden_pub_for_integration_test_access.md`).
+
+#[tokio::test]
+async fn dispatcher_refuses_tier_d_effect_via_sandbox_gate() {
+    // AZOTH_SANDBOX=off must not short-circuit the test; ensure it's
+    // unset. Tests run `--test-threads=1` per workspace policy so this
+    // is safe.
+    std::env::remove_var("AZOTH_SANDBOX");
+
+    struct TierDOnly;
+
+    #[derive(serde::Deserialize)]
+    struct In {}
+
+    #[async_trait::async_trait]
+    impl Tool for TierDOnly {
+        type Input = In;
+        type Output = String;
+        fn name(&self) -> &'static str {
+            "tier_d_only"
+        }
+        fn schema(&self) -> serde_json::Value {
+            json!({"type": "object"})
+        }
+        fn effect_class(&self) -> EffectClass {
+            // Tier D — `sandbox_for` returns Err(EffectNotAvailable).
+            EffectClass::ApplyIrreversible
+        }
+        async fn execute(
+            &self,
+            _i: Self::Input,
+            _ctx: &ExecutionContext,
+        ) -> Result<Self::Output, ToolError> {
+            panic!("Tier-D tool must never execute — sandbox gate must refuse in dispatch");
+        }
+    }
+
+    let mut disp = ToolDispatcher::new();
+    disp.register(TierDOnly);
+    let (ctx, _tmp) = build_ctx();
+    let raw = Tainted::new(Origin::ModelOutput, json!({}));
+    let err = dispatch_tool(&disp, "tier_d_only", raw, &ctx)
+        .await
+        .expect_err("Tier-D dispatch must be refused by the sandbox gate");
+
+    match err {
+        ToolError::SandboxDenied(msg) => {
+            assert!(
+                msg.contains("not available"),
+                "SandboxDenied detail should explain why: {msg}"
+            );
+        }
+        other => panic!("expected SandboxDenied, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn dispatcher_sandbox_off_env_skips_the_check() {
+    // Opt-out path: `AZOTH_SANDBOX=off` bypasses the gate. This is
+    // load-bearing for dev/test hosts that can't initialise the real
+    // sandbox layer (CI containers, WSL variants).
+    std::env::set_var("AZOTH_SANDBOX", "off");
+
+    struct TierDAllowed;
+
+    #[derive(serde::Deserialize)]
+    struct In {}
+
+    #[async_trait::async_trait]
+    impl Tool for TierDAllowed {
+        type Input = In;
+        type Output = String;
+        fn name(&self) -> &'static str {
+            "tier_d_allowed_under_off"
+        }
+        fn schema(&self) -> serde_json::Value {
+            json!({"type": "object"})
+        }
+        fn effect_class(&self) -> EffectClass {
+            EffectClass::ApplyIrreversible
+        }
+        async fn execute(
+            &self,
+            _i: Self::Input,
+            _ctx: &ExecutionContext,
+        ) -> Result<Self::Output, ToolError> {
+            Ok("ran".into())
+        }
+    }
+
+    let mut disp = ToolDispatcher::new();
+    disp.register(TierDAllowed);
+    let (ctx, _tmp) = build_ctx();
+    let raw = Tainted::new(Origin::ModelOutput, json!({}));
+    let out = dispatch_tool(&disp, "tier_d_allowed_under_off", raw, &ctx).await;
+
+    // Cleanup BEFORE any assertion so failures don't leak env state
+    // into the remaining tests in this process.
+    std::env::remove_var("AZOTH_SANDBOX");
+
+    let out = out.expect("AZOTH_SANDBOX=off must bypass the gate");
+    assert_eq!(out, json!("ran"));
+}
+
+#[tokio::test]
+async fn dispatcher_allows_tier_a_observe_tools() {
+    // Positive companion: a tool with `EffectClass::Observe` (Tier A)
+    // MUST NOT be blocked. Pins the gate as "deny unavailable tiers",
+    // not "deny all tools".
+    std::env::remove_var("AZOTH_SANDBOX");
+
+    struct ObserveNoop;
+
+    #[derive(serde::Deserialize)]
+    struct In {
+        msg: String,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for ObserveNoop {
+        type Input = In;
+        type Output = String;
+        fn name(&self) -> &'static str {
+            "observe_noop"
+        }
+        fn schema(&self) -> serde_json::Value {
+            json!({"type": "object"})
+        }
+        fn effect_class(&self) -> EffectClass {
+            EffectClass::Observe
+        }
+        async fn execute(
+            &self,
+            i: Self::Input,
+            _ctx: &ExecutionContext,
+        ) -> Result<Self::Output, ToolError> {
+            Ok(i.msg)
+        }
+    }
+
+    let mut disp = ToolDispatcher::new();
+    disp.register(ObserveNoop);
+    let (ctx, _tmp) = build_ctx();
+    let raw = Tainted::new(Origin::ModelOutput, json!({"msg": "ok"}));
+    let out = dispatch_tool(&disp, "observe_noop", raw, &ctx)
+        .await
+        .expect("Tier A dispatch must succeed");
+    assert_eq!(out, json!("ok"));
+}

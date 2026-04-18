@@ -4,6 +4,7 @@
 
 use super::context::ExecutionContext;
 use crate::authority::{ExtractionError, Extractor, JsonExtractor, Origin, Tainted};
+use crate::sandbox::sandbox_for;
 use crate::schemas::EffectClass;
 use async_trait::async_trait;
 use futures::future::BoxFuture;
@@ -80,6 +81,42 @@ impl<T: Tool + 'static> ErasedTool for T {
         ctx: &'a ExecutionContext,
     ) -> BoxFuture<'a, Result<Value, ToolError>> {
         Box::pin(async move {
+            // Sprint 7.5: sandbox gate. Ask the sandbox layer to
+            // prepare for the tool's effect class. Tier A/B return
+            // Ok (prepare is a no-op for in-process dispatch today —
+            // `spawn_jailed` for subprocess isolation is v2.1+
+            // scope). Tier C/D return `EffectNotAvailable` as
+            // documented by the plan. Either way this puts the
+            // seam in place so future tier-B exec-under-sandbox
+            // wiring has a call site to hook into, and it prevents
+            // ApplyRemote* / ApplyIrreversible tools from silently
+            // executing past the documented v2 scope fence.
+            //
+            // Opt-out: `AZOTH_SANDBOX=off` skips the check — dev-
+            // only escape hatch for hosts where the sandbox layer
+            // can't initialise. Default is on.
+            let ec = Tool::effect_class(self);
+            let sandbox_disabled = matches!(
+                std::env::var("AZOTH_SANDBOX").as_deref(),
+                Ok("off") | Ok("0") | Ok("false")
+            );
+            if !sandbox_disabled {
+                if let Err(e) = sandbox_for(ec).and_then(|s| s.prepare()) {
+                    tracing::warn!(
+                        tool = Tool::name(self),
+                        effect_class = ?ec,
+                        error = %e,
+                        "sandbox denied"
+                    );
+                    return Err(ToolError::SandboxDenied(e.to_string()));
+                }
+                tracing::debug!(
+                    tool = Tool::name(self),
+                    effect_class = ?ec,
+                    "sandbox prepared"
+                );
+            }
+
             // Taint gate: Tool::permitted_origins() drives the JsonExtractor's
             // allowlist. We can't easily pass that into `JsonExtractor::new`
             // since it wants a 'static slice, so we check manually here.
