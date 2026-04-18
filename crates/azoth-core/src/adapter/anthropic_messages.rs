@@ -23,6 +23,19 @@ pub struct AnthropicMessagesAdapter {
     http: reqwest::Client,
 }
 
+/// Prefix that identifies a Claude Code OAuth token. Anthropic emits
+/// these with a stable `sk-ant-oat01-` prefix; API keys use
+/// `sk-ant-api03-`. Prefix-sniffing is the only source of truth until
+/// Anthropic documents a public auth-mode switch.
+const ANTHROPIC_OAUTH_TOKEN_PREFIX: &str = "sk-ant-oat01-";
+
+/// Beta flag Anthropic requires when authenticating `/v1/messages`
+/// with a Claude Code OAuth token. This flag name is pinned to the
+/// date Claude Code used as of 2026-04-18; Anthropic may rename it
+/// without notice. The adapter_auth_modes integration test asserts
+/// this literal, so drift here will show up as a test failure.
+const ANTHROPIC_OAUTH_BETA_FLAG: &str = "oauth-2025-04-20";
+
 impl AnthropicMessagesAdapter {
     pub fn new(profile: ProviderProfile, api_key: SecretHandle) -> Self {
         debug_assert!(matches!(profile.tool_use_shape, ToolUseShape::ContentBlock));
@@ -30,6 +43,24 @@ impl AnthropicMessagesAdapter {
             profile,
             api_key,
             http: reqwest::Client::new(),
+        }
+    }
+
+    /// Attach the right auth header(s) to the outgoing request. Prefix-
+    /// sniffs `sk-ant-oat01-*` → `Authorization: Bearer <token>` plus
+    /// the OAuth beta flag; everything else (`sk-ant-api03-*` and
+    /// legacy / fixture tokens) → the classic `x-api-key` header. The
+    /// two auth shapes are MUTUALLY EXCLUSIVE: Anthropic treats
+    /// simultaneous presence of `x-api-key` and OAuth-flavoured Bearer
+    /// auth as ambiguous. Each branch emits only its own headers.
+    fn apply_auth(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        let key = self.api_key.expose();
+        if key.starts_with(ANTHROPIC_OAUTH_TOKEN_PREFIX) {
+            builder
+                .header("authorization", format!("Bearer {key}"))
+                .header("anthropic-beta", ANTHROPIC_OAUTH_BETA_FLAG)
+        } else {
+            builder.header("x-api-key", key)
         }
     }
 
@@ -130,10 +161,10 @@ impl ProviderAdapter for AnthropicMessagesAdapter {
         let mut builder = self
             .http
             .post(&url)
-            .header("x-api-key", self.api_key.expose())
             .header("anthropic-version", "2023-06-01")
             .header("accept", "text/event-stream")
             .header("content-type", "application/json");
+        builder = self.apply_auth(builder);
         for (k, v) in &self.profile.extra_headers {
             builder = builder.header(k.as_str(), v.as_str());
         }
