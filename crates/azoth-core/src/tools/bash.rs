@@ -401,6 +401,26 @@ fn stage_overlay_back(
         }
 
         // Regular file — copy.
+        //
+        // Codex round-7 P1: since round-6's walker fix now
+        // records ALL file types (FIFOs, sockets, block
+        // devices — not only regular files and char-device
+        // whiteouts), we MUST gate the copy branch on
+        // `is_file()` explicitly. `mkfifo pipe` in Tier B
+        // would otherwise reach `std::fs::copy` which blocks
+        // indefinitely waiting for a writer on the FIFO —
+        // bash reports success, tool hangs. Sockets / block
+        // devices would error or produce nonsense. Skip them
+        // with a tracing::warn and move on; repos don't
+        // carry IPC primitives.
+        if !meta.file_type().is_file() {
+            tracing::warn!(
+                rel = %rel.display(),
+                file_type = ?meta.file_type(),
+                "stage-back: skipping non-regular upper-layer entry (fifo/socket/block-device)"
+            );
+            continue;
+        }
         if let Some(parent) = dst.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| ToolError::Failed(format!("stage mkdir_p: {e}")))?;
@@ -1141,6 +1161,81 @@ mod tests {
             assert!(
                 !contents.starts_with("root:"),
                 "leaked /etc/passwd contents into repo: {contents:?}"
+            );
+        }
+    }
+
+    /// Codex round-7 P1 regression guard: `mkfifo pipe` under
+    /// Tier B used to hang \[stage_overlay_back\] indefinitely —
+    /// round-6's walker change made FIFOs/sockets flow into
+    /// `changed_files()`, and `std::fs::copy` on a FIFO opens
+    /// it for reading and blocks waiting for a writer. Tool
+    /// reported success by bash but execute() never returned.
+    ///
+    /// Post-fix: non-regular-file entries are skipped with a
+    /// tracing::warn. This test proves the tool returns
+    /// promptly (under a generous timeout) and the FIFO does
+    /// NOT appear in staged_files. Test wall-clock is bounded
+    /// by tokio::time::timeout so a regression cannot hang CI.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn bash_tier_b_skips_fifo_entries_without_hanging() {
+        use crate::sandbox::tier_b::probe_fuse_overlayfs;
+        if sandbox_skip() {
+            return;
+        }
+        if !probe_fuse_overlayfs() {
+            eprintln!("skip: fuse-overlayfs not on PATH");
+            return;
+        }
+        std::env::set_var("AZOTH_SANDBOX", "tier_b");
+
+        let dir = tempdir().unwrap();
+        let root = tokio::fs::canonicalize(dir.path()).await.unwrap();
+        let ctx = ctx_for(root.clone());
+
+        let mut disp = ToolDispatcher::new();
+        disp.register(BashTool);
+        // Create a FIFO + a regular file. Pre-fix: hangs on
+        // the FIFO copy. Post-fix: FIFO skipped with warn,
+        // regular file staged normally.
+        let raw = Tainted::new(
+            Origin::ModelOutput,
+            json!({ "command": "mkfifo pipe && echo written > real.txt" }),
+        );
+        // Hard-cap the dispatch; a regression would block
+        // here on the FIFO copy. 10s is generous for the
+        // real stage-back work but short enough to fail fast
+        // on a hang.
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            dispatch_tool(&disp, "bash", raw, &ctx),
+        )
+        .await
+        .expect("stage-back hung — did we regress FIFO skip?")
+        .unwrap();
+        std::env::remove_var("AZOTH_SANDBOX");
+
+        assert_eq!(out["exit_code"], 0);
+        let staged = out["staged_files"].as_array().expect("staged_files");
+        assert!(
+            staged.iter().any(|v| v == "real.txt"),
+            "real.txt must stage; got {staged:?}"
+        );
+        assert!(
+            !staged.iter().any(|v| v == "pipe"),
+            "FIFO must NOT appear in staged_files (skipped); got {staged:?}"
+        );
+        // And no regular file at repo_root/pipe.
+        let pipe_at_repo = root.join("pipe");
+        if pipe_at_repo.exists() {
+            let ft = std::fs::symlink_metadata(&pipe_at_repo)
+                .unwrap()
+                .file_type();
+            assert!(
+                !ft.is_file(),
+                "FIFO was materialised as a regular file at {}",
+                pipe_at_repo.display()
             );
         }
     }
