@@ -14,6 +14,14 @@ pub enum Origin {
     RepoFile,
     WebFetch,
     ModelOutput,
+    /// v2 Sprint 7 — content produced by the repo indexers (FTS5 snippets,
+    /// tree-sitter symbols, co-edit graph edges). Structurally distinct
+    /// from `ModelOutput` so the taint gate and future policy DSL (v2.5)
+    /// can reject hostile indexer payloads that try to impersonate model
+    /// tool calls. `rename_all = "snake_case"` serialises this as
+    /// `"indexer"`; pre-v2 logs cannot contain that token so existing
+    /// sessions deserialise unchanged.
+    Indexer,
 }
 
 /// Wraps a value whose provenance is not Azoth itself. The inner value can

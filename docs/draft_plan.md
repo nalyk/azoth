@@ -524,18 +524,27 @@ This guarantees that invariant 1 ("transcript is not memory") is not accidentall
 
 ## What v1 does NOT ship (explicit scope fence)
 
-- Graph / symbol / LSP retrieval — `GraphRetrieval` trait stub only.
-- Policy DSL — hardcoded v1 policy only.
-- Contract amendments — lint + accept only.
+v2 has since landed the repo-intelligence moat — FTS5, tree-sitter symbols,
+co-edit graph, composite evidence lanes, TDAD impact selector, and the
+localization@k eval plane. The scope fence below enumerates what remained
+out of scope *at v1 time* and whether each item is still outstanding:
+
+- Graph / symbol / LSP retrieval — tree-sitter symbols + co-edit graph
+  shipped in v2. Full LSP defs/refs/diagnostics deferred to v2.5.
+- Policy DSL — still hardcoded; full DSL deferred to v2.5.
+- Contract amendments — still lint + accept only.
 - `azoth replay`, `azoth export` — events recorded, commands deferred.
-- Trace graders / eval flywheel.
+- Trace graders / mergeability proxy — localization@k + regression_rate
+  shipped in v2; trace graders and the mergeability corpus deferred.
 - gVisor (Tier C) and Firecracker (Tier D).
 - Contract-diff review UI, evidence-pack editor.
 - Domain packs — coding only.
 - Episodic memory beyond checkpoints.
 - Provider routing / fallback policy — first configured profile wins.
 - Team/enterprise deployment modes.
-- Red-team suite.
+- Full red-team suite — Sprint 7 ships a 6-8 case regression subset in
+  `tests/v2_injection_surface.rs`. Fuzz + prompt-escape chains + sandbox
+  escape attempts deferred to v2.5.
 
 Each of these is addressable in a later plan without touching the schemas, event model, crate layout, or trait shapes defined here.
 

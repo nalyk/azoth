@@ -39,6 +39,22 @@ impl SqliteSymbolIndex {
     pub fn new(conn: Arc<Mutex<Connection>>) -> Self {
         Self { conn }
     }
+
+    /// Open a dedicated reader Connection on `db_path` with WAL mode
+    /// enabled and migrations applied (idempotent). Mirrors
+    /// `FtsLexicalRetrieval::open` so each composite-lane backend can
+    /// own its own Connection — the Mutex then only serialises calls
+    /// within a single backend, leaving the shared WAL to multiplex
+    /// reads across backends. PR #11 review feedback.
+    pub fn open<P: AsRef<std::path::Path>>(db_path: P) -> Result<Self, IndexerError> {
+        let mut conn = Connection::open(db_path.as_ref())?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        azoth_core::event_store::migrations::run(&mut conn)?;
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+        })
+    }
 }
 
 #[async_trait::async_trait]

@@ -1,9 +1,17 @@
 # azoth
 
 Contract-centric, event-sourced, provider-agnostic coding agent runtime.
-Rust workspace: `azoth-core` (library, zero TUI coupling) + `azoth` (CLI/TUI binary). Linux only.
+Rust workspace (three crates):
 
-Full architecture spec: @docs/draft_plan.md
+- `azoth-core` — library, zero frontend coupling, zero heavy indexing deps.
+- `azoth-repo` — v2 indexer plane: FTS5 (`FtsLexicalRetrieval`), tree-sitter
+  symbol index (`SqliteSymbolIndex`), co-edit graph (`CoEditGraphRetrieval`),
+  TDAD impact selector (`CargoTestImpact`). Depends on `azoth-core`.
+- `azoth` — CLI/TUI binary. Depends on both. Linux only.
+
+Dependency arrow is strictly one-way: `azoth → azoth-repo → azoth-core`.
+
+Full architecture specs: @docs/draft_plan.md (v1 skeleton), @docs/v2_plan.md (repo intelligence moat).
 
 ## Commands
 
@@ -11,7 +19,7 @@ Full architecture spec: @docs/draft_plan.md
 source "$HOME/.cargo/env"          # required — cargo is NOT on default PATH
 cargo check --workspace
 cargo build --workspace
-cargo test --workspace             # 110+ tests, unit + integration
+cargo test --workspace             # 330+ tests, unit + integration
 cargo test -p azoth-core           # core crate only
 cargo clippy --workspace -- -D warnings
 cargo fmt --check
@@ -32,15 +40,18 @@ These are runtime laws. Code that violates any invariant is a bug regardless of 
 
 ## Architecture Constraints
 
-- `azoth-core` has ZERO frontend deps. Never import ratatui, crossterm, clap, or tui-textarea in azoth-core.
+- `azoth-core` has ZERO frontend deps AND zero heavy indexer deps. Never import ratatui, crossterm, clap, tui-textarea, tree-sitter, or fts-specific crates in azoth-core. Heavy indexing lives in `azoth-repo`.
+- `azoth-repo` houses tree-sitter, FTS5 (rusqlite `bundled` already includes it — no `fts5` feature flag needed), git shell-out, and TDAD backends. It depends on `azoth-core` for traits (`LexicalRetrieval`, `SymbolRetrieval`, `GraphRetrieval`, `ImpactSelector`) and schema types.
 - Internal model protocol uses **Anthropic Messages content-block shape**. The OpenAI adapter downcasts on the wire. Do not introduce a third internal format.
 - `schemas/` is the type hub — changes ripple everywhere. Treat it as a stability boundary.
 - Every Tool impl must: (a) define a typed `Input` struct, (b) declare an `EffectClass`, (c) go through the taint gate via `ErasedTool` blanket. Never bypass the dispatcher.
-- ContextKernel 5-lane ordering is **cache-prefix-stable**: constitution → working_set → evidence → checkpoint → exit_criteria. Never reorder.
-- **JSONL is authoritative** (CRIT-1). SQLite mirror is a rebuildable secondary index. Never write to SQLite as primary store.
+- `Origin` enum (taint provenance): `User`, `Contract`, `ToolOutput`, `RepoFile`, `WebFetch`, `ModelOutput`, **`Indexer`** (v2 — FTS5/symbol/graph). Tools declare `permitted_origins()`; full policy DSL enforcement ships in v2.5.
+- ContextKernel 5-lane ordering is **cache-prefix-stable**: constitution → working_set → evidence → checkpoint → exit_criteria. Never reorder. Within evidence, composite lanes tag items (`graph`, `symbol`, `lexical`, `fts`) and the stable sort + reranker MUST preserve byte-stability across reindexes — FTS snippets pass through `normalize_snippet` before landing in `inline`.
+- **JSONL is authoritative** (CRIT-1). SQLite mirror is a rebuildable secondary index. Never write to SQLite as primary store. `.azoth/state.sqlite` is shared between SqliteMirror, RepoIndexer, FtsLexicalRetrieval, SqliteSymbolIndex, CoEditGraphRetrieval — each opens its own `rusqlite::Connection`; WAL mode is persisted on the file.
 - Event lifecycle: TurnStarted → exactly one terminal marker. No orphaned events, no silent returns.
-- Tiers C and D (`apply_remote_*`, `apply_irreversible`) return `EffectNotAvailable` in v1. Do not implement real dispatchers.
+- Tiers C and D (`apply_remote_*`, `apply_irreversible`) return `EffectNotAvailable` in v1/v2. Do not implement real dispatchers.
 - Sandbox is Linux-only: Tier A (user namespaces + Landlock + seccomp), Tier B (+ fuse-overlayfs).
+- v2 retrieval defaults: `retrieval.mode = composite`, `retrieval.lexical_backend = fts`. Pre-v2 single-lane ripgrep behaviour stays reachable via `AZOTH_RETRIEVAL_MODE=legacy` / `AZOTH_LEXICAL_BACKEND=ripgrep` for forensic comparisons.
 
 ## Test Patterns
 
