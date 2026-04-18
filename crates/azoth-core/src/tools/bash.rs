@@ -119,14 +119,51 @@ impl Tool for BashTool {
         // per codex re-review P1 on PR #14.
         #[allow(unused_mut)]
         let mut overlay_handle: OverlayHandle = Default::default();
-        let mut child =
+        // v2.1 codex re-review round 3 P1: the up-front user-ns
+        // probe + build-error handling catch the common
+        // degradation cases, but the REAL jail sequence
+        // (CLONE_NEWNET, Landlock, seccomp) runs in `pre_exec`
+        // inside the actual fork. On a container that allows
+        // unprivileged user-ns but denies net-ns or Landlock,
+        // build_bash_command returns Ok, and spawn() then fails
+        // with EPERM. Catch that and retry unsandboxed once.
+        // Only retry when the original policy was sandboxed —
+        // a genuine "bash not installed" must still propagate.
+        let spawn_attempt =
             build_bash_command(&input.command, &ctx.repo_root, policy, &mut overlay_handle)?
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .kill_on_drop(true)
+                .spawn();
+        let mut child = match spawn_attempt {
+            Ok(c) => c,
+            Err(e) if !policy.is_off() => {
+                tracing::warn!(
+                    error = %e,
+                    policy = ?policy,
+                    "sandboxed spawn failed (likely pre_exec EPERM on net-ns / landlock \
+                     in a container); degrading to unsandboxed for this invocation"
+                );
+                // Drop any mounted overlay before retrying — the
+                // retry writes to the real repo, so staging from
+                // an abandoned upper layer would be wrong.
+                overlay_handle = Default::default();
+                build_bash_command(
+                    &input.command,
+                    &ctx.repo_root,
+                    SandboxPolicy::Off,
+                    &mut overlay_handle,
+                )?
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true)
                 .spawn()
-                .map_err(|e| ToolError::Failed(format!("spawn: {e}")))?;
+                .map_err(|e| ToolError::Failed(format!("spawn (unsandboxed retry): {e}")))?
+            }
+            Err(e) => return Err(ToolError::Failed(format!("spawn: {e}"))),
+        };
 
         let wait_fut = async {
             let status = child.wait().await?;
