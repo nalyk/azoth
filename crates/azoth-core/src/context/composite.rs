@@ -474,6 +474,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn graph_lane_items_are_tagged_and_reach_final_output() {
+        use super::super::graph_evidence::GraphEvidenceCollector;
+        use crate::retrieval::{Edge, GraphRetrieval, NodeRef, RetrievalError};
+        use async_trait::async_trait;
+
+        // Minimal fake graph: seed "src/foo.rs" → "src/bar.rs".
+        // Composite with ONLY the graph slot wired: proves the lane
+        // tag propagates through RRF + dedup + sort + budget. Risk
+        // ledger #3: an unwired graph lane is a silent
+        // three-lanes-instead-of-four bug.
+        struct GraphOnly;
+        #[async_trait]
+        impl GraphRetrieval for GraphOnly {
+            async fn neighbors(
+                &self,
+                node: NodeRef,
+                _depth: usize,
+                _limit: usize,
+            ) -> Result<Vec<(NodeRef, Edge)>, RetrievalError> {
+                if node.0 == "path:src/foo.rs" {
+                    Ok(vec![(
+                        NodeRef("path:src/bar.rs".into()),
+                        Edge {
+                            kind: "co_edit".into(),
+                            weight: 0.5,
+                        },
+                    )])
+                } else {
+                    Ok(Vec::new())
+                }
+            }
+        }
+        let graph_retr: Arc<dyn GraphRetrieval> = Arc::new(GraphOnly);
+        let graph_lane: Arc<dyn EvidenceCollector> =
+            Arc::new(GraphEvidenceCollector::new(graph_retr));
+        let mut c = CompositeEvidenceCollector::empty(Arc::new(ReciprocalRankFusion::default()));
+        c.graph = Some(graph_lane);
+        let out = c.collect("touch src/foo.rs", 10).await.unwrap();
+        assert_eq!(out.len(), 1, "expected one graph neighbour surviving");
+        assert_eq!(out[0].label, "src/bar.rs");
+        assert_eq!(
+            out[0].lane.as_deref(),
+            Some("graph"),
+            "composite must tag graph-slot items with lane='graph'"
+        );
+    }
+
+    #[tokio::test]
     async fn sub_collector_failure_does_not_kill_composite() {
         struct FailingCollector;
         #[async_trait]

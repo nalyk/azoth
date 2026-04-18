@@ -39,16 +39,16 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use azoth_core::context::{
-    CompositeEvidenceCollector, EvidenceCollector, LexicalEvidenceCollector, ReciprocalRankFusion,
-    SymbolEvidenceCollector, TokenBudget,
+    CompositeEvidenceCollector, EvidenceCollector, GraphEvidenceCollector,
+    LexicalEvidenceCollector, ReciprocalRankFusion, SymbolEvidenceCollector, TokenBudget,
 };
 use azoth_core::eval::SeedTask;
 use azoth_core::retrieval::{
-    CoEditConfig, LexicalRetrieval, RipgrepLexicalRetrieval, SymbolRetrieval,
+    CoEditConfig, GraphRetrieval, LexicalRetrieval, RipgrepLexicalRetrieval, SymbolRetrieval,
 };
 use azoth_core::schemas::EvidenceItem;
 use azoth_repo::history::co_edit;
-use azoth_repo::{FtsLexicalRetrieval, RepoIndexer, SqliteSymbolIndex};
+use azoth_repo::{CoEditGraphRetrieval, FtsLexicalRetrieval, RepoIndexer, SqliteSymbolIndex};
 
 /// Per-sweep stats so the caller can report "retrieval produced
 /// anything at all" vs "every task came back empty" — the latter is
@@ -193,6 +193,20 @@ async fn build_collector(
     let symbols = SqliteSymbolIndex::open(&db_path)
         .map_err(|e| LiveRetrievalError::Indexer(e.to_string()))?;
     let symbols_arc: Arc<SqliteSymbolIndex> = Arc::new(symbols);
+    // PR B wiring: live retrieval picks up the co-edit graph lane
+    // via the same `GraphEvidenceCollector` used by the TUI worker.
+    // Graph open failures are non-fatal — zero graph signal is
+    // strictly better than dropping the whole live-retrieval sweep.
+    let graph_arc: Option<Arc<CoEditGraphRetrieval>> = match CoEditGraphRetrieval::open(&db_path) {
+        Ok(g) => Some(Arc::new(g)),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "eval_live: graph retrieval open failed; graph lane unwired"
+            );
+            None
+        }
+    };
 
     let ripgrep_arc: Arc<dyn LexicalRetrieval> = Arc::new(RipgrepLexicalRetrieval {
         root: repo_root.clone(),
@@ -205,11 +219,15 @@ async fn build_collector(
     let fts_lane: Arc<dyn EvidenceCollector> = Arc::new(LexicalEvidenceCollector::new(fts_dyn));
     let symbol_lane: Arc<dyn EvidenceCollector> =
         Arc::new(SymbolEvidenceCollector::new(symbols_dyn));
+    let graph_lane: Option<Arc<dyn EvidenceCollector>> = graph_arc.as_ref().map(|g| {
+        let g_dyn: Arc<dyn GraphRetrieval> = g.clone();
+        Arc::new(GraphEvidenceCollector::new(g_dyn)) as Arc<dyn EvidenceCollector>
+    });
 
     let mut budget = TokenBudget::v2_default();
     budget.max_tokens = 8192;
     let composite = CompositeEvidenceCollector {
-        graph: None,
+        graph: graph_lane,
         symbol: Some(symbol_lane),
         lexical: Some(ripgrep_lane),
         fts: Some(fts_lane),
