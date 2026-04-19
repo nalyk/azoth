@@ -308,13 +308,19 @@ impl TurnCard {
         // Thoughts block — collapsible, above the prose.
         if !self.thoughts.is_empty() {
             let diamond = if theme.unicode { "◇" } else { "*" };
-            let fold_hint = if self.thoughts_expanded {
-                "⇥ fold"
+            let (disclosure, fold_hint) = if self.thoughts_expanded {
+                (
+                    if theme.unicode { "▾" } else { "-" },
+                    "⇥ fold · click to close",
+                )
             } else {
-                "⇥ unfold · click to open"
+                (
+                    if theme.unicode { "▸" } else { "+" },
+                    "⇥ unfold · click to open",
+                )
             };
             let header_text = format!(
-                "{diamond} thoughts ({} lines · {fold_hint})",
+                "{disclosure} {diamond} thoughts ({} lines · {fold_hint})",
                 self.thoughts.len()
             );
             // Hint: clicking this row toggles thoughts on this card.
@@ -349,7 +355,12 @@ impl TurnCard {
                     .map(|l| Line::from(Span::styled(l.to_string(), theme.ink(Palette::INK_0))))
                     .collect(),
             };
-            let is_aborted = matches!(self.state, CardState::Aborted { .. });
+            // Aborted cards used to strike-through every prose span, which
+            // rendered the reply unreadable (especially brutal when the
+            // model had already streamed a full useful answer before
+            // the abort fired). The abort signal now lives entirely in
+            // the bar color + the explicit "aborted · <reason>" footer;
+            // prose keeps its real styling so you can read it.
             let tail_chars = match (self.state.clone(), self.last_append) {
                 (CardState::Live, Some(at)) => motion::shimmer_chars(at.elapsed().as_millis()),
                 _ => 0,
@@ -361,12 +372,7 @@ impl TurnCard {
             for (i, line) in prose_lines.into_iter().enumerate() {
                 let mut spans: Vec<Span<'static>> = vec![Span::raw("   ")];
                 for s in line.spans {
-                    let style = if is_aborted {
-                        theme.strike_dim()
-                    } else {
-                        s.style
-                    };
-                    spans.push(Span::styled(s.content.into_owned(), style));
+                    spans.push(Span::styled(s.content.into_owned(), s.style));
                 }
                 if Some(i) == last_non_blank_idx && tail_chars > 0 {
                     if let Some(last_span) = spans.pop() {
@@ -406,6 +412,23 @@ impl TurnCard {
             } else {
                 " "
             };
+            // Disclosure triangle — makes the cell obviously clickable
+            // and its state obviously toggleable. ▾ when expanded,
+            // ▸ when collapsed, ASCII `+/-` on non-Unicode terminals.
+            let has_content = !cell.preview_lines.is_empty() || !cell.full_lines.is_empty();
+            let disclosure = if !has_content {
+                " "
+            } else if cell.expanded {
+                if theme.unicode {
+                    "▾"
+                } else {
+                    "-"
+                }
+            } else if theme.unicode {
+                "▸"
+            } else {
+                "+"
+            };
             let card_live = matches!(self.state, CardState::Live | CardState::AwaitingApproval);
             let result_chip = match &cell.result {
                 CellResult::Pending if card_live => {
@@ -435,7 +458,8 @@ impl TurnCard {
                 }
             };
             let cell_line = Line::from(vec![
-                Span::styled(format!("   {focus_marker}{prefix} "), theme.dim()),
+                Span::styled(format!("   {focus_marker}{disclosure} "), theme.accent()),
+                Span::styled(format!("{prefix} "), theme.dim()),
                 Span::styled(cell.name.clone(), theme.bold()),
                 Span::styled(format!("  {}", truncate(&cell.summary, 56)), theme.dim()),
                 result_chip,
