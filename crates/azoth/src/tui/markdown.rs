@@ -351,10 +351,11 @@ fn pad_to(s: &str, width: usize) -> String {
                 acc += cw;
             }
             taken.push('…');
-            // Ensure exact width (ellipsis is width=1).
-            let out_w = UnicodeWidthStr::width(taken.as_str());
+            // Ellipsis is width=1; we already tracked the truncated
+            // body width as `acc`, so the total is acc + 1 — no need
+            // to walk the string again with `UnicodeWidthStr::width`.
             let mut out = taken;
-            for _ in out_w..width {
+            for _ in (acc + 1)..width {
                 out.push(' ');
             }
             out

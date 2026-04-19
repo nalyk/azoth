@@ -235,9 +235,13 @@ impl AppState {
     /// the amber accent never lingers after the sheet closes.
     fn take_pending_approval(&mut self) -> Option<ApprovalRequestMsg> {
         let req = self.pending_approval.take();
-        for card in self.cards.iter_mut() {
+        // Worker processes turns sequentially → at most one card is
+        // AwaitingApproval. Search from newest and break on the first
+        // hit; previous version walked the whole transcript.
+        for card in self.cards.iter_mut().rev() {
             if matches!(card.state, CardState::AwaitingApproval) {
                 card.state = CardState::Live;
+                break;
             }
         }
         req
@@ -644,10 +648,14 @@ impl AppState {
                     .flat_map(|(ci, card)| (0..card.cells.len()).rev().map(move |xi| (ci, xi)))
                     .collect();
                 if !order.is_empty() {
+                    // Focus is almost always on a recent card — search
+                    // from newest first so long sessions don't pay an
+                    // O(N) scan for what's typically the first result.
                     let current = self
                         .cards
                         .iter()
                         .enumerate()
+                        .rev()
                         .find_map(|(ci, c)| c.cell_focus.map(|xi| (ci, xi)));
                     let next = match current.and_then(|p| order.iter().position(|&q| q == p)) {
                         Some(i) if i + 1 < order.len() => order[i + 1],
@@ -990,6 +998,18 @@ impl AppState {
                         "effect error · {} · {:?}",
                         effect.tool_name, effect.error
                     )));
+                } else if matches!(
+                    effect.class,
+                    azoth_core::schemas::EffectClass::ApplyLocal
+                        | azoth_core::schemas::EffectClass::ApplyRepo
+                ) {
+                    // Successful budget-counted effect — bump the
+                    // inspector's contract budget consumption so the
+                    // user can see how close they are to the cap.
+                    // Earlier the consumed counter sat at 0 forever.
+                    if let Some((used, max)) = self.inspector_data.contract_budget.as_mut() {
+                        *used = used.saturating_add(1).min(*max);
+                    }
                 }
             }
             SessionEvent::RetrievalQueried {
@@ -2335,6 +2355,64 @@ mod tests {
         assert!(
             state.inspector_data.evidence_lanes.is_empty(),
             "prior-turn evidence must not bleed into the fresh turn"
+        );
+    }
+
+    #[test]
+    fn effect_record_increments_contract_budget_consumed() {
+        let mut state = AppState::new();
+        // Simulate accepting a contract with budget 5 (3 apply_local + 2 apply_repo).
+        state.inspector_data.contract_budget = Some((0, 5));
+        let turn_id = TurnId::new();
+        // First successful ApplyLocal effect.
+        state.handle_session_event(SessionEvent::EffectRecord {
+            turn_id: turn_id.clone(),
+            effect: azoth_core::schemas::EffectRecord {
+                id: azoth_core::schemas::EffectRecordId::new(),
+                tool_use_id: azoth_core::schemas::ToolUseId::from("tu_1".to_string()),
+                class: azoth_core::schemas::EffectClass::ApplyLocal,
+                tool_name: "fs_write".into(),
+                input_digest: None,
+                output_artifact: None,
+                error: None,
+            },
+        });
+        assert_eq!(state.inspector_data.contract_budget, Some((1, 5)));
+        // Failed effect — must NOT bump the counter.
+        state.handle_session_event(SessionEvent::EffectRecord {
+            turn_id: turn_id.clone(),
+            effect: azoth_core::schemas::EffectRecord {
+                id: azoth_core::schemas::EffectRecordId::new(),
+                tool_use_id: azoth_core::schemas::ToolUseId::from("tu_2".to_string()),
+                class: azoth_core::schemas::EffectClass::ApplyLocal,
+                tool_name: "fs_write".into(),
+                input_digest: None,
+                output_artifact: None,
+                error: Some("denied".into()),
+            },
+        });
+        assert_eq!(
+            state.inspector_data.contract_budget,
+            Some((1, 5)),
+            "errored effects must not consume budget"
+        );
+        // Observe-class effect — also doesn't count.
+        state.handle_session_event(SessionEvent::EffectRecord {
+            turn_id,
+            effect: azoth_core::schemas::EffectRecord {
+                id: azoth_core::schemas::EffectRecordId::new(),
+                tool_use_id: azoth_core::schemas::ToolUseId::from("tu_3".to_string()),
+                class: azoth_core::schemas::EffectClass::Observe,
+                tool_name: "repo_search".into(),
+                input_digest: None,
+                output_artifact: None,
+                error: None,
+            },
+        });
+        assert_eq!(
+            state.inspector_data.contract_budget,
+            Some((1, 5)),
+            "Observe is not budget-counted"
         );
     }
 
