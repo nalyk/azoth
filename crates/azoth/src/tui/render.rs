@@ -243,55 +243,78 @@ fn render_canvas(
     };
     let est_target_bot = est_target_top + visible_h_usize;
 
-    // Pass 2 — for each card, render fully when it intersects the
-    // estimated viewport (or has never been painted). Cards entirely
-    // off-screen get blank-line placeholders matching their cached
-    // height so scroll math + click_map indices stay consistent
-    // without paying `render_rows` cost (which includes markdown
-    // restyling, cell preview restyling, etc.). On long-running
-    // sessions this turns O(N) per-frame work into O(rows on screen).
-    // Pre-size both vectors to the estimated total — `lines` and
-    // `row_hints` always grow in lockstep up to ~est_total, and
-    // incremental Vec growth here was the dominant alloc on long
-    // sessions. The visible-slice virtualisation that would drop
-    // O(N) entirely (no placeholder lines for off-screen cards) is
-    // a bigger refactor — flagged for a later round.
-    let mut lines: Vec<Line<'static>> = Vec::with_capacity(est_total);
-    let mut row_hints: Vec<Option<(usize, super::card::RowHint)>> = Vec::with_capacity(est_total);
+    // Pass 2 — visible-slice virtualisation. Earlier code pushed
+    // blank-line placeholders for every off-screen card so scroll
+    // math worked out; on a 1000-card session that allocated 1000s
+    // of `Line` + `Vec<Span>` per frame just to be invisible. New
+    // approach: skip off-screen cards entirely. We track:
+    //
+    //   skipped_above_h — total estimated height of cards entirely
+    //   above the viewport (used to translate `scroll_pos` from the
+    //   "if-all-rendered" coord system into the "rendered-only" Vec).
+    //
+    //   first_card_local_skip — when the first intersecting card
+    //   straddles the viewport top, this is how many of its rows we
+    //   skip via `Paragraph::scroll`.
+    //
+    // Cards entirely below the viewport are simply not iterated —
+    // we `break` once `cursor_y > est_target_bot`.
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(visible_h_usize.saturating_mul(2));
+    let mut row_hints: Vec<Option<(usize, super::card::RowHint)>> =
+        Vec::with_capacity(visible_h_usize.saturating_mul(2));
     let mut cursor_y: usize = 0;
+    let mut skipped_above_h: usize = 0;
+    let mut first_card_local_skip: Option<usize> = None;
     for &card_idx in visible_indices.iter() {
         let est_h_val = est_h(state.cards[card_idx].last_rendered_rows);
         let card_y_end = cursor_y + est_h_val;
-        let intersects = card_y_end >= est_target_top && cursor_y <= est_target_bot;
+        let intersects = card_y_end > est_target_top && cursor_y < est_target_bot;
         let never_rendered = state.cards[card_idx].last_rendered_rows == 0;
         if intersects || never_rendered {
+            // Compute the local-skip if this is the FIRST intersecting
+            // card AND its top sits above the viewport. After we
+            // render it, scroll_pos becomes that local skip plus 0
+            // (since we've already dropped everything above it).
+            if first_card_local_skip.is_none() {
+                first_card_local_skip = Some(est_target_top.saturating_sub(cursor_y));
+            }
             let rows = state.cards[card_idx].render_rows(theme, cursor_phase, bar_phase);
             cursor_y += rows.len();
             for (line, hint) in rows {
                 lines.push(line);
                 row_hints.push(hint.map(|h| (card_idx, h)));
             }
-        } else {
-            for _ in 0..est_h_val {
-                lines.push(Line::from(""));
-                row_hints.push(None);
+            // Stop after we've rendered enough to fill the viewport.
+            // We render all cards that intersect, including ones that
+            // straddle the bottom — early-exit fires only when the
+            // NEXT card would be entirely below.
+            if cursor_y >= est_target_bot {
+                continue;
             }
+        } else if cursor_y < est_target_top {
+            // Above the viewport — accumulate and skip render.
+            skipped_above_h = skipped_above_h.saturating_add(est_h_val);
             cursor_y += est_h_val;
+        } else {
+            // Below the viewport — every subsequent card is also
+            // below. Stop iterating.
+            break;
         }
     }
 
-    // Recompute scroll from actual line count — estimates may be off
-    // by a few rows after a card streams new prose, and the actual
-    // total is what `Paragraph::scroll` consumes.
+    // scroll_pos is now relative to the rendered-only `lines` Vec,
+    // not the full transcript. The first intersecting card's local
+    // skip gives us exactly the number of rows ratatui must skip at
+    // the top of `lines` to align with the user's scroll target.
+    // When the user has not scrolled (default = bottom-pinned), we
+    // want the visible window to land at the bottom of `lines`.
     let total = lines.len() as u16;
-    let max_scroll = total.saturating_sub(visible_height);
     let scroll_pos = if state.scroll_locked {
-        max_scroll
-            .saturating_sub(state.scroll_offset)
-            .min(max_scroll)
+        first_card_local_skip.unwrap_or(0).min(u16::MAX as usize) as u16
     } else {
-        max_scroll
+        total.saturating_sub(visible_height)
     };
+    let _ = skipped_above_h; // reserved for explicit-y telemetry / future use
 
     // Populate click_map by mapping each visible row to its absolute
     // terminal Y. Iterating only the visible window keeps this O(rows

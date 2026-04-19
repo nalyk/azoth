@@ -98,62 +98,91 @@ pub fn render(
     let body_para = Paragraph::new(body_lines).wrap(Wrap { trim: false });
     f.render_widget(body_para, chunks[0]);
 
-    let action_line = Line::from(vec![
-        Span::styled(
-            "↵ ".to_string(),
+    // Buttons declared as data so labels, prefixes, and click targets
+    // stay in lockstep — the rendered span widths drive the hitbox
+    // ranges, so multi-byte glyphs (`↵`, `⎋`) and any future
+    // localization stay aligned automatically. Earlier code hardcoded
+    // hitbox X spans from char counts and was already misaligned for
+    // the unicode glyph prefixes (which `UnicodeWidthStr` reports as
+    // 1 column but `.len()` reports as 3 bytes).
+    use unicode_width::UnicodeWidthStr;
+    struct Btn {
+        prefix: &'static str,
+        label: &'static str,
+        trailing: &'static str,
+        target: ClickTarget,
+    }
+    let buttons = [
+        Btn {
+            prefix: "↵ ",
+            label: "approve once",
+            trailing: "   ",
+            target: ClickTarget::SheetApproveOnce,
+        },
+        Btn {
+            prefix: "s ",
+            label: "session",
+            trailing: "   ",
+            target: ClickTarget::SheetApproveSession,
+        },
+        Btn {
+            // Scoped-paths shares SheetApproveSession in v1 — see the
+            // keyboard handler note.
+            prefix: "p ",
+            label: "scoped paths",
+            trailing: "   ",
+            target: ClickTarget::SheetApproveSession,
+        },
+        Btn {
+            prefix: "⎋ ",
+            label: "deny",
+            trailing: "",
+            target: ClickTarget::SheetDeny,
+        },
+    ];
+    let mut spans: Vec<Span<'static>> = Vec::with_capacity(buttons.len() * 3);
+    let mut button_extents: Vec<(u16, ClickTarget)> = Vec::with_capacity(buttons.len() * 2);
+    let mut cursor_w: u16 = 0;
+    for b in &buttons {
+        let prefix_w = UnicodeWidthStr::width(b.prefix) as u16;
+        let label_w = UnicodeWidthStr::width(b.label) as u16;
+        let trailing_w = UnicodeWidthStr::width(b.trailing) as u16;
+        let btn_total = prefix_w + label_w + trailing_w;
+        button_extents.push((cursor_w + btn_total, b.target.clone()));
+        spans.push(Span::styled(
+            b.prefix.to_string(),
             theme.accent().add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("approve once   ".to_string(), theme.bold()),
-        Span::styled(
-            "s ".to_string(),
-            theme.accent().add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("session   ".to_string(), theme.bold()),
-        Span::styled(
-            "p ".to_string(),
-            theme.accent().add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("scoped paths   ".to_string(), theme.bold()),
-        Span::styled(
-            "⎋ ".to_string(),
-            theme.accent().add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("deny".to_string(), theme.bold()),
-    ]);
+        ));
+        spans.push(Span::styled(
+            format!("{}{}", b.label, b.trailing),
+            theme.bold(),
+        ));
+        cursor_w = cursor_w.saturating_add(btn_total);
+    }
+    let action_line = Line::from(spans);
     let hint_line = Line::from(Span::styled(
         format!("   tool: {}", req.tool_name),
         theme.dim(),
     ));
     f.render_widget(Paragraph::new(vec![action_line, hint_line]), chunks[1]);
 
-    // Register click targets for each button on the action row.
-    // Layout (relative to chunks[1].x): "↵ approve once   s session
-    // p scoped paths   ⎋ deny". Each button is clamped to the actual
-    // chunks[1] span — earlier code used a fixed `base + 56` upper
-    // bound that overshot narrow sheets, leaving the rightmost
-    // buttons unclickable when the sheet rendered at its 48-col floor.
+    // Register click hitboxes from the actual rendered widths, clamped
+    // to the chunks[1] span so narrow sheets stay safe (round-11 fix
+    // preserved). The earlier hardcoded `+17 / +29 / +46 / +56`
+    // offsets were eyeballed from char counts and didn't match the
+    // real display widths.
     let action_y = chunks[1].y as usize;
     if action_y < click_map.len() {
         let base = chunks[1].x;
         let bound = base.saturating_add(chunks[1].width);
-        let clamp = |start: u16, end: u16| -> std::ops::Range<u16> {
-            let s = start.min(bound);
-            let e = end.min(bound);
-            s..e
-        };
-        click_map[action_y].push((clamp(base, base + 17), ClickTarget::SheetApproveOnce));
-        click_map[action_y].push((
-            clamp(base + 17, base + 29),
-            ClickTarget::SheetApproveSession,
-        ));
-        // Scoped-paths shares the SheetApproveSession action in v1
-        // (per the keyboard handler comment), so route the click the
-        // same way for now.
-        click_map[action_y].push((
-            clamp(base + 29, base + 46),
-            ClickTarget::SheetApproveSession,
-        ));
-        click_map[action_y].push((clamp(base + 46, base + 56), ClickTarget::SheetDeny));
+        let mut prev_end: u16 = base;
+        for (cum_w, target) in button_extents {
+            let end = base.saturating_add(cum_w).min(bound);
+            if end > prev_end {
+                click_map[action_y].push((prev_end..end, target));
+            }
+            prev_end = end;
+        }
     }
 }
 

@@ -483,18 +483,26 @@ impl AppState {
                 // approve/deny clicks became no-ops when a card row
                 // sat behind the sheet area.
                 let mut chosen: Option<ClickTarget> = None;
+                let approval_pending = self.pending_approval.is_some();
                 if let Some(row) = self.click_map.get(y) {
                     for (range, t) in row.iter() {
                         if !range.contains(&x) {
                             continue;
                         }
-                        let is_modal_target = matches!(
-                            t,
+                        // PaletteOpen is gated separately: allowed when
+                        // no approval is pending, dropped when an
+                        // approval sheet is active. Earlier code let
+                        // PaletteOpen through during approval, so a
+                        // click on the status-row brand stole keyboard
+                        // input (Enter/Esc routed to palette) and made
+                        // the approval flow indirect.
+                        let is_modal_target = match t {
                             ClickTarget::SheetApproveOnce
-                                | ClickTarget::SheetApproveSession
-                                | ClickTarget::SheetDeny
-                                | ClickTarget::PaletteOpen
-                        );
+                            | ClickTarget::SheetApproveSession
+                            | ClickTarget::SheetDeny => true,
+                            ClickTarget::PaletteOpen => !approval_pending,
+                            _ => false,
+                        };
                         if modal_active && !is_modal_target {
                             continue;
                         }
@@ -1007,18 +1015,29 @@ impl AppState {
                         // a 100k-line build log used to clone fully into
                         // `preview_text` before we even decided how much
                         // we needed.
-                        // Find the FIRST text block — tools may emit a
-                        // mix of structured + text blocks. Earlier code
-                        // only checked content[0], so a tool returning
-                        // `[Image, Text { ... }]` would render the
-                        // preview as empty.
-                        let preview_text: &str = content
+                        // Concatenate ALL text blocks across the
+                        // ToolResult content — earlier code only
+                        // grabbed the first text block via find_map,
+                        // dropping later text content (a tool returning
+                        // `[Text "stdout", Image, Text "stderr"]` lost
+                        // the stderr). Borrow when possible, allocate
+                        // a join only when there are multiple blocks.
+                        let texts: Vec<&str> = content
                             .iter()
-                            .find_map(|b| match b {
+                            .filter_map(|b| match b {
                                 ContentBlock::Text { text } => Some(text.as_str()),
                                 _ => None,
                             })
-                            .unwrap_or("");
+                            .collect();
+                        let joined_storage: String;
+                        let preview_text: &str = match texts.as_slice() {
+                            [] => "",
+                            [single] => single,
+                            many => {
+                                joined_storage = many.join("\n");
+                                &joined_storage
+                            }
+                        };
                         let tu_id = tool_use_id.to_string();
                         if let Some(card) = self.card_by_turn_id_mut(&tid) {
                             if let Some(cell) = card.cell_by_id_mut(&tu_id) {
@@ -1031,54 +1050,72 @@ impl AppState {
                                 // or a giant log) cannot lock the UI
                                 // thread while we count.
                                 const MAX_LINES_SCANNED: usize = 10_000;
-                                // Per-line hard cap so a tool that emits
-                                // a single multi-megabyte line (a JSON
-                                // dump, a malformed log) doesn't clone
-                                // the whole thing into the cell cache.
+                                // Hard byte cap so even a 100MB output
+                                // with no newlines (or pathological
+                                // 10k newlines averaging 1MB each)
+                                // can't lock the UI thread.
+                                // `lines()` walks every byte to find
+                                // `\n`, so the line cap alone isn't
+                                // enough.
+                                const MAX_BYTES_SCANNED: usize = 1_048_576; // 1 MiB
                                 const MAX_LINE_BYTES: usize = 1024;
                                 let mut preview: Vec<String> = Vec::with_capacity(5);
                                 let mut full: Vec<String> = Vec::with_capacity(24);
                                 let mut total_lines: u32 = 0;
                                 let mut first_line: Option<String> = None;
                                 let mut truncated = false;
-                                for (i, line) in preview_text.lines().enumerate() {
+                                let scan_slice = if preview_text.len() > MAX_BYTES_SCANNED {
+                                    truncated = true;
+                                    // floor to char boundary
+                                    let mut end = MAX_BYTES_SCANNED;
+                                    while end > 0 && !preview_text.is_char_boundary(end) {
+                                        end -= 1;
+                                    }
+                                    &preview_text[..end]
+                                } else {
+                                    preview_text
+                                };
+                                for (i, line) in scan_slice.lines().enumerate() {
                                     if i >= MAX_LINES_SCANNED {
                                         truncated = true;
                                         break;
                                     }
-                                    // Borrow-truncate the line ONCE per
-                                    // iteration — earlier code called
-                                    // `line.to_string()` up to three
-                                    // times per line in the dual-bucket
-                                    // fill.
-                                    let trimmed = if line.len() > MAX_LINE_BYTES {
-                                        // floor to a char boundary so
-                                        // slicing never panics on
-                                        // multi-byte content
-                                        let mut end = MAX_LINE_BYTES;
-                                        while end > 0 && !line.is_char_boundary(end) {
-                                            end -= 1;
-                                        }
-                                        &line[..end]
-                                    } else {
-                                        line
-                                    };
-                                    let owned = trimmed.to_string();
-                                    if total_lines == 0 {
-                                        first_line = Some(owned.clone());
-                                    }
-                                    total_lines = total_lines.saturating_add(1);
                                     let want_preview = preview.len() < 4;
                                     let want_full = full.len() < 24;
-                                    match (want_preview, want_full) {
-                                        (true, true) => {
-                                            preview.push(owned.clone());
-                                            full.push(owned);
+                                    let is_first = total_lines == 0;
+                                    // Allocate ONLY when we will use the
+                                    // owned String — earlier code paid
+                                    // a `to_string()` for every line up
+                                    // to MAX_LINES_SCANNED, but the
+                                    // result was only stored for the
+                                    // first 24 entries. Wasted ~9976
+                                    // allocations on a 10k-line scan.
+                                    if want_preview || want_full || is_first {
+                                        let trimmed = if line.len() > MAX_LINE_BYTES {
+                                            // floor to char boundary
+                                            let mut end = MAX_LINE_BYTES;
+                                            while end > 0 && !line.is_char_boundary(end) {
+                                                end -= 1;
+                                            }
+                                            &line[..end]
+                                        } else {
+                                            line
+                                        };
+                                        let owned = trimmed.to_string();
+                                        if is_first {
+                                            first_line = Some(owned.clone());
                                         }
-                                        (true, false) => preview.push(owned),
-                                        (false, true) => full.push(owned),
-                                        (false, false) => {}
+                                        match (want_preview, want_full) {
+                                            (true, true) => {
+                                                preview.push(owned.clone());
+                                                full.push(owned);
+                                            }
+                                            (true, false) => preview.push(owned),
+                                            (false, true) => full.push(owned),
+                                            (false, false) => {}
+                                        }
                                     }
+                                    total_lines = total_lines.saturating_add(1);
                                 }
                                 if total_lines > 4 {
                                     let suffix = if truncated { "+" } else { "" };

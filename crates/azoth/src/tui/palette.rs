@@ -284,11 +284,14 @@ pub fn render(f: &mut Frame, area: Rect, state: &PaletteState, theme: &Theme, tu
         ])
         .split(inner);
 
-    // Query line.
+    // Query line. Cursor glyph routes through `Theme::glyph` so the
+    // ASCII-fallback theme (LC_ALL=C / non-UTF-8 terminal) gets a
+    // plain `_` instead of a Unicode block — earlier code emitted
+    // `▋` unconditionally, defeating the round-1 ASCII-fallback path.
     let q_line = Line::from(vec![
         Span::styled("› ".to_string(), theme.accent()),
         Span::styled(state.query.clone(), theme.bold()),
-        Span::styled("▋".to_string(), theme.accent()),
+        Span::styled(theme.glyph(Theme::CURSOR_A).to_string(), theme.accent()),
     ]);
     f.render_widget(Paragraph::new(q_line), chunks[0]);
 
