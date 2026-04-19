@@ -16,7 +16,7 @@
 //! - Links — rendered as `text` with the URL underneath, dim.
 //! - Paragraphs separated by blank lines.
 
-use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Parser, Tag, TagEnd};
+use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
@@ -26,7 +26,14 @@ use super::theme::{Palette, Theme};
 /// be dropped into a ratatui `Paragraph`.
 pub fn render(md: &str, theme: &Theme) -> Vec<Line<'static>> {
     let mut out: Vec<Line<'static>> = Vec::with_capacity(md.lines().count() + 4);
-    let parser = Parser::new(md);
+    // GFM extensions — without ENABLE_TABLES, pulldown-cmark emits
+    // raw text for pipe-syntax tables, producing jumbled output.
+    // Strikethrough + task lists are cheap wins on the same shape.
+    let mut opts = Options::empty();
+    opts.insert(Options::ENABLE_TABLES);
+    opts.insert(Options::ENABLE_STRIKETHROUGH);
+    opts.insert(Options::ENABLE_TASKLISTS);
+    let parser = Parser::new_ext(md, opts);
 
     let mut current_spans: Vec<Span<'static>> = Vec::new();
     let mut style_stack: Vec<Style> = vec![theme.ink(Palette::INK_0)];
@@ -38,6 +45,9 @@ pub fn render(md: &str, theme: &Theme) -> Vec<Line<'static>> {
     let mut in_blockquote: bool = false;
     let mut pending_link_url: Option<String> = None;
     let mut heading_level: Option<HeadingLevel> = None;
+    let mut table_buf = TableBuf::default();
+    let mut in_table: bool = false;
+    let mut in_cell: bool = false;
 
     for ev in parser {
         match ev {
@@ -141,17 +151,58 @@ pub fn render(md: &str, theme: &Theme) -> Vec<Line<'static>> {
                     current_spans.push(Span::styled(format!(" ({url})"), theme.italic_dim()));
                 }
             }
+            Event::Start(Tag::Table(_)) => {
+                flush(&mut out, &mut current_spans);
+                in_table = true;
+                table_buf = TableBuf::default();
+            }
+            Event::End(TagEnd::Table) => {
+                render_table(&mut out, &table_buf, theme);
+                out.push(Line::from(""));
+                in_table = false;
+            }
+            Event::Start(Tag::TableHead) => {
+                table_buf.in_header = true;
+            }
+            Event::End(TagEnd::TableHead) => {
+                table_buf.header = std::mem::take(&mut table_buf.current_row);
+                table_buf.in_header = false;
+            }
+            Event::Start(Tag::TableRow) => {
+                // Cells accumulate via TableCell end; nothing to do here.
+            }
+            Event::End(TagEnd::TableRow) => {
+                if !table_buf.in_header {
+                    let row = std::mem::take(&mut table_buf.current_row);
+                    table_buf.body.push(row);
+                }
+            }
+            Event::Start(Tag::TableCell) => {
+                in_cell = true;
+                table_buf.current_cell.clear();
+            }
+            Event::End(TagEnd::TableCell) => {
+                in_cell = false;
+                let cell = std::mem::take(&mut table_buf.current_cell);
+                table_buf.current_row.push(cell);
+            }
             Event::Code(text) => {
-                let top = *style_stack.last().unwrap_or(&Style::default());
-                current_spans.push(Span::styled(
-                    text.to_string(),
-                    top.fg(Palette::ACCENT)
-                        .bg(Color::Indexed(236))
-                        .add_modifier(Modifier::BOLD),
-                ));
+                if in_table && in_cell {
+                    table_buf.current_cell.push_str(&text);
+                } else {
+                    let top = *style_stack.last().unwrap_or(&Style::default());
+                    current_spans.push(Span::styled(
+                        text.to_string(),
+                        top.fg(Palette::ACCENT)
+                            .bg(Color::Indexed(236))
+                            .add_modifier(Modifier::BOLD),
+                    ));
+                }
             }
             Event::Text(text) => {
-                if in_code_block {
+                if in_table && in_cell {
+                    table_buf.current_cell.push_str(&text);
+                } else if in_code_block {
                     code_buffer.push_str(&text);
                 } else if in_blockquote {
                     for line in text.lines() {
@@ -197,6 +248,105 @@ pub fn render(md: &str, theme: &Theme) -> Vec<Line<'static>> {
         out.pop();
     }
     out
+}
+
+/// Accumulator for a GFM table during parsing. Cells are buffered as
+/// plain strings; styling (header vs body) is applied at
+/// `render_table` time.
+#[derive(Default)]
+struct TableBuf {
+    header: Vec<String>,
+    body: Vec<Vec<String>>,
+    current_row: Vec<String>,
+    current_cell: String,
+    in_header: bool,
+}
+
+/// Render a parsed GFM table as whitespace-aligned PAPER-style prose.
+/// Intentionally no vertical dividers — the aesthetic relies on
+/// alignment + a single hairline under the header, matching the rest
+/// of the canvas typography.
+fn render_table(out: &mut Vec<Line<'static>>, t: &TableBuf, theme: &Theme) {
+    let col_count = t
+        .header
+        .len()
+        .max(t.body.iter().map(|r| r.len()).max().unwrap_or(0));
+    if col_count == 0 {
+        return;
+    }
+    const MAX_COL: usize = 48;
+    const GAP: usize = 2;
+
+    let mut widths = vec![0usize; col_count];
+    for (i, cell) in t.header.iter().enumerate().take(col_count) {
+        widths[i] = widths[i].max(cell.chars().count());
+    }
+    for row in &t.body {
+        for (i, cell) in row.iter().enumerate().take(col_count) {
+            widths[i] = widths[i].max(cell.chars().count());
+        }
+    }
+    for w in &mut widths {
+        *w = (*w).min(MAX_COL);
+    }
+
+    let header_style = theme.bold().fg(Palette::ACCENT);
+    let body_style = theme.ink(Palette::INK_1);
+    let gap = " ".repeat(GAP);
+
+    let mut header_spans: Vec<Span<'static>> = vec![Span::raw("  ")];
+    for (i, width) in widths.iter().enumerate().take(col_count) {
+        let cell = t.header.get(i).cloned().unwrap_or_default();
+        header_spans.push(Span::styled(pad_to(&cell, *width), header_style));
+        if i + 1 < col_count {
+            header_spans.push(Span::styled(gap.clone(), theme.dim()));
+        }
+    }
+    out.push(Line::from(header_spans));
+
+    let total_width: usize = widths.iter().sum::<usize>() + col_count.saturating_sub(1) * GAP;
+    out.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled(
+            theme.glyph(Theme::HAIRLINE_CHAR).repeat(total_width),
+            theme.hairline(),
+        ),
+    ]));
+
+    for row in &t.body {
+        let mut spans: Vec<Span<'static>> = vec![Span::raw("  ")];
+        for (i, width) in widths.iter().enumerate().take(col_count) {
+            let cell = row.get(i).cloned().unwrap_or_default();
+            spans.push(Span::styled(pad_to(&cell, *width), body_style));
+            if i + 1 < col_count {
+                spans.push(Span::styled(gap.clone(), theme.dim()));
+            }
+        }
+        out.push(Line::from(spans));
+    }
+}
+
+/// Pad or truncate a string to exactly `width` visible chars. Uses
+/// `chars().count()` as a proxy for display width — correct for
+/// ASCII/Latin; wide Unicode (CJK / emoji) may misalign by a column
+/// until a full `unicode-width` pass lands.
+fn pad_to(s: &str, width: usize) -> String {
+    let count = s.chars().count();
+    match count.cmp(&width) {
+        std::cmp::Ordering::Greater => {
+            let mut t: String = s.chars().take(width.saturating_sub(1)).collect();
+            t.push('…');
+            t
+        }
+        std::cmp::Ordering::Less => {
+            let mut out = s.to_string();
+            for _ in 0..(width - count) {
+                out.push(' ');
+            }
+            out
+        }
+        std::cmp::Ordering::Equal => s.to_string(),
+    }
 }
 
 fn flush(out: &mut Vec<Line<'static>>, current: &mut Vec<Span<'static>>) {
@@ -503,5 +653,65 @@ mod tests {
             .iter()
             .any(|s| s.content.contains("\"hello\"") && s.style.fg.is_some());
         assert!(has_string);
+    }
+
+    #[test]
+    fn gfm_table_renders_header_separator_and_rows() {
+        let theme = Theme { unicode: true };
+        let md = "\
+| tool         | class       |
+|--------------|-------------|
+| repo_search  | observe     |
+| fs_write     | apply_local |
+";
+        let lines = render(md, &theme);
+        // Header cell text is present.
+        let has_header = lines
+            .iter()
+            .any(|l| l.spans.iter().any(|s| s.content.contains("tool")));
+        assert!(has_header, "expected header row with 'tool'");
+
+        // Body cell text is present.
+        let has_body = lines
+            .iter()
+            .any(|l| l.spans.iter().any(|s| s.content.contains("repo_search")));
+        assert!(has_body, "expected body row with 'repo_search'");
+
+        // Separator hairline uses '─' and spans multiple chars.
+        let has_hairline = lines
+            .iter()
+            .any(|l| l.spans.iter().any(|s| s.content.contains("──")));
+        assert!(has_hairline, "expected hairline separator under header");
+    }
+
+    #[test]
+    fn table_cells_get_padded_to_column_width() {
+        assert_eq!(pad_to("hi", 5), "hi   ");
+        assert_eq!(pad_to("exactly", 7), "exactly");
+        let truncated = pad_to("toolongforthecolumn", 8);
+        assert_eq!(truncated.chars().count(), 8);
+        assert!(truncated.ends_with('…'));
+    }
+
+    #[test]
+    fn strikethrough_renders_as_crossed_out_modifier() {
+        let theme = Theme { unicode: true };
+        let lines = render("~~gone~~", &theme);
+        let has_strike = lines.iter().flat_map(|l| l.spans.iter()).any(|s| {
+            s.content.contains("gone") && s.style.add_modifier.contains(Modifier::CROSSED_OUT)
+        });
+        assert!(
+            has_strike,
+            "~~text~~ should render with CROSSED_OUT modifier"
+        );
+    }
+
+    #[test]
+    fn empty_table_does_not_panic() {
+        let theme = Theme { unicode: true };
+        // A table with only a header, no body.
+        let lines = render("| a | b |\n|---|---|", &theme);
+        // Should produce at least the header + hairline, no panic.
+        assert!(lines.len() >= 2);
     }
 }
