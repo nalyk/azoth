@@ -694,7 +694,12 @@ impl AppState {
                     } else {
                         // Push the user's card immediately — the card
                         // appears before the model even sees the turn.
-                        let user_turn_id = format!("user_{}", self.committed_turns);
+                        // Use a fresh `TurnId` so back-to-back user
+                        // sends produce globally-unique card IDs (the
+                        // earlier `committed_turns`-based ID could
+                        // collide if the user pressed Enter twice
+                        // before the agent committed the prior turn).
+                        let user_turn_id = TurnId::new().to_string();
                         self.cards
                             .push(TurnCard::user(user_turn_id, content.clone()));
                         self.pending_user_text = Some(content);
@@ -880,6 +885,8 @@ impl AppState {
                             preview_lines: Vec::new(),
                             full_lines: Vec::new(),
                             created_at: Instant::now(),
+                            cached_preview_render: None,
+                            cached_full_render: None,
                         };
                         if let Some(card) = self.card_by_turn_id_mut(&tid) {
                             card.add_cell(cell);
@@ -892,38 +899,47 @@ impl AppState {
                         is_error,
                         content,
                     } => {
-                        let preview_text = content
-                            .first()
-                            .and_then(|b| match b {
-                                ContentBlock::Text { text } => Some(text.clone()),
-                                _ => None,
-                            })
-                            .unwrap_or_default();
+                        // Borrow the text without cloning the entire body —
+                        // a 100k-line build log used to clone fully into
+                        // `preview_text` before we even decided how much
+                        // we needed.
+                        let preview_text: &str = match content.first() {
+                            Some(ContentBlock::Text { text }) => text.as_str(),
+                            _ => "",
+                        };
                         let tu_id = tool_use_id.to_string();
                         if let Some(card) = self.card_by_turn_id_mut(&tid) {
                             if let Some(cell) = card.cell_by_id_mut(&tu_id) {
-                                // Walk lines once — reused for preview, full,
-                                // total count, and error first-line. Earlier
-                                // version called `.lines()` four times per
-                                // ToolResult event.
-                                let line_refs: Vec<&str> = preview_text.lines().collect();
-                                let total_lines = line_refs.len();
-                                let mut preview: Vec<String> =
-                                    line_refs.iter().take(4).map(|s| s.to_string()).collect();
+                                // Single streaming pass: take at most 4
+                                // preview + 24 full + count, never
+                                // materialising a `Vec<&str>` over the
+                                // whole output.
+                                let mut preview: Vec<String> = Vec::with_capacity(5);
+                                let mut full: Vec<String> = Vec::with_capacity(24);
+                                let mut total_lines: u32 = 0;
+                                let mut first_line: Option<String> = None;
+                                for line in preview_text.lines() {
+                                    if total_lines == 0 {
+                                        first_line = Some(line.to_string());
+                                    }
+                                    total_lines = total_lines.saturating_add(1);
+                                    if preview.len() < 4 {
+                                        preview.push(line.to_string());
+                                    }
+                                    if full.len() < 24 {
+                                        full.push(line.to_string());
+                                    }
+                                }
                                 if total_lines > 4 {
                                     preview.push(format!("… +{} more lines", total_lines - 4));
                                 }
-                                let full: Vec<String> =
-                                    line_refs.iter().take(24).map(|s| s.to_string()).collect();
-                                cell.preview_lines = preview;
-                                cell.full_lines = full;
+                                cell.set_preview_lines(preview);
+                                cell.set_full_lines(full);
                                 cell.result = if is_error {
-                                    let msg: String = line_refs
-                                        .first()
-                                        .copied()
-                                        .unwrap_or("tool error")
-                                        .to_string();
-                                    CellResult::Err { message: msg }
+                                    CellResult::Err {
+                                        message: first_line
+                                            .unwrap_or_else(|| "tool error".to_string()),
+                                    }
                                 } else if total_lines > 0 {
                                     CellResult::Ok {
                                         count_hint: Some(format!("{total_lines} lines")),
@@ -2140,6 +2156,8 @@ mod tests {
             preview_lines: vec!["src/auth/tokens.rs:42".into()],
             full_lines: vec!["src/auth/tokens.rs:42".into()],
             created_at: std::time::Instant::now(),
+            cached_preview_render: None,
+            cached_full_render: None,
         });
         state.cards.push(agent);
 
@@ -2287,6 +2305,80 @@ mod tests {
             state.inspector_data.evidence_lanes.is_empty(),
             "prior-turn evidence must not bleed into the fresh turn"
         );
+    }
+
+    #[test]
+    fn user_card_ids_are_unique_across_back_to_back_sends() {
+        let mut state = AppState::new();
+        state.textarea.insert_str("first message");
+        state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        state.textarea.insert_str("second message");
+        state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        // Both user cards exist; turn IDs must differ even though no
+        // agent commit happened in between.
+        let user_cards: Vec<&TurnCard> = state
+            .cards
+            .iter()
+            .filter(|c| matches!(c.role, super::super::card::CardRole::User))
+            .collect();
+        assert_eq!(user_cards.len(), 2);
+        assert_ne!(
+            user_cards[0].turn_id, user_cards[1].turn_id,
+            "back-to-back user enters must mint distinct card IDs"
+        );
+    }
+
+    #[test]
+    fn tool_result_streams_without_collecting_full_output() {
+        // Build a 1000-line synthetic output and assert preview/full
+        // are bounded at 5/24 entries even though the source is huge.
+        let mut state = AppState::new();
+        let turn_id = TurnId::new();
+        state.handle_session_event(SessionEvent::TurnStarted {
+            turn_id: turn_id.clone(),
+            run_id: RunId::new(),
+            parent_turn: None,
+            timestamp: "2026-04-19T00:00:00Z".into(),
+        });
+        let tu = azoth_core::schemas::ToolUseId::from("tu_big".to_string());
+        state.handle_session_event(SessionEvent::ContentBlock {
+            turn_id: turn_id.clone(),
+            index: 0,
+            block: ContentBlock::ToolUse {
+                id: tu.clone(),
+                name: "bash".to_string(),
+                input: serde_json::json!({"command": "find /"}),
+                call_group: None,
+            },
+        });
+        let big_output = (0..1000)
+            .map(|i| format!("line_{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        state.handle_session_event(SessionEvent::ContentBlock {
+            turn_id: turn_id.clone(),
+            index: 1,
+            block: ContentBlock::ToolResult {
+                tool_use_id: tu,
+                content: vec![ContentBlock::Text { text: big_output }],
+                is_error: false,
+            },
+        });
+        let cell = &state.cards[0].cells[0];
+        // Preview = 4 + 1 ellipsis line, full = 24, NOT 1000.
+        assert_eq!(
+            cell.preview_lines.len(),
+            5,
+            "preview must stay bounded regardless of source size"
+        );
+        assert!(cell.preview_lines[4].contains("+996 more lines"));
+        assert_eq!(cell.full_lines.len(), 24);
+        match &cell.result {
+            CellResult::Ok { count_hint } => {
+                assert_eq!(count_hint.as_deref(), Some("1000 lines"));
+            }
+            _ => panic!("expected Ok result"),
+        }
     }
 
     #[test]

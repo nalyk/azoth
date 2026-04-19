@@ -72,6 +72,59 @@ pub struct ToolCell {
     /// process-wide boot clock which left stuck cells (turn committed
     /// without a ToolResult event) animating forever on scroll-back.
     pub created_at: Instant,
+    /// Lazy cache of the rendered preview lines (collapsed view).
+    /// `None` means dirty; populated on first paint, invalidated by
+    /// `set_preview_lines`. Pre-cache, every paint re-ran the
+    /// path-link / diff-prefix heuristics on every line.
+    pub cached_preview_render: Option<Vec<Line<'static>>>,
+    /// Same lazy cache for the expanded view (`full_lines`).
+    pub cached_full_render: Option<Vec<Line<'static>>>,
+}
+
+impl ToolCell {
+    /// Replace the preview lines and drop the rendered cache so the
+    /// next paint recomputes once.
+    pub fn set_preview_lines(&mut self, lines: Vec<String>) {
+        self.preview_lines = lines;
+        self.cached_preview_render = None;
+    }
+
+    /// Replace the full lines and drop the rendered cache so the next
+    /// paint recomputes once.
+    pub fn set_full_lines(&mut self, lines: Vec<String>) {
+        self.full_lines = lines;
+        self.cached_full_render = None;
+    }
+
+    /// Return the rendered preview lines (collapsed view), refreshing
+    /// the cache on a miss. Bounded at 4 lines per the visual design.
+    pub fn render_preview(&mut self, theme: &Theme) -> &[Line<'static>] {
+        if self.cached_preview_render.is_none() {
+            self.cached_preview_render = Some(
+                self.preview_lines
+                    .iter()
+                    .take(4)
+                    .map(|p| render_cell_preview_line(p, theme))
+                    .collect(),
+            );
+        }
+        self.cached_preview_render.as_deref().unwrap_or(&[])
+    }
+
+    /// Return the rendered full lines (expanded view), refreshing the
+    /// cache on a miss. Bounded at 24 lines per the visual design.
+    pub fn render_full(&mut self, theme: &Theme) -> &[Line<'static>] {
+        if self.cached_full_render.is_none() {
+            self.cached_full_render = Some(
+                self.full_lines
+                    .iter()
+                    .take(24)
+                    .map(|p| render_cell_preview_line(p, theme))
+                    .collect(),
+            );
+        }
+        self.cached_full_render.as_deref().unwrap_or(&[])
+    }
 }
 
 /// Tool cell outcome.
@@ -457,14 +510,12 @@ impl TurnCard {
         }
 
         // Cells — indented, collapsed by default.
-        for (i, cell) in self.cells.iter().enumerate() {
+        let cell_focus = self.cell_focus;
+        let card_live = matches!(self.state, CardState::Live | CardState::AwaitingApproval);
+        for (i, cell) in self.cells.iter_mut().enumerate() {
             out.push((Line::from(""), None));
             let prefix = theme.glyph(Theme::CELL_PREFIX);
-            let focus_marker = if self.cell_focus == Some(i) {
-                "·"
-            } else {
-                " "
-            };
+            let focus_marker = if cell_focus == Some(i) { "·" } else { " " };
             // Disclosure triangle — makes the cell obviously clickable
             // and its state obviously toggleable. ▾ when expanded,
             // ▸ when collapsed, ASCII `+/-` on non-Unicode terminals.
@@ -482,7 +533,6 @@ impl TurnCard {
             } else {
                 "+"
             };
-            let card_live = matches!(self.state, CardState::Live | CardState::AwaitingApproval);
             let result_chip = match &cell.result {
                 CellResult::Pending if card_live => {
                     let age_ms = cell_pending_age(cell);
@@ -520,14 +570,20 @@ impl TurnCard {
             // Hint: clicking this row toggles the cell's expansion.
             out.push((cell_line, Some(RowHint::CellHeader { cell_idx: i })));
 
-            let preview: Vec<&String> = if cell.expanded {
-                cell.full_lines.iter().take(24).collect()
+            // Render preview/full from the per-cell cache. The cache is
+            // populated lazily on first paint and invalidated by
+            // `set_preview_lines` / `set_full_lines` — eliminates the
+            // per-frame path-link / diff-prefix heuristics that used
+            // to run on every visible cell line every frame.
+            let cached = if cell.expanded {
+                cell.render_full(theme)
             } else {
-                cell.preview_lines.iter().take(4).collect()
+                cell.render_preview(theme)
             };
-            for p in preview {
-                out.push((render_cell_preview_line(p, theme), None));
+            for line in cached {
+                out.push((line.clone(), None));
             }
+            // Borrow `cell.result` after the &mut borrow above ends.
             if let CellResult::Err { message } = &cell.result {
                 out.push((
                     Line::from(vec![
@@ -781,6 +837,8 @@ mod tests {
             preview_lines: vec!["p1".into()],
             full_lines: vec!["p1".into(), "p2".into()],
             created_at: Instant::now(),
+            cached_preview_render: None,
+            cached_full_render: None,
         });
         assert_eq!(c.cells.len(), 1);
         c.cells[0].expanded = true;
@@ -800,6 +858,8 @@ mod tests {
             preview_lines: vec!["file1".into()],
             full_lines: vec!["file1".into()],
             created_at: Instant::now(),
+            cached_preview_render: None,
+            cached_full_render: None,
         });
         let theme = Theme { unicode: true };
         let lines = c.render_lines(&theme, true, true);
@@ -867,5 +927,50 @@ mod tests {
             !cached_after,
             "unicode flip must invalidate the markdown cache"
         );
+    }
+
+    #[test]
+    fn cell_render_caches_preview_after_first_paint() {
+        let mut c = TurnCard::agent("t-cellcache");
+        c.add_cell(ToolCell {
+            tool_use_id: "tu".into(),
+            name: "bash".into(),
+            summary: "ls".into(),
+            expanded: false,
+            result: CellResult::Ok { count_hint: None },
+            preview_lines: vec!["src/foo.rs:42".into(), "+ added".into()],
+            full_lines: vec!["src/foo.rs:42".into(), "+ added".into()],
+            created_at: Instant::now(),
+            cached_preview_render: None,
+            cached_full_render: None,
+        });
+        let theme = Theme { unicode: true };
+        // First paint populates the cache.
+        let _ = c.render_lines(&theme, true, true);
+        assert!(c.cells[0].cached_preview_render.is_some());
+        // Stamp the cache; second paint must NOT recompute (sentinel survives).
+        c.cells[0]
+            .cached_preview_render
+            .as_mut()
+            .unwrap()
+            .push(Line::from(Span::raw("CELL_SENTINEL")));
+        let _ = c.render_lines(&theme, true, true);
+        let still = c.cells[0]
+            .cached_preview_render
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|l| {
+                l.spans
+                    .iter()
+                    .any(|s| s.content.as_ref() == "CELL_SENTINEL")
+            });
+        assert!(
+            still,
+            "second paint must reuse the cell render cache, not rebuild"
+        );
+        // set_preview_lines invalidates.
+        c.cells[0].set_preview_lines(vec!["new".into()]);
+        assert!(c.cells[0].cached_preview_render.is_none());
     }
 }

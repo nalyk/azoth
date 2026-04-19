@@ -211,14 +211,17 @@ fn render_canvas(
     };
 
     // Populate click_map by mapping each visible row to its absolute
-    // terminal Y. Rows scrolled off-screen contribute nothing.
+    // terminal Y. Iterating only the visible window keeps this O(rows
+    // on screen) instead of O(total transcript lines), which mattered
+    // once long-running sessions accumulated thousands of lines.
     let first_visible = scroll_pos as usize;
-    let last_visible = (scroll_pos + visible_height) as usize;
-    for (line_idx, hint) in row_hints.iter().enumerate() {
-        if line_idx < first_visible || line_idx >= last_visible {
-            continue;
-        }
-        let relative_y = line_idx - first_visible;
+    for (relative_y, hint) in row_hints
+        .iter()
+        .enumerate()
+        .skip(first_visible)
+        .take(visible_height as usize)
+        .map(|(line_idx, hint)| (line_idx - first_visible, hint))
+    {
         let absolute_y = area.y as usize + relative_y;
         if let Some((card_idx, h)) = hint {
             let target = match h {
