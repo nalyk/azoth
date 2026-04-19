@@ -7,6 +7,8 @@ pub mod card;
 pub mod config;
 pub mod input;
 pub mod inspector;
+pub mod markdown;
+pub mod motion;
 pub mod palette;
 pub mod rail;
 pub mod render;

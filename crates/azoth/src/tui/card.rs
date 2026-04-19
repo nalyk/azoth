@@ -8,9 +8,11 @@
 
 use std::time::Instant;
 
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
+use super::markdown;
+use super::motion;
 use super::theme::{Palette, Theme};
 
 /// Who owns the card's text.
@@ -129,10 +131,24 @@ pub struct TurnCard {
     pub turn_id: String,
     pub role: CardRole,
     pub state: CardState,
+    /// Model prose — raw markdown source. Rendered via `markdown::render`
+    /// at paint time so inline bold/italic/code, fenced code islands,
+    /// headings, and bullets become real typography.
     pub prose: Vec<String>,
+    /// Extended-thinking content (from Anthropic reasoning blocks).
+    /// Rendered as a collapsible block above the prose. Hidden by
+    /// default; `⇥` on the live card toggles.
+    pub thoughts: Vec<String>,
+    pub thoughts_expanded: bool,
     pub cells: Vec<ToolCell>,
     pub usage: Option<UsageChip>,
     pub started: Instant,
+    /// Set when the card transitions to `Committed`. Used to drive
+    /// the commit-bloom effect (accent bar glows brighter for ~600ms).
+    pub committed_at: Option<Instant>,
+    /// Last time prose was appended — drives the streaming shimmer
+    /// (trailing accent glow on newly-typed characters).
+    pub last_append: Option<Instant>,
     pub contract_goal: Option<String>,
     pub cell_focus: Option<usize>,
 }
@@ -145,14 +161,19 @@ pub struct UsageChip {
 
 impl TurnCard {
     pub fn user(turn_id: impl Into<String>, text: impl Into<String>) -> Self {
+        let now = Instant::now();
         Self {
             turn_id: turn_id.into(),
             role: CardRole::User,
             state: CardState::Committed,
             prose: text.into().lines().map(String::from).collect(),
+            thoughts: Vec::new(),
+            thoughts_expanded: false,
             cells: Vec::new(),
             usage: None,
-            started: Instant::now(),
+            started: now,
+            committed_at: Some(now),
+            last_append: None,
             contract_goal: None,
             cell_focus: None,
         }
@@ -163,9 +184,13 @@ impl TurnCard {
             role: CardRole::Agent,
             state: CardState::Live,
             prose: Vec::new(),
+            thoughts: Vec::new(),
+            thoughts_expanded: false,
             cells: Vec::new(),
             usage: None,
             started: Instant::now(),
+            committed_at: None,
+            last_append: None,
             contract_goal: None,
             cell_focus: None,
         }
@@ -183,6 +208,13 @@ impl TurnCard {
                 self.prose.push(line.to_string());
             }
         }
+        self.last_append = Some(Instant::now());
+    }
+
+    pub fn append_thought(&mut self, text: &str) {
+        for line in text.split('\n') {
+            self.thoughts.push(line.to_string());
+        }
     }
 
     pub fn add_cell(&mut self, cell: ToolCell) {
@@ -198,25 +230,26 @@ impl TurnCard {
     }
 
     /// Render this card into a sequence of styled `Line` values for the
-    /// canvas pane. `width` is the pane width; wrap is caller-managed
-    /// via ratatui's `Paragraph::wrap`.
+    /// canvas pane. The caller provides pulse/cursor phase from a
+    /// single monotonic clock; this fn reads `Instant::now()` only
+    /// for the commit-bloom and streaming-shimmer decay windows.
     pub fn render_lines(
         &self,
         theme: &Theme,
         live_cursor_phase: bool,
         pulse_phase_a: bool,
     ) -> Vec<Line<'static>> {
-        let mut out = Vec::with_capacity(self.prose.len() + self.cells.len() * 3 + 3);
+        let mut out = Vec::with_capacity(self.prose.len() + self.cells.len() * 4 + 6);
 
         let bar = self.bar_glyph(theme, pulse_phase_a);
-        let bar_style = self.bar_style();
+        let bar_style = self.effective_bar_style();
         let role_style = match self.role {
-            CardRole::User => theme.bold(),
+            CardRole::User => theme.bold().fg(Palette::ACCENT),
             CardRole::Agent => theme.bold(),
             CardRole::System => theme.italic_dim(),
         };
 
-        // Header line: bar + role label + right-gutter metadata.
+        // Header: bar + role + usage chip + timestamp.
         let elapsed = self.started.elapsed().as_secs_f32();
         let ts_label = if elapsed < 10.0 {
             format!("t+{elapsed:.1}s")
@@ -242,23 +275,90 @@ impl TurnCard {
         out.push(Line::from(header));
         out.push(Line::from(""));
 
-        // Prose body — pre-styled, one pass.
-        let prose_style = match &self.state {
-            CardState::Aborted { .. } => theme.strike_dim(),
-            _ => theme.ink(Palette::INK_0),
-        };
-        for (idx, line) in self.prose.iter().enumerate() {
-            let is_last = idx + 1 == self.prose.len();
-            let cursor_glyph = theme.glyph(if live_cursor_phase {
-                Theme::CURSOR_A
+        // Thoughts block — collapsible, above the prose.
+        if !self.thoughts.is_empty() {
+            let diamond = if theme.unicode { "◇" } else { "*" };
+            let fold_hint = if self.thoughts_expanded {
+                "⇥ fold"
             } else {
-                Theme::CURSOR_B
-            });
-            let mut spans = vec![Span::raw("   "), Span::styled(line.clone(), prose_style)];
-            if is_last && matches!(self.state, CardState::Live) {
-                spans.push(Span::styled(cursor_glyph.to_string(), theme.accent()));
+                "⇥ unfold"
+            };
+            let header_text = format!(
+                "{diamond} thoughts ({} lines · {fold_hint})",
+                self.thoughts.len()
+            );
+            out.push(Line::from(vec![
+                Span::raw("   "),
+                Span::styled(header_text, theme.italic_dim()),
+            ]));
+            if self.thoughts_expanded {
+                for line in &self.thoughts {
+                    out.push(Line::from(vec![
+                        Span::raw("     "),
+                        Span::styled(line.clone(), theme.italic_dim()),
+                    ]));
+                }
             }
-            out.push(Line::from(spans));
+            out.push(Line::from(""));
+        }
+
+        // Prose — markdown-rendered for agents; plain for users.
+        if !self.prose.is_empty() {
+            let joined = self.prose.join("\n");
+            let prose_lines: Vec<Line<'static>> = match self.role {
+                CardRole::Agent => markdown::render(&joined, theme),
+                _ => joined
+                    .lines()
+                    .map(|l| Line::from(Span::styled(l.to_string(), theme.ink(Palette::INK_0))))
+                    .collect(),
+            };
+            let is_aborted = matches!(self.state, CardState::Aborted { .. });
+            let tail_chars = match (self.state.clone(), self.last_append) {
+                (CardState::Live, Some(at)) => motion::shimmer_chars(at.elapsed().as_millis()),
+                _ => 0,
+            };
+            let last_non_blank_idx = prose_lines
+                .iter()
+                .rposition(|l| l.spans.iter().any(|s| !s.content.trim().is_empty()));
+
+            for (i, line) in prose_lines.into_iter().enumerate() {
+                // Indent every line into the 3-col gutter and apply
+                // aborted-body strike when applicable.
+                let mut spans: Vec<Span<'static>> = vec![Span::raw("   ")];
+                for s in line.spans {
+                    let style = if is_aborted {
+                        theme.strike_dim()
+                    } else {
+                        s.style
+                    };
+                    spans.push(Span::styled(s.content.into_owned(), style));
+                }
+                if Some(i) == last_non_blank_idx && tail_chars > 0 {
+                    if let Some(last_span) = spans.pop() {
+                        let base = last_span.style;
+                        let content = last_span.content.into_owned();
+                        let shim = motion::shimmer_spans(&content, tail_chars, base);
+                        spans.extend(shim);
+                    }
+                }
+                if Some(i) == last_non_blank_idx && matches!(self.state, CardState::Live) {
+                    let cursor_glyph = theme.glyph(if live_cursor_phase {
+                        Theme::CURSOR_A
+                    } else {
+                        Theme::CURSOR_B
+                    });
+                    spans.push(Span::styled(cursor_glyph.to_string(), theme.accent()));
+                }
+                out.push(Line::from(spans));
+            }
+        } else if matches!(self.state, CardState::Live) {
+            // Pre-stream: no prose yet. Show typing dots where the
+            // cursor would be.
+            let dots = motion::typing_frame(theme, self.started.elapsed().as_millis());
+            out.push(Line::from(vec![
+                Span::raw("   "),
+                Span::styled(dots.to_string(), theme.accent()),
+            ]));
         }
 
         // Cells — indented, collapsed by default.
@@ -271,7 +371,20 @@ impl TurnCard {
                 " "
             };
             let result_chip = match &cell.result {
-                CellResult::Pending => Span::styled(" …".to_string(), theme.dim()),
+                CellResult::Pending => {
+                    let age_ms = cell_pending_age(cell);
+                    if age_ms > 1500 {
+                        Span::styled(
+                            format!(" {}", motion::sweep_frame(theme, age_ms)),
+                            theme.accent(),
+                        )
+                    } else {
+                        Span::styled(
+                            format!(" {}", motion::spinner_frame(theme, age_ms)),
+                            theme.accent(),
+                        )
+                    }
+                }
                 CellResult::Ok { count_hint } => {
                     let c = count_hint
                         .clone()
@@ -291,24 +404,19 @@ impl TurnCard {
             ]);
             out.push(cell_line);
 
-            let preview = if cell.expanded {
-                cell.full_lines.iter().take(24)
+            let preview: Vec<&String> = if cell.expanded {
+                cell.full_lines.iter().take(24).collect()
             } else {
-                cell.preview_lines.iter().take(4)
+                cell.preview_lines.iter().take(4).collect()
             };
             for p in preview {
+                out.push(render_cell_preview_line(p, theme));
+            }
+            if let CellResult::Err { message } = &cell.result {
                 out.push(Line::from(vec![
                     Span::styled("     ".to_string(), theme.dim()),
-                    Span::styled(p.clone(), theme.dim()),
+                    Span::styled(truncate(message, 80), theme.ink(Palette::ABORT)),
                 ]));
-            }
-            if matches!(cell.result, CellResult::Err { .. }) {
-                if let CellResult::Err { message } = &cell.result {
-                    out.push(Line::from(vec![
-                        Span::styled("     ".to_string(), theme.dim()),
-                        Span::styled(truncate(message, 80).to_string(), theme.ink(Palette::ABORT)),
-                    ]));
-                }
             }
         }
 
@@ -338,6 +446,19 @@ impl TurnCard {
 
         out.push(Line::from(""));
         out
+    }
+
+    /// Bar style with commit-bloom overlay applied when applicable.
+    fn effective_bar_style(&self) -> Style {
+        if let Some(at) = self.committed_at {
+            if matches!(self.state, CardState::Committed) {
+                let intensity = motion::bloom_phase(at.elapsed().as_millis());
+                if intensity > 0.0 {
+                    return motion::bloom_bar_style(intensity);
+                }
+            }
+        }
+        self.bar_style()
     }
 
     pub fn bar_glyph(&self, theme: &Theme, phase_a: bool) -> &'static str {
@@ -391,6 +512,97 @@ impl TurnCard {
             Span::styled(excerpt, theme.dim()),
         ])
     }
+}
+
+/// Age in milliseconds since a tool cell was created — approximated
+/// from the card's render pass. For the motion spinner we just need
+/// "roughly 80ms ticks", so we piggyback on the process-wide boot
+/// `Instant` via a thread-local on render. Since cells don't carry
+/// their own timestamp, we use a coarse monotonic elapsed here.
+fn cell_pending_age(_cell: &ToolCell) -> u128 {
+    use std::sync::OnceLock;
+    static BOOT: OnceLock<Instant> = OnceLock::new();
+    let b = BOOT.get_or_init(Instant::now);
+    b.elapsed().as_millis()
+}
+
+/// Render a single preview line from a tool cell, with diff and
+/// path:line tinting applied.
+fn render_cell_preview_line(line: &str, theme: &Theme) -> Line<'static> {
+    // Diff markers.
+    let trimmed = line.trim_start();
+    if let Some(rest) = trimmed.strip_prefix('+') {
+        if !rest.starts_with('+') {
+            return Line::from(vec![
+                Span::styled("     ".to_string(), theme.dim()),
+                Span::styled(
+                    line.to_string(),
+                    Style::default()
+                        .fg(Color::Indexed(108))
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]);
+        }
+    }
+    if let Some(rest) = trimmed.strip_prefix('-') {
+        if !rest.starts_with('-') {
+            return Line::from(vec![
+                Span::styled("     ".to_string(), theme.dim()),
+                Span::styled(
+                    line.to_string(),
+                    Style::default()
+                        .fg(Color::Indexed(167))
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]);
+        }
+    }
+
+    // Path:line detection — path starts near the left, followed by
+    // `:<digits>` or `:<digits>:<digits>`. Apply accent + underline.
+    let tokens: Vec<&str> = line.split_whitespace().collect();
+    if let Some(first) = tokens.first() {
+        if looks_like_path_line(first) {
+            let rest = &line[first.len()..];
+            return Line::from(vec![
+                Span::styled("     ".to_string(), theme.dim()),
+                Span::styled(
+                    first.to_string(),
+                    Style::default()
+                        .fg(Palette::ACCENT)
+                        .add_modifier(Modifier::UNDERLINED),
+                ),
+                Span::styled(rest.to_string(), theme.dim()),
+            ]);
+        }
+    }
+
+    Line::from(vec![
+        Span::styled("     ".to_string(), theme.dim()),
+        Span::styled(line.to_string(), theme.dim()),
+    ])
+}
+
+/// Heuristic: does this token look like `path/with.ext:42` or
+/// `path:42:7`?
+fn looks_like_path_line(s: &str) -> bool {
+    let Some(last_colon) = s.rfind(':') else {
+        return false;
+    };
+    let tail = &s[last_colon + 1..];
+    if tail.is_empty() || !tail.chars().all(|c| c.is_ascii_digit()) {
+        // Maybe path:line:col — strip tail and try once more.
+        if let Some(prior) = s[..last_colon].rfind(':') {
+            let middle = &s[prior + 1..last_colon];
+            if middle.chars().all(|c| c.is_ascii_digit())
+                && tail.chars().all(|c| c.is_ascii_digit())
+            {
+                return s[..prior].contains('.') || s[..prior].contains('/');
+            }
+        }
+        return false;
+    }
+    s[..last_colon].contains('.') || s[..last_colon].contains('/')
 }
 
 fn chip_num(n: u32) -> String {

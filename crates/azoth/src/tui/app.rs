@@ -495,15 +495,29 @@ impl AppState {
                 return;
             }
             (KeyCode::Tab, m) if !m.contains(KeyModifiers::SHIFT) => {
-                // Expand the last cell of the latest agent card.
+                // Priority: cells on the latest agent card (toggle
+                // the last one), then thoughts on the latest agent
+                // card that carries them. Falls through to the
+                // textarea when neither applies.
+                let mut consumed = false;
                 if let Some(card) = self.cards.iter_mut().rev().find(|c| !c.cells.is_empty()) {
                     if let Some(last) = card.cells.last_mut() {
                         last.expanded = !last.expanded;
-                        self.dirty = true;
-                        return;
+                        consumed = true;
                     }
                 }
-                // No expandable cell — fall through to textarea.
+                if !consumed {
+                    if let Some(card) = self.cards.iter_mut().rev().find(|c| !c.thoughts.is_empty())
+                    {
+                        card.thoughts_expanded = !card.thoughts_expanded;
+                        consumed = true;
+                    }
+                }
+                if consumed {
+                    self.dirty = true;
+                    return;
+                }
+                // No expandable content — fall through to textarea.
             }
             (KeyCode::BackTab, _) | (KeyCode::Tab, KeyModifiers::SHIFT) => {
                 for card in self.cards.iter_mut() {
@@ -750,7 +764,10 @@ impl AppState {
                         }
                         self.whisper.clear();
                     }
-                    ContentBlock::Thinking { .. } => {
+                    ContentBlock::Thinking { text, .. } => {
+                        if let Some(card) = self.card_by_turn_id_mut(&tid) {
+                            card.append_thought(&text);
+                        }
                         self.whisper.set("thinking");
                     }
                 }
@@ -811,6 +828,7 @@ impl AppState {
                 if let Some(card) = self.card_by_turn_id_mut(&tid) {
                     card.state = CardState::Committed;
                     card.usage = Some(chip);
+                    card.committed_at = Some(Instant::now());
                 }
                 self.committed_turns = self.committed_turns.saturating_add(1);
                 self.whisper.clear();

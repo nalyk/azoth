@@ -9,6 +9,7 @@ use std::time::Instant;
 use ratatui::text::{Line, Span};
 
 use super::card::{Note, NoteKind};
+use super::motion;
 use super::theme::{Palette, Theme};
 
 #[derive(Debug, Clone)]
@@ -51,13 +52,17 @@ impl Whisper {
     /// state.
     pub fn render_line(&self, theme: &Theme, latest_note: Option<&Note>) -> Line<'static> {
         if let (Some(text), Some(started)) = (self.narration.as_ref(), self.narration_started) {
-            let elapsed = started.elapsed().as_secs_f32();
+            let elapsed_f = started.elapsed().as_secs_f32();
+            let elapsed_ms = started.elapsed().as_millis();
+            let spinner = motion::spinner_frame(theme, elapsed_ms);
             return Line::from(vec![
                 Span::raw("      "),
+                Span::styled(spinner.to_string(), theme.accent()),
+                Span::raw(" "),
                 Span::styled("azoth".to_string(), theme.bold()),
                 Span::raw(" "),
                 Span::styled(text.clone(), theme.italic_dim()),
-                Span::styled(format!(" · {elapsed:.1}s"), theme.dim()),
+                Span::styled(format!(" · {elapsed_f:.1}s"), theme.dim()),
             ]);
         }
 
