@@ -30,9 +30,11 @@ pub fn frame(f: &mut Frame, state: &mut AppState) {
     let cursor_phase = pulse_phase(elapsed_ms, 500);
 
     // Reset click map every frame; render paths register hit regions
-    // by absolute terminal Y.
+    // by absolute terminal Y. Sized to exactly the canvas height —
+    // prior code added an arbitrary `+4` slack which wasted memory
+    // and risked masking off-by-one bugs in y mapping.
     state.click_map.clear();
-    state.click_map.resize(size.height as usize + 4, None);
+    state.click_map.resize(size.height as usize, None);
 
     // Splashscreen takes the whole canvas while the worker boots.
     if state.booting {
@@ -188,17 +190,19 @@ fn render_canvas(
     let visible_h_usize = visible_height as usize;
 
     // Pass 1 — estimate per-card heights from the cache. A card with
-    // `last_rendered_rows == 0` has never been painted; we MUST render
-    // it this pass to learn its actual height, otherwise the
-    // viewport-virtualisation skip below would hide it forever. Such
-    // cards get an estimate equal to the visible height so the
-    // subsequent in-viewport check forces a real render.
+    // `last_rendered_rows == 0` has never been painted; the explicit
+    // `never_rendered` check in pass 2 forces render regardless of
+    // estimate, so we use a small realistic default (most cards
+    // settle around 4-6 rows). A viewport-sized estimate would cause
+    // a visible scroll jump the moment the real (smaller) height
+    // landed.
+    const UNRENDERED_HEIGHT_HINT: usize = 4;
     let est_heights: Vec<usize> = visible_indices
         .iter()
         .map(|&i| {
             let h = state.cards[i].last_rendered_rows;
             if h == 0 {
-                visible_h_usize.max(1)
+                UNRENDERED_HEIGHT_HINT
             } else {
                 h
             }

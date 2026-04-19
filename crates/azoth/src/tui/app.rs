@@ -146,6 +146,12 @@ pub struct AppState {
     pub scroll_offset: u16,
     /// Whether the user has manually scrolled up (disables auto-scroll).
     pub scroll_locked: bool,
+    /// Cached `(card_idx, cell_idx)` order for `Tab` cell-cycling,
+    /// newest→oldest. `None` = dirty; recomputed on next Tab press.
+    /// Invalidated whenever a card or cell is added (TurnStarted +
+    /// ToolUse handlers). Replaces an O(N+M) walk-allocate-collect on
+    /// every Tab keystroke.
+    tab_order_cache: Option<Vec<(usize, usize)>>,
 }
 
 impl AppState {
@@ -196,6 +202,7 @@ impl AppState {
             max_context_tokens: 0,
             scroll_offset: 0,
             scroll_locked: false,
+            tab_order_cache: None,
         }
     }
 
@@ -640,13 +647,21 @@ impl AppState {
                 // last cell of the most recent card, leaving older cells
                 // unreachable from the keyboard. Falls through to
                 // thoughts / textarea when no cells exist anywhere.
-                let order: Vec<(usize, usize)> = self
-                    .cards
-                    .iter()
-                    .enumerate()
-                    .rev()
-                    .flat_map(|(ci, card)| (0..card.cells.len()).rev().map(move |xi| (ci, xi)))
-                    .collect();
+                // Lazy-fill the cached cell order. Invalidated whenever
+                // a card or cell is added (TurnStarted / ToolUse /
+                // user Enter handlers above). Saves the rebuild cost
+                // on every Tab keystroke for long sessions.
+                if self.tab_order_cache.is_none() {
+                    let order: Vec<(usize, usize)> = self
+                        .cards
+                        .iter()
+                        .enumerate()
+                        .rev()
+                        .flat_map(|(ci, card)| (0..card.cells.len()).rev().map(move |xi| (ci, xi)))
+                        .collect();
+                    self.tab_order_cache = Some(order);
+                }
+                let order = self.tab_order_cache.as_ref().unwrap();
                 if !order.is_empty() {
                     // Focus is almost always on a recent card — search
                     // from newest first so long sessions don't pay an
@@ -719,6 +734,7 @@ impl AppState {
                         let user_turn_id = TurnId::new().to_string();
                         self.cards
                             .push(TurnCard::user(user_turn_id, content.clone()));
+                        self.tab_order_cache = None;
                         self.pending_user_text = Some(content);
                         // Queued state — spinner appears in the
                         // whisper row immediately so there's no silent
@@ -852,6 +868,7 @@ impl AppState {
             }
             SessionEvent::TurnStarted { turn_id, .. } => {
                 self.cards.push(TurnCard::agent(turn_id.to_string()));
+                self.tab_order_cache = None;
                 self.whisper.set("thinking");
                 // Evidence lanes are per-turn — flush so the inspector
                 // shows what *this* turn retrieved, not the prior one's
@@ -907,6 +924,7 @@ impl AppState {
                         };
                         if let Some(card) = self.card_by_turn_id_mut(&tid) {
                             card.add_cell(cell);
+                            self.tab_order_cache = None;
                         }
                         let narration: String = summary.chars().take(40).collect();
                         self.whisper.set(format!("running {name} · {narration}"));
@@ -2082,8 +2100,7 @@ mod tests {
         state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(state.cards.len(), 1);
         assert_eq!(
-            state.cards[0].prose,
-            vec!["hello world".to_string()],
+            state.cards[0].prose, "hello world",
             "user card prose matches input"
         );
         assert_eq!(
@@ -2355,6 +2372,46 @@ mod tests {
         assert!(
             state.inspector_data.evidence_lanes.is_empty(),
             "prior-turn evidence must not bleed into the fresh turn"
+        );
+    }
+
+    #[test]
+    fn tab_order_cache_is_invalidated_on_card_and_cell_add() {
+        use azoth_core::schemas::ToolUseId;
+        let mut state = AppState::new();
+        let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+        // Empty session: no expandable content, Tab falls through.
+        state.handle_key(tab);
+        // Add a card → cache must invalidate even if it was None.
+        state.handle_session_event(SessionEvent::TurnStarted {
+            turn_id: TurnId::new(),
+            run_id: RunId::new(),
+            parent_turn: None,
+            timestamp: "2026-04-19T00:00:00Z".into(),
+        });
+        assert!(state.tab_order_cache.is_none(), "TurnStarted invalidates");
+        // Add a tool cell → cache must invalidate.
+        let tid = state.cards[0].turn_id.clone();
+        state.handle_session_event(SessionEvent::ContentBlock {
+            turn_id: TurnId::from(tid),
+            index: 0,
+            block: ContentBlock::ToolUse {
+                id: ToolUseId::from("tu_1".to_string()),
+                name: "bash".into(),
+                input: serde_json::json!({}),
+                call_group: None,
+            },
+        });
+        assert!(state.tab_order_cache.is_none(), "ToolUse invalidates");
+        // Tab populates the cache; second Tab reuses it (length stable).
+        state.handle_key(tab);
+        assert!(state.tab_order_cache.is_some(), "first Tab fills cache");
+        let cached_len = state.tab_order_cache.as_ref().unwrap().len();
+        state.handle_key(tab);
+        assert_eq!(
+            state.tab_order_cache.as_ref().unwrap().len(),
+            cached_len,
+            "second Tab reuses cache (no reallocation)"
         );
     }
 

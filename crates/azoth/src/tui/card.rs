@@ -203,8 +203,12 @@ pub struct TurnCard {
     pub state: CardState,
     /// Model prose — raw markdown source. Rendered via `markdown::render`
     /// at paint time so inline bold/italic/code, fenced code islands,
-    /// headings, and bullets become real typography.
-    pub prose: Vec<String>,
+    /// headings, and bullets become real typography. Stored as a
+    /// single owned `String` so streaming appends are `push_str`
+    /// (no Vec growth) and the markdown cache miss path passes
+    /// `&self.prose` directly without materialising a fresh joined
+    /// copy on every invalidation.
+    pub prose: String,
     /// Bumped on every `append_prose`. Drives `cached_prose` invalidation.
     pub prose_revision: u64,
     /// Cached markdown render of `prose`. None when never rendered or
@@ -259,7 +263,7 @@ impl TurnCard {
             turn_id: turn_id.into(),
             role: CardRole::User,
             state: CardState::Committed,
-            prose: text.into().lines().map(String::from).collect(),
+            prose: text.into(),
             prose_revision: 1,
             cached_prose: None,
             thoughts: Vec::new(),
@@ -279,7 +283,7 @@ impl TurnCard {
             turn_id: turn_id.into(),
             role: CardRole::Agent,
             state: CardState::Live,
-            prose: Vec::new(),
+            prose: String::new(),
             prose_revision: 0,
             cached_prose: None,
             thoughts: Vec::new(),
@@ -296,19 +300,12 @@ impl TurnCard {
     }
 
     pub fn append_prose(&mut self, text: &str) {
-        for (i, line) in text.split('\n').enumerate() {
-            if i == 0 {
-                if let Some(last) = self.prose.last_mut() {
-                    last.push_str(line);
-                } else {
-                    self.prose.push(line.to_string());
-                }
-            } else {
-                self.prose.push(line.to_string());
-            }
-        }
+        // Single push_str — newlines in the streamed chunk land
+        // verbatim inside `prose`. Pre-refactor we stored prose as
+        // `Vec<String>` and re-joined with `\n` on every cache miss;
+        // a long agent reply (~10kB) paid that join cost per frame.
+        self.prose.push_str(text);
         self.last_append = Some(Instant::now());
-        // Invalidate the markdown cache — next render recomputes.
         self.prose_revision = self.prose_revision.wrapping_add(1);
     }
 
@@ -360,7 +357,7 @@ impl TurnCard {
         pulse_phase_a: bool,
     ) -> Vec<(Line<'static>, Option<RowHint>)> {
         let mut out: Vec<(Line<'static>, Option<RowHint>)> =
-            Vec::with_capacity(self.prose.len() + self.cells.len() * 4 + 6);
+            Vec::with_capacity(self.prose.lines().count() + self.cells.len() * 4 + 6);
 
         let bar = self.bar_glyph(theme, pulse_phase_a);
         let bar_style = self.effective_bar_style();
@@ -448,10 +445,13 @@ impl TurnCard {
                 .map(|c| c.revision != self.prose_revision || c.unicode != theme.unicode)
                 .unwrap_or(true);
             if needs_refresh {
-                let joined = self.prose.join("\n");
+                // No `join("\n")` — `self.prose` is already the source.
+                // For long agent replies this skips an O(N) String alloc
+                // on every cache miss (e.g. each new streamed chunk).
                 let lines: Vec<Line<'static>> = match self.role {
-                    CardRole::Agent => markdown::render(&joined, theme),
-                    _ => joined
+                    CardRole::Agent => markdown::render(&self.prose, theme),
+                    _ => self
+                        .prose
                         .lines()
                         .map(|l| Line::from(Span::styled(l.to_string(), theme.ink(Palette::INK_0))))
                         .collect(),
@@ -692,12 +692,8 @@ impl TurnCard {
     pub fn miniature(&self, theme: &Theme, phase_a: bool) -> Line<'static> {
         let bar = self.bar_glyph(theme, phase_a);
         let role = self.role.label();
-        let first_prose = self
-            .prose
-            .first()
-            .cloned()
-            .unwrap_or_else(|| "…".to_string());
-        let excerpt = truncate(&first_prose, 18).to_string();
+        let first_prose = self.prose.lines().next().unwrap_or("…");
+        let excerpt = truncate(first_prose, 18).to_string();
         Line::from(vec![
             Span::styled(bar.to_string(), self.bar_style()),
             Span::raw(" "),
@@ -819,7 +815,7 @@ mod tests {
     #[test]
     fn user_card_holds_text() {
         let c = TurnCard::user("t1", "hello\nworld");
-        assert_eq!(c.prose, vec!["hello", "world"]);
+        assert_eq!(c.prose, "hello\nworld");
         assert_eq!(c.role, CardRole::User);
     }
 
@@ -835,7 +831,7 @@ mod tests {
         let mut c = TurnCard::agent("t3");
         c.append_prose("hello ");
         c.append_prose("world\nsecond");
-        assert_eq!(c.prose, vec!["hello world", "second"]);
+        assert_eq!(c.prose, "hello world\nsecond");
     }
 
     #[test]

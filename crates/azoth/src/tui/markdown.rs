@@ -427,6 +427,16 @@ fn render_code_island(out: &mut Vec<Line<'static>>, theme: &Theme, lang: Option<
 /// Python, JSON/TOML basics, JS/TS. Falls through to plain for
 /// unknown languages.
 fn tint_code(line: &str, lang: &str, theme: &Theme) -> Vec<Span<'static>> {
+    // The byte-level tokenizer below is only safe + meaningful on
+    // pure ASCII source. Multi-byte characters (Cyrillic identifiers,
+    // emoji in string literals, unicode operators) bypass every
+    // ASCII-byte check, so the loops still produce char-aligned
+    // slices but the highlighting becomes meaningless. Bail to plain
+    // ink on non-ASCII input — better to under-highlight than to
+    // mis-tint or risk a future tokenizer change panicking.
+    if !line.is_ascii() {
+        return vec![Span::styled(line.to_string(), theme.ink(Palette::INK_1))];
+    }
     let lang_l = lang.to_lowercase();
     let keywords: &[&str] = match lang_l.as_str() {
         "rust" | "rs" => &[
@@ -657,6 +667,18 @@ mod tests {
             .flat_map(|l| l.spans.iter())
             .any(|s| s.content.contains("•"));
         assert!(has_bullet);
+    }
+
+    #[test]
+    fn tint_code_falls_through_to_plain_on_non_ascii() {
+        let theme = Theme { unicode: true };
+        // Rust keyword `let` would normally get accent. With non-ASCII
+        // (Cyrillic identifier or emoji) anywhere in the line, the
+        // tokenizer bails to plain — better than mis-tinting or
+        // risking a future panic on byte-level slicing.
+        let spans = tint_code("let café = 1;", "rust", &theme);
+        assert_eq!(spans.len(), 1, "non-ASCII line collapses to a single span");
+        assert!(spans[0].content.contains("café"));
     }
 
     #[test]
