@@ -1,11 +1,31 @@
 # azoth
 
+<p align="center">
+  <a href="https://github.com/nalyk/azoth/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/nalyk/azoth?include_prereleases&sort=semver&display_name=tag&label=release&color=blue"></a>
+  <a href="https://github.com/nalyk/azoth/releases"><img alt="Total downloads" src="https://img.shields.io/github/downloads/nalyk/azoth/total?label=downloads&color=blue"></a>
+  <a href="#license"><img alt="License: MIT OR Apache-2.0" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue"></a>
+  <a href="https://github.com/nalyk/azoth/attestations"><img alt="SLSA v1.0 build provenance" src="https://img.shields.io/badge/SLSA-v1.0-blueviolet"></a>
+  <a href="rust-toolchain.toml"><img alt="Rust 1.80+" src="https://img.shields.io/badge/rust-1.80%2B-orange?logo=rust"></a>
+  <a href="https://github.com/nalyk/azoth/releases/latest"><img alt="Platform: linux x86_64" src="https://img.shields.io/badge/platform-linux--x86__64-lightgrey?logo=linux"></a>
+</p>
+
 Contract-centric, event-sourced, provider-agnostic coding-agent runtime.
 Interactive TUI. Rust workspace. Linux only.
 
-Current release: **v2.0.0** (main @ `56a0c16`). Nine sprints + three closure
-gaps + seven rounds of adversarial review. **383 tests** passing, fmt +
-clippy clean.
+<p align="center">
+  <a href="assets/start_screen.png"><img alt="azoth starting a fresh session — status line reads 'no contract yet', 0 turns, ctx 0%; the composer invites 'what are we building?' against the PAPER dark palette" src="assets/start_screen.png" width="100%"></a>
+  <br>
+  <sub><em>Fresh session — empty contract, 0 turns, the composer invites the first prompt.</em></sub>
+</p>
+
+<p align="center">
+  <a href="assets/main_screen.png"><img alt="azoth mid-conversation — collapsible thoughts, rendered markdown headings with a Crate / Purpose GFM table, per-turn usage chip '15.4k↓ 1.3k↑ t+15s', and the whisper row 'ready · ^K for commands' beneath the composer" src="assets/main_screen.png" width="100%"></a>
+  <br>
+  <sub><em>Live turn — collapsible thoughts, rendered markdown (headings, lists, GFM tables), per-turn usage chip, whisper row.</em></sub>
+</p>
+
+Every release ships with fmt + clippy clean, the full workspace test suite
+green on Linux x86_64, and SLSA v1.0 build provenance attached.
 
 ## Honest status
 
@@ -175,7 +195,7 @@ Opt in via `AZOTH_SANDBOX`:
 
 | Value     | Mechanism                                                  |
 |-----------|------------------------------------------------------------|
-| (unset) / `off` | No sandbox. Tools run in the azoth process. (v2.0.0 default.)    |
+| (unset) / `off` | No sandbox. Tools run in the azoth process. (default.)           |
 | `tier_a`  | Unprivileged user-ns + net-ns + Landlock V2 FS rules.       |
 | `tier_b`  | Tier A + `fuse-overlayfs` merged mount of the repo; bash's cwd is the merged view. Successful writes stage back; failed runs discard. |
 
@@ -283,7 +303,7 @@ stored out-of-band and referenced from events.
 
 ```bash
 cargo test --workspace -- --test-threads=1
-# 383 passed / 0 failed / 1 ignored
+# 466 passed / 0 failed / 1 ignored
 ```
 
 Single-threaded because `sandbox_tier_a_smoke` and a few other tests
@@ -315,7 +335,7 @@ Selected integration tests worth knowing about:
 
 ```
 azoth/
-├── Cargo.toml                    # workspace root (v2.0.0)
+├── Cargo.toml                    # workspace root
 ├── crates/
 │   ├── azoth-core/               # runtime library, zero frontend + zero heavy-indexer deps
 │   │   └── src/
@@ -364,10 +384,15 @@ azoth/
 
 ## Version history
 
-- **v2.0.0** (current, main) — composite retrieval, tree-sitter
-  symbols, co-edit graph, TDAD impact, eval plane, sandbox Tier-A/B
-  enforcement on bash, live-retrieval flag, seven bot-review rounds
-  closed.
+- **v2.0.1** (current, main) — Tier-B `stage_overlay_back` symlink-escape
+  hardening. Three rounds: refuse symlinks whose canonical target escapes
+  the merged view; canonicalize against `ws.merged` (not `repo_root`) so
+  same-turn-created targets validate independently of `read_dir` order;
+  refuse every absolute symlink target outright (absolute paths captured
+  from `$PWD` under the ephemeral overlay mount dangle forever post-unmount).
+- **v2.0.0** — composite retrieval, tree-sitter symbols, co-edit graph,
+  TDAD impact, eval plane, sandbox Tier-A/B enforcement on bash,
+  live-retrieval flag, seven bot-review rounds closed.
 - **v1.5** — adapters (Anthropic OAuth + OpenAI), content-block
   protocol, JSONL dual projection, Tier-A/B sandbox smoke, ContextKernel
   v0, Tools + ToolDispatcher + AuthorityEngine, TUI MVP.
