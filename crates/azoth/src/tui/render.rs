@@ -155,7 +155,7 @@ fn render_status(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     // Model / profile label (from AppState.status, set to
     // "<profile> · <model_id>" at worker init).
     if !state.status.is_empty() && state.status != "ready" {
-        spans.push(Span::styled(" · ".to_string(), theme.dim()));
+        spans.push(Span::styled(" · ", theme.dim()));
         spans.push(Span::styled(
             trunc(&state.status, 48),
             theme.ink(Colors::INK_2),
@@ -173,7 +173,7 @@ fn render_status(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     } else {
         theme.ink(Colors::ACCENT).add_modifier(Modifier::BOLD)
     };
-    spans.push(Span::styled("     ctx ".to_string(), theme.dim()));
+    spans.push(Span::styled("     ctx ", theme.dim()));
     spans.push(Span::styled(format!("{}%", state.ctx_pct), ctx_style));
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
@@ -397,16 +397,15 @@ fn render_zero_state(f: &mut Frame, area: Rect, theme: &Theme) {
         Line::from(""),
         Line::from(vec![
             Span::raw("     "),
-            Span::styled(bar.to_string(), theme.accent()),
+            Span::styled(bar, theme.accent()),
             Span::raw("  "),
-            Span::styled("what are we building?".to_string(), theme.bold()),
+            Span::styled("what are we building?", theme.bold()),
         ]),
         Line::from(""),
         Line::from(vec![
             Span::raw("        "),
             Span::styled(
-                "tell azoth what you want. it will plan, then ask before touching anything."
-                    .to_string(),
+                "tell azoth what you want. it will plan, then ask before touching anything.",
                 theme.italic_dim(),
             ),
         ]),
@@ -432,16 +431,16 @@ fn render_composer(f: &mut Frame, area: Rect, state: &mut AppState, theme: &Them
         .border_type(BorderType::Rounded)
         .border_style(theme.ink(Colors::INK_3))
         .title(Line::from(vec![
-            Span::styled(" write".to_string(), theme.bold()),
-            Span::styled(" ".to_string(), Style::default()),
+            Span::styled(" write", theme.bold()),
+            Span::styled(" ", Style::default()),
         ]))
         .title_bottom(Line::from(vec![
-            Span::styled(" ⌃K ".to_string(), theme.accent()),
-            Span::styled("palette · ".to_string(), theme.dim()),
-            Span::styled("↵ ".to_string(), theme.accent()),
-            Span::styled("send · ".to_string(), theme.dim()),
-            Span::styled("⇧↵ ".to_string(), theme.accent()),
-            Span::styled("newline ".to_string(), theme.dim()),
+            Span::styled(" ⌃K ", theme.accent()),
+            Span::styled("palette · ", theme.dim()),
+            Span::styled("↵ ", theme.accent()),
+            Span::styled("send · ", theme.dim()),
+            Span::styled("⇧↵ ", theme.accent()),
+            Span::styled("newline ", theme.dim()),
         ]));
     let inner = block.inner(area);
     f.render_widget(block, area);

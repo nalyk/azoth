@@ -575,17 +575,14 @@ impl TurnCard {
                     } else {
                         Theme::CURSOR_B
                     });
-                    spans.push(Span::styled(cursor_glyph.to_string(), theme.accent()));
+                    spans.push(Span::styled(cursor_glyph, theme.accent()));
                 }
                 out.push((Line::from(spans), None));
             }
         } else if matches!(self.state, CardState::Live) {
             let dots = motion::typing_frame(theme, self.started.elapsed().as_millis());
             out.push((
-                Line::from(vec![
-                    Span::raw("   "),
-                    Span::styled(dots.to_string(), theme.accent()),
-                ]),
+                Line::from(vec![Span::raw("   "), Span::styled(dots, theme.accent())]),
                 None,
             ));
         }
@@ -629,7 +626,7 @@ impl TurnCard {
                         )
                     }
                 }
-                CellResult::Pending => Span::styled(" —".to_string(), theme.dim()),
+                CellResult::Pending => Span::styled(" —", theme.dim()),
                 CellResult::Ok { count_hint } => {
                     let c = count_hint
                         .clone()
@@ -702,7 +699,7 @@ impl TurnCard {
                 out.push((Line::from(""), None));
                 out.push((
                     Line::from(vec![
-                        Span::styled("   aborted · ".to_string(), theme.dim()),
+                        Span::styled("   aborted · ", theme.dim()),
                         Span::styled(reason.clone(), theme.ink(Palette::ABORT)),
                         if detail.is_empty() {
                             Span::raw("")
@@ -717,7 +714,7 @@ impl TurnCard {
                 out.push((Line::from(""), None));
                 out.push((
                     Line::from(vec![
-                        Span::styled("   interrupted · ".to_string(), theme.dim()),
+                        Span::styled("   interrupted · ", theme.dim()),
                         Span::styled(reason.clone(), theme.italic_dim()),
                     ]),
                     None,
@@ -859,7 +856,7 @@ fn render_cell_preview_line(line: &str, theme: &Theme) -> Line<'static> {
     }
 
     Line::from(vec![
-        Span::styled("     ".to_string(), theme.dim()),
+        Span::styled("     ", theme.dim()),
         Span::styled(line.to_string(), theme.dim()),
     ])
 }

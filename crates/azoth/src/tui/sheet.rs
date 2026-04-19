@@ -66,7 +66,7 @@ pub fn render(
 
     let effect_label = format!("{:?}", req.effect_class).to_lowercase();
     let title = Line::from(vec![
-        Span::styled(" approve · ".to_string(), theme.bold()),
+        Span::styled(" approve · ", theme.bold()),
         Span::styled(effect_label.clone(), theme.ink(Colors::AMBER)),
         Span::styled(
             format!(" · {} ", truncate_for_title(&req.summary, 48)),

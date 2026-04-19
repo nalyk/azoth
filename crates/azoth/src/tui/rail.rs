@@ -33,7 +33,7 @@ pub fn render(
 
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(cards.len() * 2 + 1);
     lines.push(Line::from(Span::styled(
-        " turns".to_string(),
+        " turns",
         theme.bold().add_modifier(Modifier::DIM),
     )));
     lines.push(Line::from(""));

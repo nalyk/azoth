@@ -156,10 +156,15 @@ pub fn render(f: &mut Frame, area: Rect, data: &InspectorData, theme: &Theme) {
     }
 }
 
-fn render_section_header(f: &mut Frame, inner: Rect, y: u16, label: &str, theme: &Theme) {
+fn render_section_header(f: &mut Frame, inner: Rect, y: u16, label: &'static str, theme: &Theme) {
+    // Round-26: `label` is always a `&'static str` literal from the
+    // render body ("context"/"contract"/"evidence"/"tools"). Binding
+    // the lifetime to `'static` lets Span::styled take it as
+    // Cow::Borrowed, eliminating the per-frame `label.to_string()`
+    // allocation that fired once per section on every render.
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            label.to_string(),
+            label,
             theme.bold().add_modifier(Modifier::DIM),
         ))),
         Rect::new(inner.x, y, inner.width, 1),

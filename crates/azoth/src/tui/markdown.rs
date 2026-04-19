@@ -207,7 +207,7 @@ pub fn render(md: &str, theme: &Theme) -> Vec<Line<'static>> {
                 } else if in_blockquote {
                     for line in text.lines() {
                         out.push(Line::from(vec![
-                            Span::styled("│ ".to_string(), theme.ink(Palette::ACCENT)),
+                            Span::styled("│ ", theme.ink(Palette::ACCENT)),
                             Span::styled(line.to_string(), theme.italic_dim()),
                         ]));
                     }
@@ -276,6 +276,12 @@ fn render_table(out: &mut Vec<Line<'static>>, t: &TableBuf, theme: &Theme) {
     }
     const MAX_COL: usize = 48;
     const GAP: usize = 2;
+    // Round-26: GAP is a compile-time constant (2), so the inter-cell
+    // spacer is a fixed &'static str. Using a literal lets every
+    // Span::styled borrow it as Cow::Borrowed, eliminating the
+    // `" ".repeat(GAP)` + per-spacer `gap.clone()` allocations that
+    // previously ran for every cell on every table render.
+    const GAP_STR: &str = "  ";
 
     use unicode_width::UnicodeWidthStr;
     let mut widths = vec![0usize; col_count];
@@ -293,7 +299,6 @@ fn render_table(out: &mut Vec<Line<'static>>, t: &TableBuf, theme: &Theme) {
 
     let header_style = theme.bold().fg(Palette::ACCENT);
     let body_style = theme.ink(Palette::INK_1);
-    let gap = " ".repeat(GAP);
 
     let mut header_spans: Vec<Span<'static>> = vec![Span::raw("  ")];
     for (i, width) in widths.iter().enumerate().take(col_count) {
@@ -303,7 +308,7 @@ fn render_table(out: &mut Vec<Line<'static>>, t: &TableBuf, theme: &Theme) {
         let cell = t.header.get(i).map(|s| s.as_str()).unwrap_or("");
         header_spans.push(Span::styled(pad_to(cell, *width), header_style));
         if i + 1 < col_count {
-            header_spans.push(Span::styled(gap.clone(), theme.dim()));
+            header_spans.push(Span::styled(GAP_STR, theme.dim()));
         }
     }
     out.push(Line::from(header_spans));
@@ -320,10 +325,10 @@ fn render_table(out: &mut Vec<Line<'static>>, t: &TableBuf, theme: &Theme) {
     for row in &t.body {
         let mut spans: Vec<Span<'static>> = vec![Span::raw("  ")];
         for (i, width) in widths.iter().enumerate().take(col_count) {
-            let cell = row.get(i).cloned().unwrap_or_default();
-            spans.push(Span::styled(pad_to(&cell, *width), body_style));
+            let cell = row.get(i).map(|s| s.as_str()).unwrap_or("");
+            spans.push(Span::styled(pad_to(cell, *width), body_style));
             if i + 1 < col_count {
-                spans.push(Span::styled(gap.clone(), theme.dim()));
+                spans.push(Span::styled(GAP_STR, theme.dim()));
             }
         }
         out.push(Line::from(spans));
@@ -412,7 +417,7 @@ fn render_code_island(out: &mut Vec<Line<'static>>, theme: &Theme, lang: Option<
     let lang_label = lang.unwrap_or("").trim();
     if !lang_label.is_empty() {
         out.push(Line::from(vec![
-            Span::styled("  ".to_string(), theme.dim()),
+            Span::styled("  ", theme.dim()),
             Span::styled(
                 lang_label.to_lowercase(),
                 theme.dim().add_modifier(Modifier::BOLD),

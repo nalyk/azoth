@@ -5,6 +5,8 @@
 //! fires the selection, `⎋` dismisses. Slash-prefixed queries
 //! (`/help`) still work — the parser strips the leading `/`.
 
+use std::borrow::Cow;
+
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -279,11 +281,8 @@ pub fn render(
                 format!(" {} ", theme.glyph(Theme::MAGNIFIER)),
                 theme.accent().add_modifier(Modifier::BOLD),
             ),
-            Span::styled("palette".to_string(), theme.bold()),
-            Span::styled(
-                "  · ↵ fire · ⎋ dismiss · ↑↓ navigate ".to_string(),
-                theme.dim(),
-            ),
+            Span::styled("palette", theme.bold()),
+            Span::styled("  · ↵ fire · ⎋ dismiss · ↑↓ navigate ", theme.dim()),
         ]));
     f.render_widget(block, rect);
 
@@ -307,9 +306,9 @@ pub fn render(
     // plain `_` instead of a Unicode block — earlier code emitted
     // `▋` unconditionally, defeating the round-1 ASCII-fallback path.
     let q_line = Line::from(vec![
-        Span::styled("› ".to_string(), theme.accent()),
+        Span::styled("› ", theme.accent()),
         Span::styled(state.query.clone(), theme.bold()),
-        Span::styled(theme.glyph(Theme::CURSOR_A).to_string(), theme.accent()),
+        Span::styled(theme.glyph(Theme::CURSOR_A), theme.accent()),
     ]);
     f.render_widget(Paragraph::new(q_line), chunks[0]);
 
@@ -348,10 +347,15 @@ pub fn render(
         .enumerate()
         .map(|(i, e)| {
             let selected = i == state.selected;
-            let marker: String = if selected {
-                format!("{} ", theme.glyph(Theme::CHEVRON))
+            // Round-26: unselected marker is a 2-space literal, not a
+            // freshly-allocated String. Selected rows still need
+            // `format!` because the chevron glyph is theme-dependent.
+            // Cow::Borrowed for the common case, Cow::Owned when a
+            // chevron is composed.
+            let marker: Cow<'static, str> = if selected {
+                Cow::Owned(format!("{} ", theme.glyph(Theme::CHEVRON)))
             } else {
-                "  ".to_string()
+                Cow::Borrowed("  ")
             };
             let marker_style = if selected {
                 theme.accent().add_modifier(Modifier::BOLD)
@@ -370,9 +374,13 @@ pub fn render(
             } else {
                 format!("     {}", e.hint)
             };
+            // `e.label` is `&'static str` (from STATIC_ENTRIES) — pass
+            // it directly so Span::styled wraps Cow::Borrowed. Earlier
+            // `e.label.to_string()` allocated a fresh String per row
+            // on every frame the palette was open.
             Line::from(vec![
                 Span::styled(marker, marker_style),
-                Span::styled(e.label.to_string(), label_style),
+                Span::styled(e.label, label_style),
                 Span::styled(hint, theme.dim()),
             ])
         })
