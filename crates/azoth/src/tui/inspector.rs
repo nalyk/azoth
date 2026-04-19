@@ -41,7 +41,7 @@ pub fn render(f: &mut Frame, area: Rect, data: &InspectorData, theme: &Theme) {
     render_section_header(f, inner, y, "context", theme);
     y = y.saturating_add(1);
     let ctx_line = Line::from(vec![
-        Span::styled("ctx  ".to_string(), theme.dim()),
+        Span::styled("ctx  ", theme.dim()),
         Span::styled(
             format!("{}%", data.ctx_pct),
             if data.ctx_pct >= 80 {
@@ -67,7 +67,7 @@ pub fn render(f: &mut Frame, area: Rect, data: &InspectorData, theme: &Theme) {
         let digest = truncate(d, inner.width as usize);
         f.render_widget(
             Paragraph::new(Line::from(vec![
-                Span::styled("pkt  ".to_string(), theme.dim()),
+                Span::styled("pkt  ", theme.dim()),
                 Span::styled(digest, theme.italic_dim()),
             ])),
             Rect::new(inner.x, y, inner.width, 1),
@@ -89,7 +89,7 @@ pub fn render(f: &mut Frame, area: Rect, data: &InspectorData, theme: &Theme) {
     } else {
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                "(none accepted)".to_string(),
+                "(none accepted)",
                 theme.italic_dim(),
             ))),
             Rect::new(inner.x, y, inner.width, 1),
@@ -99,7 +99,7 @@ pub fn render(f: &mut Frame, area: Rect, data: &InspectorData, theme: &Theme) {
     if let Some((used, max)) = data.contract_budget {
         f.render_widget(
             Paragraph::new(Line::from(vec![
-                Span::styled("budget ".to_string(), theme.dim()),
+                Span::styled("budget ", theme.dim()),
                 Span::styled(format!("{used}/{max}"), theme.ink(Colors::INK_1)),
             ])),
             Rect::new(inner.x, y, inner.width, 1),

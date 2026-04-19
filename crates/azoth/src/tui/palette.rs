@@ -74,6 +74,11 @@ pub struct PaletteState {
     pub open: bool,
     pub query: String,
     pub selected: usize,
+    /// Cached `match_entries` result keyed by `(query, turn_count)`.
+    /// `match_entries` runs every frame while the palette is open
+    /// (60fps), allocating + filtering up to N entries; caching keeps
+    /// it at one compute per actual change. Cleared on close.
+    pub cached_entries: Option<(String, usize, Vec<PaletteEntry>)>,
 }
 
 impl PaletteState {
@@ -81,11 +86,13 @@ impl PaletteState {
         self.open = true;
         self.query.clear();
         self.selected = 0;
+        self.cached_entries = None;
     }
     pub fn close(&mut self) {
         self.open = false;
         self.query.clear();
         self.selected = 0;
+        self.cached_entries = None;
     }
     pub fn push_char(&mut self, c: char) {
         self.query.push(c);
@@ -244,7 +251,13 @@ fn score(query: &str, target: &str) -> Option<i32> {
     None
 }
 
-pub fn render(f: &mut Frame, area: Rect, state: &PaletteState, theme: &Theme, turn_count: usize) {
+pub fn render(
+    f: &mut Frame,
+    area: Rect,
+    state: &mut PaletteState,
+    theme: &Theme,
+    turn_count: usize,
+) {
     let w = (area.width.saturating_mul(60) / 100).clamp(40, 100);
     let h = (area.height.saturating_mul(55) / 100).clamp(10, 24);
     let x = area.x + area.width.saturating_sub(w) / 2;
@@ -305,8 +318,24 @@ pub fn render(f: &mut Frame, area: Rect, state: &PaletteState, theme: &Theme, tu
         chunks[1],
     );
 
-    // Results.
-    let entries = match_entries(&state.query, turn_count);
+    // Results — cached by (query, turn_count). `match_entries`
+    // allocates + filters per call; without cache it ran every frame
+    // while the palette was open (60fps). Cache populates lazily,
+    // invalidates when either key component changes.
+    let needs_recompute = state
+        .cached_entries
+        .as_ref()
+        .map(|(q, n, _)| q != &state.query || *n != turn_count)
+        .unwrap_or(true);
+    if needs_recompute {
+        let entries = match_entries(&state.query, turn_count);
+        state.cached_entries = Some((state.query.clone(), turn_count, entries));
+    }
+    let entries = state
+        .cached_entries
+        .as_ref()
+        .map(|(_, _, e)| e.as_slice())
+        .unwrap_or(&[]);
     let visible = entries.len().min(chunks[2].height as usize);
     let result_lines: Vec<Line<'static>> = entries
         .iter()

@@ -333,6 +333,13 @@ fn render_table(out: &mut Vec<Line<'static>>, t: &TableBuf, theme: &Theme) {
 /// Preserves content intact when it fits; appends `…` on truncation
 /// so the result never overruns `width`.
 fn pad_to(s: &str, width: usize) -> String {
+    // Round-24 fix: width=0 must produce an empty string. Earlier the
+    // `Greater` branch with target=width-1=0 took no chars then
+    // appended `…` (width=1), overrunning the column and breaking
+    // GFM table alignment when a column collapses to 0.
+    if width == 0 {
+        return String::new();
+    }
     use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
     let total_w = UnicodeWidthStr::width(s);
     match total_w.cmp(&width) {
@@ -415,7 +422,7 @@ fn render_code_island(out: &mut Vec<Line<'static>>, theme: &Theme, lang: Option<
 
     for line in body.lines() {
         let code_spans = tint_code(line, lang_label, theme);
-        let mut spans = vec![Span::styled(bar.to_string(), bar_style), Span::raw("  ")];
+        let mut spans = vec![Span::styled(bar, bar_style), Span::raw("  ")];
         spans.extend(code_spans);
         out.push(Line::from(spans));
     }
@@ -677,6 +684,17 @@ mod tests {
             .flat_map(|l| l.spans.iter())
             .any(|s| s.content.contains("•"));
         assert!(has_bullet);
+    }
+
+    #[test]
+    fn pad_to_returns_empty_for_width_zero() {
+        // Round-24 bug: pad_to("hello", 0) returned "…" (1 char wide)
+        // instead of "" because the truncation branch produced
+        // ellipsis + 0 padding chars, overrunning the column. GFM
+        // tables collapsed columns broke alignment.
+        assert_eq!(pad_to("hello", 0), "");
+        assert_eq!(pad_to("", 0), "");
+        assert_eq!(pad_to("é", 0), ""); // multi-byte char also empty
     }
 
     #[test]

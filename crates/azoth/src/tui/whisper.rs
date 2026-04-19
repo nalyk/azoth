@@ -57,9 +57,9 @@ impl Whisper {
             let spinner = motion::spinner_frame(theme, elapsed_ms);
             return Line::from(vec![
                 Span::raw("      "),
-                Span::styled(spinner.to_string(), theme.accent()),
+                Span::styled(spinner, theme.accent()),
                 Span::raw(" "),
-                Span::styled("azoth".to_string(), theme.bold()),
+                Span::styled("azoth", theme.bold()),
                 Span::raw(" "),
                 Span::styled(text.clone(), theme.italic_dim()),
                 Span::styled(format!(" · {elapsed_f:.1}s"), theme.dim()),
@@ -76,7 +76,7 @@ impl Whisper {
                 };
                 return Line::from(vec![
                     Span::raw("      "),
-                    Span::styled(prefix.to_string(), style),
+                    Span::styled(prefix, style),
                     Span::raw(" "),
                     Span::styled(note.text.clone(), theme.italic_dim()),
                 ]);
@@ -86,9 +86,9 @@ impl Whisper {
         // Default zero-state hint.
         Line::from(vec![
             Span::raw("      "),
-            Span::styled("ready".to_string(), theme.dim()),
+            Span::styled("ready", theme.dim()),
             Span::raw(" "),
-            Span::styled("· ⌃K for commands".to_string(), theme.italic_dim()),
+            Span::styled("· ⌃K for commands", theme.italic_dim()),
         ])
     }
 }

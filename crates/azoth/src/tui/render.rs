@@ -30,11 +30,17 @@ pub fn frame(f: &mut Frame, state: &mut AppState) {
     let cursor_phase = pulse_phase(elapsed_ms, 500);
 
     // Reset click map every frame; render paths register hit regions
-    // by absolute terminal Y. Sized to exactly the canvas height.
-    // Each row holds a list of (x_range, target) so multiple buttons
-    // on one row (sheet action bar, status row toggles) are routable.
-    state.click_map.clear();
-    state.click_map.resize_with(size.height as usize, Vec::new);
+    // by absolute terminal Y. Reuse inner Vecs (clear keeps capacity);
+    // only resize the outer Vec when terminal height changes. Earlier
+    // `clear()` + `resize_with` dropped + reallocated every inner
+    // Vec on every frame at 60fps — significant heap churn on long
+    // sessions (round-24 gemini MED).
+    if state.click_map.len() != size.height as usize {
+        state.click_map.resize_with(size.height as usize, Vec::new);
+    }
+    for row in &mut state.click_map {
+        row.clear();
+    }
 
     // Splashscreen takes the whole canvas while the worker boots.
     if state.booting {
@@ -116,7 +122,7 @@ pub fn frame(f: &mut Frame, state: &mut AppState) {
 
     // Overlays.
     if state.palette.open {
-        palette::render(f, size, &state.palette, &theme, state.cards.len());
+        palette::render(f, size, &mut state.palette, &theme, state.cards.len());
     }
     if let Some(req) = state.pending_approval.as_ref() {
         sheet::render(
