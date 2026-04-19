@@ -219,6 +219,15 @@ pub struct TurnCard {
     /// Rendered as a collapsible block above the prose. Hidden by
     /// default; `⇥` on the live card toggles.
     pub thoughts: Vec<String>,
+    /// Bumped on every `append_thought`. Drives `cached_thoughts`
+    /// invalidation in the same shape as `prose_revision`.
+    pub thoughts_revision: u64,
+    /// Lazy cache of the rendered thought lines as `(revision, lines)`.
+    /// Mirrors `cached_prose` — populated on first paint, invalidated
+    /// when `thoughts_revision` changes. Eliminates per-frame
+    /// `String::clone` for every thought line on long sessions where
+    /// the user keeps `⌃T thoughts` expanded.
+    pub cached_thoughts: Option<(u64, Vec<Line<'static>>)>,
     pub thoughts_expanded: bool,
     pub cells: Vec<ToolCell>,
     pub usage: Option<UsageChip>,
@@ -267,6 +276,8 @@ impl TurnCard {
             prose_revision: 1,
             cached_prose: None,
             thoughts: Vec::new(),
+            thoughts_revision: 0,
+            cached_thoughts: None,
             thoughts_expanded: false,
             cells: Vec::new(),
             usage: None,
@@ -287,6 +298,8 @@ impl TurnCard {
             prose_revision: 0,
             cached_prose: None,
             thoughts: Vec::new(),
+            thoughts_revision: 0,
+            cached_thoughts: None,
             thoughts_expanded: false,
             cells: Vec::new(),
             usage: None,
@@ -332,6 +345,7 @@ impl TurnCard {
         for line in parts {
             self.thoughts.push(line.to_string());
         }
+        self.thoughts_revision = self.thoughts_revision.wrapping_add(1);
     }
 
     pub fn add_cell(&mut self, cell: ToolCell) {
@@ -399,10 +413,13 @@ impl TurnCard {
         } else {
             format!("t+{:.0}s", elapsed)
         };
+        // `bar` and `role.label()` are `&'static str` — pass them
+        // directly to Span::styled (Cow::Borrowed) instead of
+        // allocating String per frame per visible card.
         let mut header = vec![
-            Span::styled(bar.to_string(), bar_style),
+            Span::styled(bar, bar_style),
             Span::raw(" "),
-            Span::styled(self.role.label().to_string(), role_style),
+            Span::styled(self.role.label(), role_style),
         ];
         if let Some(usage) = self.usage {
             header.push(Span::styled(
@@ -445,14 +462,32 @@ impl TurnCard {
                 Some(RowHint::ThoughtsHeader),
             ));
             if self.thoughts_expanded {
-                for line in &self.thoughts {
-                    out.push((
-                        Line::from(vec![
-                            Span::raw("     "),
-                            Span::styled(line.clone(), theme.italic_dim()),
-                        ]),
-                        None,
-                    ));
+                // Round-19 fix: cache the rendered thought lines so
+                // `line.clone()` per thought per frame doesn't run on
+                // every paint. Thoughts are immutable once received;
+                // invalidate via `thoughts_revision` (bumped in
+                // `append_thought`).
+                let want_rev = self.thoughts_revision;
+                let needs_refresh = self
+                    .cached_thoughts
+                    .as_ref()
+                    .map(|(rev, _)| *rev != want_rev)
+                    .unwrap_or(true);
+                if needs_refresh {
+                    let italic = theme.italic_dim();
+                    let lines: Vec<Line<'static>> = self
+                        .thoughts
+                        .iter()
+                        .map(|t| {
+                            Line::from(vec![Span::raw("     "), Span::styled(t.clone(), italic)])
+                        })
+                        .collect();
+                    self.cached_thoughts = Some((want_rev, lines));
+                }
+                if let Some((_, cached)) = self.cached_thoughts.as_ref() {
+                    for line in cached {
+                        out.push((line.clone(), None));
+                    }
                 }
             }
             out.push((Line::from(""), None));
@@ -633,7 +668,10 @@ impl TurnCard {
                 out.push((
                     Line::from(vec![
                         Span::styled("     ".to_string(), theme.dim()),
-                        Span::styled(truncate(message, 80), theme.ink(Palette::ABORT)),
+                        Span::styled(
+                            truncate(message, 80).into_owned(),
+                            theme.ink(Palette::ABORT),
+                        ),
                     ]),
                     None,
                 ));

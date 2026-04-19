@@ -124,17 +124,20 @@ pub fn frame(f: &mut Frame, state: &mut AppState) {
 }
 
 fn render_status(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
-    let mut spans: Vec<Span<'static>> = vec![
+    // Spans borrow from `state` (status row strings + truncated
+    // labels) — relaxed lifetime annotation since the Vec is
+    // consumed within this fn (Paragraph::new + render_widget).
+    let mut spans: Vec<Span<'_>> = vec![
         Span::raw("  "),
-        Span::styled("azoth".to_string(), theme.bold()),
-        Span::styled(" · ".to_string(), theme.dim()),
+        Span::styled("azoth", theme.bold()),
+        Span::styled(" · ", theme.dim()),
     ];
     let contract_label = state
         .inspector_data
         .contract_goal
         .as_deref()
         .map(|g| trunc(g, 40))
-        .unwrap_or_else(|| "no contract yet".to_string());
+        .unwrap_or(std::borrow::Cow::Borrowed("no contract yet"));
     spans.push(Span::styled(contract_label, theme.ink(Colors::INK_1)));
     // Model / profile label (from AppState.status, set to
     // "<profile> · <model_id>" at worker init).
