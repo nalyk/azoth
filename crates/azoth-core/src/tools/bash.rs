@@ -312,14 +312,19 @@ fn stage_overlay_back(
     let upper_canon = ws.upper.canonicalize().map_err(|e| {
         ToolError::Failed(format!("canonicalize upper {}: {e}", ws.upper.display()))
     })?;
-    // Canonicalized repo root for the symlink-target boundary check
-    // in the symlink branch below. Computed once so every entry's
-    // decision references a stable resolved path.
-    let repo_canon = repo_root.canonicalize().map_err(|e| {
-        ToolError::Failed(format!(
-            "canonicalize repo_root {}: {e}",
-            repo_root.display()
-        ))
+    // Canonicalized merged view for the symlink-target boundary
+    // check in the symlink branch below. We canonicalize against
+    // `ws.merged` (the fuse-overlayfs mount that shows lower +
+    // upper in a single coherent tree) rather than `repo_root`
+    // so symlinks whose target was created in the same turn
+    // resolve regardless of `read_dir` iteration order in the
+    // staging loop below. Flagged on PR #17 round 2 by gemini
+    // HIGH + codex P1: the `repo_root` base made legitimate
+    // `echo x > foo && ln -s foo link` silently drop the
+    // symlink whenever `link` happened to iterate before `foo`
+    // in the tmpfs-backed upper-layer directory listing.
+    let merged_canon = ws.merged.canonicalize().map_err(|e| {
+        ToolError::Failed(format!("canonicalize merged {}: {e}", ws.merged.display()))
     })?;
     for rel in &rels {
         let src = ws.upper.join(rel);
@@ -393,37 +398,44 @@ fn stage_overlay_back(
 
             // Tier B symlink-escape defence (2026-04-20): refuse
             // to recreate a symlink whose target resolves outside
-            // `repo_root`. Without this check, a model-issued
-            // `ln -s /etc leak` is faithfully recreated in the
-            // real repo and ANY subsequent path traversal through
-            // `leak/` reaches host files — the walker's
-            // no-follow fix in `collect_files` stops the leak
-            // DURING stage-back, but the leak vector survives.
-            // Canonicalize the target (resolved relative to the
-            // destination's parent for relative targets) and
-            // accept only paths under `repo_canon`. Dangling
-            // targets whose safety we cannot verify are refused.
-            // Caught by `bash_tier_b_blocks_symlink_dir_traversal_to_host_files`
-            // on first CI run that had fuse-overlayfs on PATH
-            // (GHA ubuntu-22.04); dev machines (WSL2) probe-skip
-            // the test, which is what let this sleep.
-            let dst_parent = dst.parent().ok_or_else(|| {
-                ToolError::Failed(format!("symlink dst has no parent: {}", dst.display()))
+            // the overlay's merged view. Without this check, a
+            // model-issued `ln -s /etc leak` is faithfully
+            // recreated in the real repo and ANY subsequent path
+            // traversal through `leak/` reaches host files — the
+            // walker's no-follow fix in `collect_files` stops the
+            // leak DURING stage-back, but the leak vector
+            // survives. Resolving relative targets against the
+            // `ws.merged` mount (lower + upper layers in one
+            // coherent tree) — not `repo_root` — means legitimate
+            // same-turn-created targets validate cleanly
+            // regardless of `read_dir` iteration order (PR #17
+            // round 2, gemini HIGH + codex P1). Dangling targets
+            // whose safety we cannot verify are refused. Caught
+            // by `bash_tier_b_blocks_symlink_dir_traversal_to_host_files`
+            // on first CI run with fuse-overlayfs on PATH (GHA
+            // ubuntu-22.04); dev (WSL2) probe-skipped it until
+            // `sudo apt install fuse-overlayfs`.
+            let merged_path = ws.merged.join(rel);
+            let merged_parent = merged_path.parent().ok_or_else(|| {
+                ToolError::Failed(format!(
+                    "symlink merged path has no parent: {}",
+                    rel.display()
+                ))
             })?;
             let target_abs = if link_target.is_absolute() {
                 link_target.clone()
             } else {
-                dst_parent.join(&link_target)
+                merged_parent.join(&link_target)
             };
             match std::fs::canonicalize(&target_abs) {
-                Ok(resolved) if resolved.starts_with(&repo_canon) => {}
+                Ok(resolved) if resolved.starts_with(&merged_canon) => {}
                 Ok(resolved) => {
                     tracing::warn!(
                         rel = %rel.display(),
                         target = %link_target.display(),
                         resolved = %resolved.display(),
-                        repo_root = %repo_canon.display(),
-                        "stage-back refused: symlink target escapes repo_root"
+                        merged_root = %merged_canon.display(),
+                        "stage-back refused: symlink target escapes overlay merged view"
                     );
                     continue;
                 }
@@ -1342,6 +1354,94 @@ mod tests {
                 "refused relative-escape symlink must not appear in staged_files; got {staged:?}"
             );
         }
+    }
+
+    /// 2026-04-20 PR #17 round 2 (gemini HIGH + codex P1): the
+    /// initial fix canonicalized symlink targets against
+    /// `repo_root`. Because `stage_overlay_back` processes
+    /// entries in `read_dir` order and a symlink may iterate
+    /// BEFORE its target has been staged into the real repo,
+    /// `canonicalize(repo_root/target)` nondeterministically
+    /// failed on legitimate intra-turn operations like
+    /// `echo x > foo && ln -s foo link`. That silent drop was a
+    /// correctness regression. Post-fix: canonicalize against
+    /// `ws.merged` (fuse-overlayfs mount exposing lower + upper
+    /// in one tree), which sees both existing and newly-created
+    /// targets — order-independent. This test asserts that a
+    /// symlink created in the same command as its target survives
+    /// stage-back as a symlink (not dropped, not copied).
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn bash_tier_b_preserves_symlink_to_file_created_in_same_command() {
+        use crate::sandbox::tier_b::probe_fuse_overlayfs;
+        if sandbox_skip() {
+            return;
+        }
+        if !probe_fuse_overlayfs() {
+            eprintln!("skip: fuse-overlayfs not on PATH");
+            return;
+        }
+        std::env::set_var("AZOTH_SANDBOX", "tier_b");
+
+        let dir = tempdir().unwrap();
+        let root = tokio::fs::canonicalize(dir.path()).await.unwrap();
+        let ctx = ctx_for(root.clone());
+
+        let mut disp = ToolDispatcher::new();
+        disp.register(BashTool);
+        // Both `foo.txt` and `link` are created in this single
+        // command. Neither exists in `repo_root` when stage-back
+        // starts. If stage-back iterates `link` before `foo.txt`
+        // (plausible given unsorted `read_dir` on tmpfs-backed
+        // upper layers), the fix must still preserve the
+        // symlink — the merged-view canonicalization sees both
+        // entries regardless of processing order.
+        let raw = Tainted::new(
+            Origin::ModelOutput,
+            json!({ "command": "echo payload > foo.txt && ln -s foo.txt link" }),
+        );
+        let out = dispatch_tool(&disp, "bash", raw, &ctx).await.unwrap();
+        std::env::remove_var("AZOTH_SANDBOX");
+
+        assert_eq!(out["exit_code"], 0, "bash echo+ln succeeded");
+
+        // Target file must be staged as a regular file.
+        let foo_meta =
+            std::fs::symlink_metadata(root.join("foo.txt")).expect("foo.txt must be staged back");
+        assert!(
+            foo_meta.file_type().is_file(),
+            "foo.txt must be a regular file; got {:?}",
+            foo_meta.file_type()
+        );
+
+        // Symlink must be staged AS a symlink, with its target
+        // preserved verbatim — not dropped, not materialised as
+        // a copy of foo.txt's bytes.
+        let link_meta = std::fs::symlink_metadata(root.join("link"))
+            .expect("link must be staged back despite same-turn target creation");
+        assert!(
+            link_meta.file_type().is_symlink(),
+            "link must be a symlink; got {:?}",
+            link_meta.file_type()
+        );
+        let resolved = std::fs::read_link(root.join("link")).unwrap();
+        assert_eq!(
+            resolved.as_os_str(),
+            "foo.txt",
+            "symlink target must be preserved verbatim"
+        );
+
+        // Both entries should appear in staged_files.
+        let staged = out["staged_files"].as_array().expect("staged_files array");
+        let staged_names: Vec<&str> = staged.iter().filter_map(|v| v.as_str()).collect();
+        assert!(
+            staged_names.contains(&"foo.txt"),
+            "foo.txt must appear in staged_files; got {staged_names:?}"
+        );
+        assert!(
+            staged_names.contains(&"link"),
+            "link must appear in staged_files; got {staged_names:?}"
+        );
     }
 
     /// Codex round-7 P1 regression guard: `mkfifo pipe` under
