@@ -1,0 +1,9 @@
+<svg viewBox="0 0 512 512" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Azoth quadrature spiral - heavy weight with lead-in">
+  <path id="icon"
+    d="M 96 48 L 96 96 L 416 96 L 416 416 L 96 416 L 96 176 L 336 176 L 336 336 L 176 336 L 176 256 L 256 256"
+    stroke="#0A0A0A"
+    stroke-width="40"
+    fill="none"
+    stroke-linecap="butt"
+    stroke-linejoin="miter" />
+</svg>

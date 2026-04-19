@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logos/azoth-logo.svg" alt="azoth logo" width="120" height="120">
+</p>
+
 # azoth
 
 <p align="center">
