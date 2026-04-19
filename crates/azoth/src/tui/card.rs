@@ -780,10 +780,15 @@ fn render_cell_preview_line(line: &str, theme: &Theme) -> Line<'static> {
 
     // Path:line detection — path starts near the left, followed by
     // `:<digits>` or `:<digits>:<digits>`. Apply accent + underline.
-    let tokens: Vec<&str> = line.split_whitespace().collect();
-    if let Some(first) = tokens.first() {
+    // Use `split_whitespace().next()` directly + `line.find(first)`
+    // so leading whitespace doesn't shift the slice. Earlier
+    // `&line[first.len()..]` assumed the path token started at index
+    // 0 — on lines like "  src/foo.rs:42 ctx" it sliced "rs:42 ctx"
+    // (chopping the path tail + including leftover ctx).
+    if let Some(first) = line.split_whitespace().next() {
         if looks_like_path_line(first) {
-            let rest = &line[first.len()..];
+            let first_idx = line.find(first).unwrap_or(0);
+            let rest = &line[first_idx + first.len()..];
             return Line::from(vec![
                 Span::styled("     ".to_string(), theme.dim()),
                 Span::styled(
