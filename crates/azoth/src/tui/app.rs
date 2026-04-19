@@ -22,6 +22,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use std::io;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::mpsc;
 use tui_textarea::{Input as TaInput, TextArea};
 
@@ -53,8 +54,13 @@ use azoth_core::validators::{
 use azoth_repo::history::co_edit;
 use azoth_repo::{CoEditGraphRetrieval, FtsLexicalRetrieval, RepoIndexer, SqliteSymbolIndex};
 
+use super::card::{CardState, CellResult, Note, ToolCell, TurnCard, UsageChip};
 use super::input::SlashCommand;
+use super::inspector::InspectorData;
+use super::palette::{PaletteAction, PaletteState};
 use super::render;
+use super::theme::Theme;
+use super::whisper::Whisper;
 
 #[derive(Debug, Clone)]
 pub enum InputEvent {
@@ -65,7 +71,29 @@ pub enum InputEvent {
 
 pub struct AppState {
     pub textarea: TextArea<'static>,
-    pub transcript: Vec<String>,
+    /// PAPER cards — the visible manuscript. Replaces the flat `Vec<String>`
+    /// transcript of the pre-PAPER TUI. Each card is a structured turn.
+    pub cards: Vec<TurnCard>,
+    /// System notes — slash-command feedback, session banners, errors.
+    /// Rendered in the whisper row, not in the canvas.
+    pub notes: Vec<Note>,
+    /// Single-row narrator above the composer.
+    pub whisper: Whisper,
+    /// Command palette state (⌃K).
+    pub palette: PaletteState,
+    /// Resolved theme (glyph table + colors).
+    pub theme: Theme,
+    /// Monotonic clock for pulse/blink phase.
+    pub boot: Instant,
+    /// Right-side inspector drawer (⌃2).
+    pub inspector_open: bool,
+    /// Left-side turn rail (⌃1).
+    pub rail_open: bool,
+    /// Focus mode — hide all cards except the live one (⌃\).
+    pub focus_mode: bool,
+    /// Structured data driving the inspector drawer.
+    pub inspector_data: InspectorData,
+
     pub status: String,
     pub ctx_pct: u8,
     pub dirty: bool,
@@ -85,7 +113,7 @@ pub struct AppState {
     pub last_input_tokens: u32,
     /// Max context window from the active profile. Set once at startup.
     pub max_context_tokens: u32,
-    /// Scroll offset for the transcript (0 = pinned to bottom).
+    /// Scroll offset for the canvas (0 = pinned to latest).
     pub scroll_offset: u16,
     /// Whether the user has manually scrolled up (disables auto-scroll).
     pub scroll_locked: bool,
@@ -94,10 +122,29 @@ pub struct AppState {
 impl AppState {
     pub fn new() -> Self {
         let mut textarea = TextArea::default();
-        textarea.set_placeholder_text("type a message or /command…");
+        textarea.set_placeholder_text("what are we building?");
+        let inspector_data = InspectorData {
+            tools: vec![
+                "repo_search".into(),
+                "repo_read_file".into(),
+                "repo_read_spans".into(),
+                "fs_write".into(),
+                "bash".into(),
+            ],
+            ..Default::default()
+        };
         Self {
             textarea,
-            transcript: vec!["azoth · ready".to_string()],
+            cards: Vec::new(),
+            notes: Vec::new(),
+            whisper: Whisper::default(),
+            palette: PaletteState::default(),
+            theme: Theme::detect(),
+            boot: Instant::now(),
+            inspector_open: false,
+            rail_open: false,
+            focus_mode: false,
+            inspector_data,
             status: "ready".to_string(),
             ctx_pct: 0,
             dirty: true,
@@ -124,89 +171,160 @@ impl AppState {
         self.textarea.lines().join("\n")
     }
 
+    /// Find the most recent card matching `turn_id`. Walks in reverse
+    /// because the live turn is almost always the target.
+    pub fn card_by_turn_id_mut(&mut self, turn_id: &str) -> Option<&mut TurnCard> {
+        self.cards.iter_mut().rev().find(|c| c.turn_id == turn_id)
+    }
+
+    fn run_palette_action(&mut self, action: PaletteAction) {
+        match action {
+            PaletteAction::ShowContext => {
+                if let Some(s) = self.last_context_summary.clone() {
+                    for line in s.lines() {
+                        self.notes.push(Note::info(line.to_string()));
+                    }
+                } else {
+                    self.notes
+                        .push(Note::help("no packet compiled yet — send a message first"));
+                }
+            }
+            PaletteAction::ShowContract => {
+                if let Some(g) = self.inspector_data.contract_goal.clone() {
+                    self.notes.push(Note::info(format!("contract · {g}")));
+                } else {
+                    self.notes.push(Note::help(
+                        "no contract accepted yet — type `/contract <goal>` or just send a message",
+                    ));
+                }
+            }
+            PaletteAction::ShowTools => {
+                self.notes.push(Note::info(format!(
+                    "tools · {}",
+                    self.inspector_data.tools.join(", ")
+                )));
+            }
+            PaletteAction::ShowEvidence => {
+                if self.inspector_data.evidence_lanes.is_empty() {
+                    self.notes.push(Note::help(
+                        "no evidence yet — send a message to trigger retrieval",
+                    ));
+                } else {
+                    for (lane, label) in &self.inspector_data.evidence_lanes {
+                        self.notes.push(Note::info(format!("{lane:<8} {label}")));
+                    }
+                }
+            }
+            PaletteAction::OpenRail => {
+                self.rail_open = !self.rail_open;
+            }
+            PaletteAction::OpenInspector => {
+                self.inspector_open = !self.inspector_open;
+            }
+            PaletteAction::FocusMode => {
+                self.focus_mode = !self.focus_mode;
+            }
+            PaletteAction::Quit => {
+                self.should_quit = true;
+            }
+            PaletteAction::Continue => {
+                self.pending_user_text = Some(
+                    "Please continue from where you left off — pick up the \
+                     partial output and finish."
+                        .to_string(),
+                );
+            }
+            PaletteAction::DraftContract(Some(goal)) => {
+                let mut draft = azoth_core::contract::draft(goal.clone());
+                draft.success_criteria.push(format!("delivers: {goal}"));
+                self.pending_contract = Some(draft);
+                self.notes
+                    .push(Note::info(format!("contract drafted · {goal}")));
+            }
+            PaletteAction::DraftContract(None) => {
+                self.notes.push(Note::help("usage: /contract <goal>"));
+            }
+            PaletteAction::Approve(Some(tool)) => {
+                self.pending_approve = Some(tool.clone());
+                self.notes
+                    .push(Note::info(format!("approving tool {tool} session-scope")));
+            }
+            PaletteAction::Approve(None) => {
+                self.notes.push(Note::help("usage: /approve <tool_name>"));
+            }
+            PaletteAction::Resume => {
+                self.notes.push(Note::help(
+                    "resume runs from the CLI: `azoth resume <run_id>`",
+                ));
+            }
+            PaletteAction::JumpToTurn(idx) => {
+                let _ = idx; // rail jump — passive in this build, scroll remains manual
+                self.notes.push(Note::info(format!(
+                    "rail selected turn {} · scroll to navigate",
+                    idx + 1
+                )));
+            }
+            PaletteAction::UnknownSlash(name) => {
+                self.notes
+                    .push(Note::warn(format!("unknown command: /{name}")));
+            }
+        }
+    }
+
     fn handle_slash(&mut self, cmd: SlashCommand) {
         match cmd {
             SlashCommand::Help => {
-                self.transcript.push("· help".into());
-                self.transcript
-                    .push("  /help              show this list".into());
-                self.transcript
-                    .push("  /status            run_id, session path, turn count".into());
-                self.transcript
-                    .push("  /context           latest compiled context packet".into());
-                self.transcript
-                    .push("  /contract <goal>   draft + accept a run contract".into());
-                self.transcript
-                    .push("  /approve [tool]    pre-approve a tool for the session".into());
-                self.transcript
-                    .push("  /resume <run_id>   (restart required in v1)".into());
-                self.transcript
-                    .push("  /continue          nudge the model to resume a truncated turn".into());
-                self.transcript.push("  /quit              exit".into());
+                self.notes.push(Note::help(
+                    "press ⌃K for the palette · all commands live there",
+                ));
             }
             SlashCommand::Status => {
-                self.transcript.push("· status".into());
-                self.transcript
-                    .push(format!("  run_id        {}", self.run_id));
-                self.transcript
-                    .push(format!("  session_path  {}", self.session_path));
-                self.transcript.push(format!(
-                    "  pending_appr  {}",
-                    if self.pending_approval.is_some() {
-                        "yes"
+                self.notes.push(Note::info(format!(
+                    "run {} · turns {} · contract {}",
+                    if self.run_id.is_empty() {
+                        "(pending)".to_string()
                     } else {
-                        "no"
-                    }
-                ));
-                self.transcript
-                    .push(format!("  turns         {}", self.committed_turns));
-                self.transcript.push(format!(
-                    "  contract      {}",
+                        self.run_id.chars().take(14).collect()
+                    },
+                    self.committed_turns,
                     self.current_contract_id
                         .as_ref()
-                        .map(|c| c.to_string())
-                        .unwrap_or_else(|| "(none)".to_string())
-                ));
+                        .map(|c| c.to_string().chars().take(14).collect())
+                        .unwrap_or_else(|| "none".to_string())
+                )));
             }
             SlashCommand::Context => match &self.last_context_summary {
                 Some(summary) => {
-                    self.transcript.push("· context".into());
                     for line in summary.lines() {
-                        self.transcript.push(format!("  {line}"));
+                        self.notes.push(Note::info(line.to_string()));
                     }
                 }
                 None => {
-                    self.transcript
-                        .push("· context: no packet compiled yet".into());
+                    self.notes
+                        .push(Note::help("no packet compiled yet — send a message first"));
                 }
             },
             SlashCommand::Contract(rest) => match rest {
                 None => {
-                    self.transcript
-                        .push("! usage: /contract <goal text>".into());
+                    self.notes.push(Note::help("usage: /contract <goal text>"));
                 }
                 Some(goal) => {
                     let mut c = azoth_core::contract::draft(goal.clone());
                     c.success_criteria.push(format!("delivers: {goal}"));
-                    self.transcript.push(format!("· contract drafted: {goal}"));
+                    self.notes
+                        .push(Note::info(format!("contract drafted: {goal}")));
                     self.pending_contract = Some(c);
                 }
             },
             SlashCommand::Approve(arg) => match arg {
                 Some(tool_name) => {
-                    self.transcript.push(format!(
-                        "· approve: queuing session-scoped pre-approval for {tool_name}"
-                    ));
+                    self.notes.push(Note::info(format!(
+                        "approve: queuing session-scoped pre-approval for {tool_name}"
+                    )));
                     self.pending_approve = Some(tool_name);
                 }
                 None => {
-                    self.transcript.push("· approve".into());
-                    self.transcript.push("  usage: /approve <tool_name>".into());
-                    self.transcript
-                        .push("  pre-grants a session-scoped capability token".into());
-                    self.transcript
-                        .push("  so the tool will not prompt for approval.".into());
-                    self.transcript.push("  registered tools: fs_write, bash, repo_search, repo_read_file, repo_read_spans".into());
+                    self.notes.push(Note::help("usage: /approve <tool_name>"));
                 }
             },
             SlashCommand::Quit => {
@@ -214,35 +332,34 @@ impl AppState {
             }
             SlashCommand::Resume(arg) => match arg {
                 Some(id) => {
-                    self.transcript.push(format!(
-                        "! /resume not yet supported at runtime, restart with: azoth resume {id}"
-                    ));
+                    self.notes.push(Note::info(format!(
+                        "/resume not supported at runtime — restart with: azoth resume {id}"
+                    )));
                     self.should_quit = true;
                 }
                 None => {
-                    self.transcript.push("! usage: /resume <run_id>".into());
+                    self.notes.push(Note::help("usage: /resume <run_id>"));
                 }
             },
             SlashCommand::Continue => {
-                // Sprint 7.5: queue a synthetic user prompt asking the
-                // model to resume where it left off. Meaningful after a
-                // `turn_aborted { reason: "model_truncated" }` where the
-                // model hit max_tokens mid-generation; the next turn
-                // starts with this nudge and the model's own
-                // conversation history still contains the partial
-                // output.
-                self.transcript.push("· /continue".into());
+                // Sprint 7.5 preserved: queue a synthetic user prompt
+                // nudging the model to resume after a max_tokens
+                // truncation. The next turn starts with this nudge
+                // and the model's own conversation history still
+                // contains the partial output.
                 self.pending_user_text = Some(
                     "Please continue from where you left off — pick up the \
                      partial output and finish."
                         .to_string(),
                 );
-                self.dirty = true;
+                self.notes.push(Note::info("continue requested"));
             }
             SlashCommand::Unknown(name) => {
-                self.transcript.push(format!("! unknown command: /{name}"));
+                self.notes
+                    .push(Note::warn(format!("unknown command: /{name}")));
             }
         }
+        self.dirty = true;
     }
 
     pub fn handle_input(&mut self, ev: InputEvent) {
@@ -273,41 +390,128 @@ impl AppState {
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
+        // Palette captures input when open.
+        if self.palette.open {
+            match (key.code, key.modifiers) {
+                (KeyCode::Esc, _) => {
+                    self.palette.close();
+                }
+                (KeyCode::Enter, _) => {
+                    let action = self.palette.fire(self.cards.len());
+                    self.palette.close();
+                    if let Some(a) = action {
+                        self.run_palette_action(a);
+                    }
+                }
+                (KeyCode::Backspace, _) => {
+                    self.palette.pop_char();
+                }
+                (KeyCode::Up, _) => {
+                    self.palette.cursor_up();
+                }
+                (KeyCode::Down, _) => {
+                    let total =
+                        super::palette::match_entries(&self.palette.query, self.cards.len()).len();
+                    self.palette.cursor_down(total);
+                }
+                (KeyCode::Char(c), _) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.palette.push_char(c);
+                }
+                _ => {}
+            }
+            self.dirty = true;
+            return;
+        }
+
+        // Approval sheet captures input when a request is pending.
         if self.pending_approval.is_some() {
-            match key.code {
-                KeyCode::Char('y') | KeyCode::Char('Y') => {
+            match (key.code, key.modifiers) {
+                (KeyCode::Enter, _) | (KeyCode::Char('y'), _) | (KeyCode::Char('Y'), _) => {
                     if let Some(req) = self.pending_approval.take() {
                         let _ = req.responder.send(ApprovalResponse::Grant {
                             scope: ApprovalScope::Once,
                         });
-                        self.transcript.push("  · approval: granted once".into());
-                        self.dirty = true;
+                        self.notes.push(Note::info("approval · granted once"));
                     }
                 }
-                KeyCode::Char('s') | KeyCode::Char('S') => {
+                (KeyCode::Char('s'), _) | (KeyCode::Char('S'), _) => {
                     if let Some(req) = self.pending_approval.take() {
                         let _ = req.responder.send(ApprovalResponse::Grant {
                             scope: ApprovalScope::Session,
                         });
-                        self.transcript.push("  · approval: granted session".into());
-                        self.dirty = true;
+                        self.notes.push(Note::info("approval · granted session"));
                     }
                 }
-                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                (KeyCode::Char('p'), _) | (KeyCode::Char('P'), _) => {
+                    // Scoped-paths v1: a no-op empty path list is unsafe,
+                    // so we route to session-scope and surface a note so
+                    // the user knows the batch-plan sheet isn't in this
+                    // build yet. Bona-fide ScopedPaths lands in v2.1.
+                    if let Some(req) = self.pending_approval.take() {
+                        let _ = req.responder.send(ApprovalResponse::Grant {
+                            scope: ApprovalScope::Session,
+                        });
+                        self.notes.push(Note::info(
+                            "approval · scoped-paths falls back to session in v1",
+                        ));
+                    }
+                }
+                (KeyCode::Esc, _) | (KeyCode::Char('n'), _) | (KeyCode::Char('N'), _) => {
                     if let Some(req) = self.pending_approval.take() {
                         let _ = req.responder.send(ApprovalResponse::Deny);
-                        self.transcript.push("  · approval: denied".into());
-                        self.dirty = true;
+                        self.notes.push(Note::warn("approval · denied"));
                     }
                 }
                 _ => {}
             }
+            self.dirty = true;
             return;
         }
+
         match (key.code, key.modifiers) {
             (KeyCode::Char('c'), KeyModifiers::CONTROL)
             | (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
                 self.should_quit = true;
+                return;
+            }
+            (KeyCode::Char('k'), KeyModifiers::CONTROL) => {
+                self.palette.open();
+                self.dirty = true;
+                return;
+            }
+            (KeyCode::Char('1'), KeyModifiers::CONTROL) => {
+                self.rail_open = !self.rail_open;
+                self.dirty = true;
+                return;
+            }
+            (KeyCode::Char('2'), KeyModifiers::CONTROL) => {
+                self.inspector_open = !self.inspector_open;
+                self.dirty = true;
+                return;
+            }
+            (KeyCode::Char('\\'), KeyModifiers::CONTROL) => {
+                self.focus_mode = !self.focus_mode;
+                self.dirty = true;
+                return;
+            }
+            (KeyCode::Tab, m) if !m.contains(KeyModifiers::SHIFT) => {
+                // Expand the last cell of the latest agent card.
+                if let Some(card) = self.cards.iter_mut().rev().find(|c| !c.cells.is_empty()) {
+                    if let Some(last) = card.cells.last_mut() {
+                        last.expanded = !last.expanded;
+                        self.dirty = true;
+                        return;
+                    }
+                }
+                // No expandable cell — fall through to textarea.
+            }
+            (KeyCode::BackTab, _) | (KeyCode::Tab, KeyModifiers::SHIFT) => {
+                for card in self.cards.iter_mut() {
+                    for cell in card.cells.iter_mut() {
+                        cell.expanded = false;
+                    }
+                }
+                self.dirty = true;
                 return;
             }
             (KeyCode::Enter, m) if !m.contains(KeyModifiers::ALT) => {
@@ -316,12 +520,15 @@ impl AppState {
                     self.input_history.push(content.clone());
                     self.history_cursor = self.input_history.len();
                     self.textarea = TextArea::default();
-                    self.textarea
-                        .set_placeholder_text("type a message or /command…");
-                    self.transcript.push(format!("> {content}"));
+                    self.textarea.set_placeholder_text("what are we building?");
                     if let Some(cmd) = SlashCommand::parse(&content) {
                         self.handle_slash(cmd);
                     } else {
+                        // Push the user's card immediately — the card
+                        // appears before the model even sees the turn.
+                        let user_turn_id = format!("user_{}", self.committed_turns);
+                        self.cards
+                            .push(TurnCard::user(user_turn_id, content.clone()));
                         self.pending_user_text = Some(content);
                     }
                     self.dirty = true;
@@ -336,8 +543,7 @@ impl AppState {
                 self.history_cursor -= 1;
                 let prev = self.input_history[self.history_cursor].clone();
                 self.textarea = TextArea::from(prev.lines().map(String::from).collect::<Vec<_>>());
-                self.textarea
-                    .set_placeholder_text("type a message or /command…");
+                self.textarea.set_placeholder_text("what are we building?");
                 self.dirty = true;
                 return;
             }
@@ -354,8 +560,7 @@ impl AppState {
                 } else {
                     self.textarea = TextArea::default();
                 }
-                self.textarea
-                    .set_placeholder_text("type a message or /command…");
+                self.textarea.set_placeholder_text("what are we building?");
                 self.dirty = true;
                 return;
             }
@@ -438,12 +643,24 @@ impl AppState {
     pub fn handle_session_event(&mut self, ev: SessionEvent) {
         match ev {
             SessionEvent::ContractAccepted { contract, .. } => {
-                self.transcript
-                    .push(format!("  [contract accepted] {}", contract.goal));
+                let goal = contract.goal.clone();
+                self.inspector_data.contract_goal = Some(goal.clone());
+                let budget = contract
+                    .effect_budget
+                    .max_apply_local
+                    .saturating_add(contract.effect_budget.max_apply_repo);
+                self.inspector_data.contract_budget = Some((0, budget));
+                self.notes
+                    .push(Note::info(format!("contract accepted · {goal}")));
                 self.current_contract_id = Some(contract.id);
             }
-            // Suppress noisy lifecycle events — they go to .azoth/azoth.log
-            SessionEvent::TurnStarted { .. } | SessionEvent::ModelRequest { .. } => {}
+            SessionEvent::TurnStarted { turn_id, .. } => {
+                self.cards.push(TurnCard::agent(turn_id.to_string()));
+                self.whisper.set("thinking");
+            }
+            SessionEvent::ModelRequest { .. } => {
+                self.whisper.set("waiting for the model");
+            }
             SessionEvent::ContextPacket {
                 turn_id,
                 packet_id,
@@ -452,97 +669,195 @@ impl AppState {
                 self.last_context_summary = Some(format!(
                     "packet_id  {packet_id}\nturn_id    {turn_id}\ndigest     {packet_digest}"
                 ));
+                let digest_short: String = packet_digest.chars().take(18).collect();
+                self.inspector_data.packet_digest = Some(digest_short);
+                self.inspector_data.turn_id = Some(turn_id.to_string());
             }
-            SessionEvent::ContentBlock { block, .. } => match block {
-                ContentBlock::Text { text } => {
-                    // Model text — the main content the user wants to read.
-                    for line in text.lines() {
-                        self.transcript.push(format!("  {line}"));
+            SessionEvent::ContentBlock { turn_id, block, .. } => {
+                let tid = turn_id.to_string();
+                match block {
+                    ContentBlock::Text { text } => {
+                        if let Some(card) = self.card_by_turn_id_mut(&tid) {
+                            card.append_prose(&text);
+                        }
+                        self.whisper.clear();
                     }
-                }
-                ContentBlock::ToolUse { name, input, .. } => {
-                    let summary = input
-                        .get("command")
-                        .or_else(|| input.get("path"))
-                        .or_else(|| input.get("q"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("...");
-                    self.transcript.push(format!("  [{name}] {summary}"));
-                }
-                ContentBlock::ToolResult {
-                    is_error, content, ..
-                } => {
-                    if is_error {
-                        let msg = content
+                    ContentBlock::ToolUse {
+                        id, name, input, ..
+                    } => {
+                        let summary = input
+                            .get("command")
+                            .or_else(|| input.get("path"))
+                            .or_else(|| input.get("q"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("…")
+                            .to_string();
+                        let cell = ToolCell {
+                            tool_use_id: id.to_string(),
+                            name: name.clone(),
+                            summary: summary.clone(),
+                            expanded: false,
+                            result: CellResult::Pending,
+                            preview_lines: Vec::new(),
+                            full_lines: Vec::new(),
+                        };
+                        if let Some(card) = self.card_by_turn_id_mut(&tid) {
+                            card.add_cell(cell);
+                        }
+                        let narration: String = summary.chars().take(40).collect();
+                        self.whisper.set(format!("running {name} · {narration}"));
+                    }
+                    ContentBlock::ToolResult {
+                        tool_use_id,
+                        is_error,
+                        content,
+                    } => {
+                        let preview_text = content
                             .first()
                             .and_then(|b| match b {
-                                ContentBlock::Text { text } => Some(text.as_str()),
+                                ContentBlock::Text { text } => Some(text.clone()),
                                 _ => None,
                             })
-                            .unwrap_or("error");
-                        self.transcript.push(format!("  [error] {msg}"));
+                            .unwrap_or_default();
+                        let tu_id = tool_use_id.to_string();
+                        if let Some(card) = self.card_by_turn_id_mut(&tid) {
+                            if let Some(cell) = card.cell_by_id_mut(&tu_id) {
+                                let mut preview: Vec<String> =
+                                    preview_text.lines().take(4).map(String::from).collect();
+                                let total_lines = preview_text.lines().count();
+                                if total_lines > 4 {
+                                    preview.push(format!("… +{} more lines", total_lines - 4));
+                                }
+                                let full: Vec<String> =
+                                    preview_text.lines().take(24).map(String::from).collect();
+                                cell.preview_lines = preview;
+                                cell.full_lines = full;
+                                cell.result = if is_error {
+                                    let msg: String = preview_text
+                                        .lines()
+                                        .next()
+                                        .unwrap_or("tool error")
+                                        .to_string();
+                                    CellResult::Err { message: msg }
+                                } else if total_lines > 0 {
+                                    CellResult::Ok {
+                                        count_hint: Some(format!("{total_lines} lines")),
+                                    }
+                                } else {
+                                    CellResult::Ok { count_hint: None }
+                                };
+                            }
+                        }
+                        self.whisper.clear();
+                    }
+                    ContentBlock::Thinking { .. } => {
+                        self.whisper.set("thinking");
                     }
                 }
-                ContentBlock::Thinking { .. } => {
-                    self.transcript.push("  [thinking...]".into());
-                }
-            },
+            }
             SessionEvent::EffectRecord { effect, .. } => {
                 if effect.error.is_some() {
-                    self.transcript.push(format!(
-                        "  [effect error] {} {:?}",
+                    self.notes.push(Note::error(format!(
+                        "effect error · {} · {:?}",
                         effect.tool_name, effect.error
-                    ));
+                    )));
                 }
             }
             SessionEvent::ToolResult {
+                turn_id,
                 tool_use_id,
                 is_error,
                 ..
             } => {
                 if is_error {
-                    self.transcript
-                        .push(format!("  [tool error] id={tool_use_id}"));
+                    let tid = turn_id.to_string();
+                    let tu = tool_use_id.to_string();
+                    if let Some(card) = self.card_by_turn_id_mut(&tid) {
+                        if let Some(cell) = card.cell_by_id_mut(&tu) {
+                            if matches!(cell.result, CellResult::Pending) {
+                                cell.result = CellResult::Err {
+                                    message: "tool error".to_string(),
+                                };
+                            }
+                        }
+                    }
                 }
             }
             SessionEvent::ApprovalGranted { scope, .. } => {
-                let scope_label = match &scope {
+                let label = match &scope {
                     ApprovalScope::Once => "once",
                     ApprovalScope::Session => "session",
                     ApprovalScope::ScopedPaths { .. } => "scoped-paths",
                 };
-                self.transcript.push(format!("  [approved {scope_label}]"));
+                self.notes.push(Note::info(format!("approval · {label}")));
             }
-            SessionEvent::TurnCommitted { usage, .. } => {
+            SessionEvent::TurnCommitted { turn_id, usage, .. } => {
                 self.last_input_tokens = usage.input_tokens;
                 if self.max_context_tokens > 0 {
                     self.ctx_pct = ((usage.input_tokens as u64 * 100)
                         / self.max_context_tokens as u64)
                         .min(100) as u8;
+                    if self.inspector_data.ctx_history.len() >= 24 {
+                        self.inspector_data.ctx_history.remove(0);
+                    }
+                    self.inspector_data.ctx_history.push(self.ctx_pct as u64);
+                    self.inspector_data.ctx_pct = self.ctx_pct;
                 }
-                self.transcript.push(format!(
-                    "  [done] {} in / {} out tokens",
-                    usage.input_tokens, usage.output_tokens
-                ));
+                let tid = turn_id.to_string();
+                let chip = UsageChip {
+                    input_tokens: usage.input_tokens,
+                    output_tokens: usage.output_tokens,
+                };
+                if let Some(card) = self.card_by_turn_id_mut(&tid) {
+                    card.state = CardState::Committed;
+                    card.usage = Some(chip);
+                }
                 self.committed_turns = self.committed_turns.saturating_add(1);
+                self.whisper.clear();
             }
-            SessionEvent::TurnAborted { reason, detail, .. } => {
-                let d = detail.unwrap_or_default();
-                self.transcript.push(format!("  [aborted] {reason:?}: {d}"));
+            SessionEvent::TurnAborted {
+                turn_id,
+                reason,
+                detail,
+                ..
+            } => {
+                let tid = turn_id.to_string();
+                let reason_str = format!("{reason:?}");
+                let detail_str = detail.unwrap_or_default();
+                if let Some(card) = self.card_by_turn_id_mut(&tid) {
+                    card.state = CardState::Aborted {
+                        reason: reason_str.clone(),
+                        detail: detail_str.clone(),
+                    };
+                }
+                self.notes.push(Note::warn(format!(
+                    "aborted · {reason_str}{}{}",
+                    if detail_str.is_empty() { "" } else { " · " },
+                    detail_str
+                )));
+                self.whisper.clear();
             }
-            SessionEvent::TurnInterrupted { reason, .. } => {
-                self.transcript.push(format!("  [interrupted] {reason:?}"));
+            SessionEvent::TurnInterrupted {
+                turn_id, reason, ..
+            } => {
+                let tid = turn_id.to_string();
+                let reason_str = format!("{reason:?}");
+                if let Some(card) = self.card_by_turn_id_mut(&tid) {
+                    card.state = CardState::Interrupted {
+                        reason: reason_str.clone(),
+                    };
+                }
+                self.notes
+                    .push(Note::info(format!("interrupted · {reason_str}")));
+                self.whisper.clear();
             }
-            // Suppress all other internal events (ApprovalRequest,
-            // ApprovalDenied, SandboxEntered, Checkpoint, ValidatorResult,
-            // RunStarted). They're in the JSONL + log file.
             _ => {}
         }
         self.dirty = true;
     }
 
     pub fn push_error(&mut self, msg: impl Into<String>) {
-        self.transcript.push(format!("! {}", msg.into()));
+        self.notes.push(Note::error(msg.into()));
         self.dirty = true;
     }
 }
@@ -1283,8 +1598,8 @@ pub async fn run_app(resume: Option<String>) -> io::Result<()> {
     state.status = profile_status;
     let banner = if resuming { "resumed" } else { "session" };
     state
-        .transcript
-        .push(format!("· {banner} {}", session_path.display()));
+        .notes
+        .push(Note::info(format!("{banner} · {}", session_path.display())));
     let mut ticker = tokio::time::interval(std::time::Duration::from_millis(200));
 
     loop {
@@ -1359,9 +1674,9 @@ mod tests {
         state.handle_slash(SlashCommand::Contract(None));
         assert!(state.take_pending_contract().is_none());
         assert!(state
-            .transcript
+            .notes
             .iter()
-            .any(|l| l.contains("usage: /contract")));
+            .any(|n| n.text.contains("usage: /contract")));
     }
 
     #[test]
@@ -1401,11 +1716,11 @@ mod tests {
         let mut state = AppState::new();
         state.last_context_summary = Some("packet_id  ctx_test\ndigest  sha256:ff".into());
         state.handle_slash(SlashCommand::Context);
-        assert!(state.transcript.iter().any(|l| l.contains("ctx_test")));
+        assert!(state.notes.iter().any(|n| n.text.contains("ctx_test")));
         assert!(!state
-            .transcript
+            .notes
             .iter()
-            .any(|l| l.contains("no packet compiled yet")));
+            .any(|n| n.text.contains("no packet compiled yet")));
     }
 
     #[test]
@@ -1413,9 +1728,9 @@ mod tests {
         let mut state = AppState::new();
         state.handle_slash(SlashCommand::Context);
         assert!(state
-            .transcript
+            .notes
             .iter()
-            .any(|l| l.contains("no packet compiled yet")));
+            .any(|n| n.text.contains("no packet compiled yet")));
     }
 
     #[test]
@@ -1424,7 +1739,7 @@ mod tests {
         state.handle_slash(SlashCommand::Approve(Some("fs_write".into())));
         let tool = state.take_pending_approve().expect("pending approve");
         assert_eq!(tool, "fs_write");
-        assert!(state.transcript.iter().any(|l| l.contains("fs_write")));
+        assert!(state.notes.iter().any(|n| n.text.contains("fs_write")));
     }
 
     #[test]
@@ -1433,8 +1748,176 @@ mod tests {
         state.handle_slash(SlashCommand::Approve(None));
         assert!(state.take_pending_approve().is_none());
         assert!(state
-            .transcript
+            .notes
             .iter()
-            .any(|l| l.contains("usage: /approve")));
+            .any(|n| n.text.contains("usage: /approve")));
+    }
+
+    #[test]
+    fn user_enter_appends_user_card() {
+        let mut state = AppState::new();
+        state.textarea = TextArea::from(vec!["hello world".to_string()]);
+        state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(state.cards.len(), 1);
+        assert_eq!(
+            state.cards[0].prose,
+            vec!["hello world".to_string()],
+            "user card prose matches input"
+        );
+        assert_eq!(
+            state.take_pending_user_text().as_deref(),
+            Some("hello world")
+        );
+    }
+
+    #[test]
+    fn ctrl_k_opens_palette() {
+        let mut state = AppState::new();
+        state.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
+        assert!(state.palette.open, "⌃K opens the palette");
+    }
+
+    #[test]
+    fn ctrl_1_toggles_rail() {
+        let mut state = AppState::new();
+        assert!(!state.rail_open);
+        state.handle_key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::CONTROL));
+        assert!(state.rail_open, "⌃1 opens rail");
+        state.handle_key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::CONTROL));
+        assert!(!state.rail_open, "⌃1 again closes rail");
+    }
+
+    #[test]
+    fn ctrl_2_toggles_inspector() {
+        let mut state = AppState::new();
+        assert!(!state.inspector_open);
+        state.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::CONTROL));
+        assert!(state.inspector_open);
+    }
+
+    #[test]
+    fn ctrl_backslash_toggles_focus() {
+        let mut state = AppState::new();
+        state.handle_key(KeyEvent::new(KeyCode::Char('\\'), KeyModifiers::CONTROL));
+        assert!(state.focus_mode);
+    }
+
+    #[test]
+    fn agent_card_materialised_by_turn_started() {
+        let mut state = AppState::new();
+        let turn_id = TurnId::new();
+        state.handle_session_event(SessionEvent::TurnStarted {
+            turn_id: turn_id.clone(),
+            run_id: RunId::new(),
+            parent_turn: None,
+            timestamp: "2026-04-19T00:00:00Z".into(),
+        });
+        assert_eq!(state.cards.len(), 1);
+        assert_eq!(state.cards[0].turn_id, turn_id.to_string());
+        assert!(state.whisper.is_narrating());
+    }
+
+    #[test]
+    fn tool_use_appends_cell_to_matching_card() {
+        let mut state = AppState::new();
+        let turn_id = TurnId::new();
+        state.handle_session_event(SessionEvent::TurnStarted {
+            turn_id: turn_id.clone(),
+            run_id: RunId::new(),
+            parent_turn: None,
+            timestamp: "2026-04-19T00:00:00Z".into(),
+        });
+        state.handle_session_event(SessionEvent::ContentBlock {
+            turn_id: turn_id.clone(),
+            index: 0,
+            block: ContentBlock::ToolUse {
+                id: azoth_core::schemas::ToolUseId::from("tu_1".to_string()),
+                name: "repo_search".to_string(),
+                input: serde_json::json!({"q": "refresh"}),
+                call_group: None,
+            },
+        });
+        assert_eq!(state.cards[0].cells.len(), 1);
+        assert_eq!(state.cards[0].cells[0].name, "repo_search");
+    }
+
+    #[test]
+    fn render_does_not_panic_on_zero_state() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = AppState::new();
+        terminal
+            .draw(|f| super::super::render::frame(f, &mut state))
+            .expect("zero-state render");
+    }
+
+    #[test]
+    fn render_does_not_panic_with_full_state() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let backend = TestBackend::new(140, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = AppState::new();
+        state.rail_open = true;
+        state.inspector_open = true;
+        state.ctx_pct = 45;
+        state.max_context_tokens = 100_000;
+        state.inspector_data.contract_goal = Some("fix token refresh".into());
+        state.inspector_data.ctx_pct = 45;
+        state.inspector_data.ctx_history = vec![12, 18, 23, 30, 45];
+
+        // User card + agent card with a pending tool cell.
+        state
+            .cards
+            .push(TurnCard::user("t0", "fix the token refresh bug"));
+        let mut agent = TurnCard::agent("t1");
+        agent.append_prose("investigating the refresh flow\nfound an off-by-one");
+        agent.add_cell(ToolCell {
+            tool_use_id: "tu1".into(),
+            name: "repo_search".into(),
+            summary: "refresh_token".into(),
+            expanded: false,
+            result: CellResult::Ok {
+                count_hint: Some("4 matches".into()),
+            },
+            preview_lines: vec!["src/auth/tokens.rs:42".into()],
+            full_lines: vec!["src/auth/tokens.rs:42".into()],
+        });
+        state.cards.push(agent);
+
+        state.notes.push(Note::info("session banner"));
+        state.whisper.set("thinking");
+        state.palette.open();
+        state.palette.push_char('s');
+        state.palette.push_char('h');
+
+        terminal
+            .draw(|f| super::super::render::frame(f, &mut state))
+            .expect("full-state render with rail + inspector + palette");
+    }
+
+    #[test]
+    fn render_survives_narrow_terminal_ascii_theme() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let backend = TestBackend::new(60, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = AppState::new();
+        state.theme = super::super::theme::Theme { unicode: false };
+        state.rail_open = true;
+        state.inspector_open = true; // should auto-hide < 100 cols
+        state.cards.push(TurnCard::user("t0", "hello"));
+        let mut agent = TurnCard::agent("t1");
+        agent.append_prose("hi");
+        agent.state = super::super::card::CardState::Aborted {
+            reason: "ValidatorFail".into(),
+            detail: "impact_tests".into(),
+        };
+        state.cards.push(agent);
+        terminal
+            .draw(|f| super::super::render::frame(f, &mut state))
+            .expect("narrow-terminal ASCII render");
     }
 }

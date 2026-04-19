@@ -3,10 +3,16 @@
 //! `AZOTH_PROFILE` (default: `ollama-qwen-anthropic`).
 
 pub mod app;
+pub mod card;
 pub mod config;
 pub mod input;
+pub mod inspector;
+pub mod palette;
+pub mod rail;
 pub mod render;
-pub mod widgets;
+pub mod sheet;
+pub mod theme;
+pub mod whisper;
 
 pub fn run(resume: Option<String>) -> std::io::Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()
