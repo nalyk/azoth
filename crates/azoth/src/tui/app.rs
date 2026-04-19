@@ -474,28 +474,35 @@ impl AppState {
             MouseEventKind::Down(MouseButton::Left) => {
                 let y = me.row as usize;
                 let x = me.column;
-                let target = self.click_map.get(y).and_then(|row| {
-                    row.iter()
-                        .find(|(r, _)| r.contains(&x))
-                        .map(|(_, t)| t.clone())
-                });
-                if let Some(t) = target {
-                    // Block canvas click-through while a modal is open
-                    // — clicks on the sheet/palette area must not also
-                    // toggle the underlying card cells. Sheet buttons
-                    // and palette open are explicit modal targets and
-                    // pass through; everything else is dropped.
-                    let modal_active = self.palette.open || self.pending_approval.is_some();
-                    let is_modal_target = matches!(
-                        t,
-                        ClickTarget::SheetApproveOnce
-                            | ClickTarget::SheetApproveSession
-                            | ClickTarget::SheetDeny
-                            | ClickTarget::PaletteOpen
-                    );
-                    if modal_active && !is_modal_target {
-                        return;
+                let modal_active = self.palette.open || self.pending_approval.is_some();
+                // Walk EVERY matching target on this row. A wide
+                // canvas-card range can match before a narrow sheet
+                // button range; the modal gate rejects the canvas hit
+                // but we keep scanning so the sheet button still
+                // fires. Earlier code returned on first reject and
+                // approve/deny clicks became no-ops when a card row
+                // sat behind the sheet area.
+                let mut chosen: Option<ClickTarget> = None;
+                if let Some(row) = self.click_map.get(y) {
+                    for (range, t) in row.iter() {
+                        if !range.contains(&x) {
+                            continue;
+                        }
+                        let is_modal_target = matches!(
+                            t,
+                            ClickTarget::SheetApproveOnce
+                                | ClickTarget::SheetApproveSession
+                                | ClickTarget::SheetDeny
+                                | ClickTarget::PaletteOpen
+                        );
+                        if modal_active && !is_modal_target {
+                            continue;
+                        }
+                        chosen = Some(t.clone());
+                        break;
                     }
+                }
+                if let Some(t) = chosen {
                     self.handle_click_target(t);
                     self.dirty = true;
                 }
@@ -714,20 +721,23 @@ impl AppState {
                         None => 0,
                     };
                     let next = order[next_idx];
-                    // Only the previously-focused cell needs unfocus +
-                    // collapse — earlier this swept all cards and all
-                    // cells on every Tab press, O(N+M) per keystroke.
-                    if let Some(prev_idx) = self.tab_cursor {
-                        if let Some(&(pci, pxi)) = order.get(prev_idx) {
-                            if let Some(prev_card) = self.cards.get_mut(pci) {
-                                prev_card.cell_focus = None;
-                                if let Some(prev_cell) = prev_card.cells.get_mut(pxi) {
-                                    prev_cell.expanded = false;
-                                }
+                    // Sweep every cell across every card so Tab
+                    // enforces "focused cell is the only one expanded"
+                    // even when the user previously mouse-expanded
+                    // others. The lighter "unfocus only previous"
+                    // version (round 6) leaked manual mouse-expansions
+                    // into keyboard navigation.
+                    let (ci, xi) = next;
+                    for (card_i, card) in self.cards.iter_mut().enumerate() {
+                        for (cell_i, cell) in card.cells.iter_mut().enumerate() {
+                            if card_i != ci || cell_i != xi {
+                                cell.expanded = false;
                             }
                         }
+                        if card_i != ci {
+                            card.cell_focus = None;
+                        }
                     }
-                    let (ci, xi) = next;
                     if let Some(card) = self.cards.get_mut(ci) {
                         if let Some(cell) = card.cells.get_mut(xi) {
                             cell.expanded = true;
@@ -2444,6 +2454,79 @@ mod tests {
         assert!(
             state.inspector_data.evidence_lanes.is_empty(),
             "prior-turn evidence must not bleed into the fresh turn"
+        );
+    }
+
+    #[test]
+    fn modal_active_falls_through_to_modal_target_on_overlap() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let mut state = AppState::new();
+        state.click_map.resize_with(20, Vec::new);
+        // Wide canvas range (would be rejected by modal gate) THEN
+        // narrow sheet button range on the same row. Earlier code
+        // returned on first reject; this asserts the loop keeps
+        // scanning and dispatches the sheet target.
+        state.click_map[7].push((0..u16::MAX, ClickTarget::ThoughtsToggle { card_idx: 0 }));
+        state.click_map[7].push((10..30, ClickTarget::SheetApproveOnce));
+        // Open palette so the canvas target is gated.
+        state.palette.open();
+        state.dirty = false;
+        state.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 15,
+            row: 7,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        });
+        // Sheet target should still fire — handle_click_target marks
+        // dirty as a side effect of the SheetApproveOnce branch.
+        // (The take_pending_approval inside that branch sees None
+        // because we never set pending_approval — but the dispatch
+        // path was reached, which is what we test.)
+        assert!(
+            state.dirty,
+            "modal-targeted hit should fire even when a wider canvas range matches first"
+        );
+    }
+
+    #[test]
+    fn tab_collapses_all_cells_to_enforce_focused_only_invariant() {
+        use azoth_core::schemas::ToolUseId;
+        let mut state = AppState::new();
+        for tid in ["t1", "t2"] {
+            state.handle_session_event(SessionEvent::TurnStarted {
+                turn_id: TurnId::from(tid.to_string()),
+                run_id: RunId::new(),
+                parent_turn: None,
+                timestamp: "2026-04-19T00:00:00Z".into(),
+            });
+            state.handle_session_event(SessionEvent::ContentBlock {
+                turn_id: TurnId::from(tid.to_string()),
+                index: 0,
+                block: ContentBlock::ToolUse {
+                    id: ToolUseId::from(format!("tu_{tid}")),
+                    name: "bash".into(),
+                    input: serde_json::json!({}),
+                    call_group: None,
+                },
+            });
+        }
+        // User mouse-expands BOTH cells (simulating two clicks).
+        for card in state.cards.iter_mut() {
+            for cell in card.cells.iter_mut() {
+                cell.expanded = true;
+            }
+        }
+        // Tab fires — must collapse all but the new focus.
+        state.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        let expanded_count: usize = state
+            .cards
+            .iter()
+            .flat_map(|c| c.cells.iter())
+            .filter(|c| c.expanded)
+            .count();
+        assert_eq!(
+            expanded_count, 1,
+            "Tab must enforce 'focused cell is the only one expanded' invariant"
         );
     }
 

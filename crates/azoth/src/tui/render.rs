@@ -204,26 +204,29 @@ fn render_canvas(
     let visible_height = area.height;
     let visible_h_usize = visible_height as usize;
 
-    // Pass 1 — estimate per-card heights from the cache. A card with
-    // `last_rendered_rows == 0` has never been painted; the explicit
-    // `never_rendered` check in pass 2 forces render regardless of
-    // estimate, so we use a small realistic default (most cards
-    // settle around 4-6 rows). A viewport-sized estimate would cause
-    // a visible scroll jump the moment the real (smaller) height
-    // landed.
+    // Pass 1 — estimate the total height by streaming cards through
+    // the same per-card height function. Earlier code collected into
+    // a Vec<usize> just to .sum() it, paying an N-sized allocation
+    // every frame; the helper closure below lets pass 2 read the
+    // same per-card estimate without re-materialising the Vec.
+    //
+    // Future scaling: this is O(visible cards) per frame. For sessions
+    // with >>10k cards a Fenwick/segment tree on `last_rendered_rows`
+    // would give O(log N) lookup. Defer until we see real workloads
+    // that hit the wall — until then the constant factors dominate
+    // and a Vec walk is faster than tree pointer-chasing.
     const UNRENDERED_HEIGHT_HINT: usize = 4;
-    let est_heights: Vec<usize> = visible_indices
+    fn est_h(rows: usize) -> usize {
+        if rows == 0 {
+            UNRENDERED_HEIGHT_HINT
+        } else {
+            rows
+        }
+    }
+    let est_total: usize = visible_indices
         .iter()
-        .map(|&i| {
-            let h = state.cards[i].last_rendered_rows;
-            if h == 0 {
-                UNRENDERED_HEIGHT_HINT
-            } else {
-                h
-            }
-        })
-        .collect();
-    let est_total: usize = est_heights.iter().sum();
+        .map(|&i| est_h(state.cards[i].last_rendered_rows))
+        .sum();
     let est_max_scroll = est_total.saturating_sub(visible_h_usize);
     let scroll_offset = state.scroll_offset as usize;
     let est_target_top = if state.scroll_locked {
@@ -244,9 +247,9 @@ fn render_canvas(
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut row_hints: Vec<Option<(usize, super::card::RowHint)>> = Vec::new();
     let mut cursor_y: usize = 0;
-    for (idx, &card_idx) in visible_indices.iter().enumerate() {
-        let est_h = est_heights[idx];
-        let card_y_end = cursor_y + est_h;
+    for &card_idx in visible_indices.iter() {
+        let est_h_val = est_h(state.cards[card_idx].last_rendered_rows);
+        let card_y_end = cursor_y + est_h_val;
         let intersects = card_y_end >= est_target_top && cursor_y <= est_target_bot;
         let never_rendered = state.cards[card_idx].last_rendered_rows == 0;
         if intersects || never_rendered {
@@ -257,11 +260,11 @@ fn render_canvas(
                 row_hints.push(hint.map(|h| (card_idx, h)));
             }
         } else {
-            for _ in 0..est_h {
+            for _ in 0..est_h_val {
                 lines.push(Line::from(""));
                 row_hints.push(None);
             }
-            cursor_y += est_h;
+            cursor_y += est_h_val;
         }
     }
 
@@ -302,9 +305,12 @@ fn render_canvas(
                 },
             };
             if absolute_y < state.click_map.len() {
-                // Card hits are full-row — any X on this Y triggers
-                // the cell/thoughts toggle.
-                state.click_map[absolute_y].push((0..u16::MAX, target));
+                // Card hits are constrained to the canvas X bounds —
+                // earlier `0..u16::MAX` leaked through rail/inspector
+                // panels on the same Y, toggling cards from clicks
+                // landing inside side drawers.
+                let x_range = area.x..(area.x + area.width);
+                state.click_map[absolute_y].push((x_range, target));
             }
         }
     }
