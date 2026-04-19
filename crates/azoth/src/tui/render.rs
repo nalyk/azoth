@@ -250,8 +250,14 @@ fn render_canvas(
     // without paying `render_rows` cost (which includes markdown
     // restyling, cell preview restyling, etc.). On long-running
     // sessions this turns O(N) per-frame work into O(rows on screen).
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    let mut row_hints: Vec<Option<(usize, super::card::RowHint)>> = Vec::new();
+    // Pre-size both vectors to the estimated total — `lines` and
+    // `row_hints` always grow in lockstep up to ~est_total, and
+    // incremental Vec growth here was the dominant alloc on long
+    // sessions. The visible-slice virtualisation that would drop
+    // O(N) entirely (no placeholder lines for off-screen cards) is
+    // a bigger refactor — flagged for a later round.
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(est_total);
+    let mut row_hints: Vec<Option<(usize, super::card::RowHint)>> = Vec::with_capacity(est_total);
     let mut cursor_y: usize = 0;
     for &card_idx in visible_indices.iter() {
         let est_h_val = est_h(state.cards[card_idx].last_rendered_rows);

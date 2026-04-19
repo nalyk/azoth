@@ -1007,10 +1007,18 @@ impl AppState {
                         // a 100k-line build log used to clone fully into
                         // `preview_text` before we even decided how much
                         // we needed.
-                        let preview_text: &str = match content.first() {
-                            Some(ContentBlock::Text { text }) => text.as_str(),
-                            _ => "",
-                        };
+                        // Find the FIRST text block — tools may emit a
+                        // mix of structured + text blocks. Earlier code
+                        // only checked content[0], so a tool returning
+                        // `[Image, Text { ... }]` would render the
+                        // preview as empty.
+                        let preview_text: &str = content
+                            .iter()
+                            .find_map(|b| match b {
+                                ContentBlock::Text { text } => Some(text.as_str()),
+                                _ => None,
+                            })
+                            .unwrap_or("");
                         let tu_id = tool_use_id.to_string();
                         if let Some(card) = self.card_by_turn_id_mut(&tid) {
                             if let Some(cell) = card.cell_by_id_mut(&tu_id) {
@@ -1023,6 +1031,11 @@ impl AppState {
                                 // or a giant log) cannot lock the UI
                                 // thread while we count.
                                 const MAX_LINES_SCANNED: usize = 10_000;
+                                // Per-line hard cap so a tool that emits
+                                // a single multi-megabyte line (a JSON
+                                // dump, a malformed log) doesn't clone
+                                // the whole thing into the cell cache.
+                                const MAX_LINE_BYTES: usize = 1024;
                                 let mut preview: Vec<String> = Vec::with_capacity(5);
                                 let mut full: Vec<String> = Vec::with_capacity(24);
                                 let mut total_lines: u32 = 0;
@@ -1033,15 +1046,38 @@ impl AppState {
                                         truncated = true;
                                         break;
                                     }
+                                    // Borrow-truncate the line ONCE per
+                                    // iteration — earlier code called
+                                    // `line.to_string()` up to three
+                                    // times per line in the dual-bucket
+                                    // fill.
+                                    let trimmed = if line.len() > MAX_LINE_BYTES {
+                                        // floor to a char boundary so
+                                        // slicing never panics on
+                                        // multi-byte content
+                                        let mut end = MAX_LINE_BYTES;
+                                        while end > 0 && !line.is_char_boundary(end) {
+                                            end -= 1;
+                                        }
+                                        &line[..end]
+                                    } else {
+                                        line
+                                    };
+                                    let owned = trimmed.to_string();
                                     if total_lines == 0 {
-                                        first_line = Some(line.to_string());
+                                        first_line = Some(owned.clone());
                                     }
                                     total_lines = total_lines.saturating_add(1);
-                                    if preview.len() < 4 {
-                                        preview.push(line.to_string());
-                                    }
-                                    if full.len() < 24 {
-                                        full.push(line.to_string());
+                                    let want_preview = preview.len() < 4;
+                                    let want_full = full.len() < 24;
+                                    match (want_preview, want_full) {
+                                        (true, true) => {
+                                            preview.push(owned.clone());
+                                            full.push(owned);
+                                        }
+                                        (true, false) => preview.push(owned),
+                                        (false, true) => full.push(owned),
+                                        (false, false) => {}
                                     }
                                 }
                                 if total_lines > 4 {

@@ -356,8 +356,14 @@ impl TurnCard {
         live_cursor_phase: bool,
         pulse_phase_a: bool,
     ) -> Vec<(Line<'static>, Option<RowHint>)> {
+        // Capacity hint from the prior render — `prose.lines().count()`
+        // would walk the entire body every frame. `last_rendered_rows`
+        // is exactly the count we observed last paint; .max(8) gives
+        // a sensible floor for never-rendered cards (the canvas's
+        // never_rendered branch forces a real render anyway, so the
+        // exact number doesn't matter — only the alloc count does).
         let mut out: Vec<(Line<'static>, Option<RowHint>)> =
-            Vec::with_capacity(self.prose.lines().count() + self.cells.len() * 4 + 6);
+            Vec::with_capacity(self.last_rendered_rows.max(8));
 
         let bar = self.bar_glyph(theme, pulse_phase_a);
         let bar_style = self.effective_bar_style();
