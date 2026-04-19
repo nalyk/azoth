@@ -30,6 +30,7 @@ pub fn render(
     req: &ApprovalRequestMsg,
     theme: &Theme,
     click_map: &mut [Vec<(std::ops::Range<u16>, ClickTarget)>],
+    body_scroll: u16,
 ) {
     if area.height < MIN_SHEET_CANVAS_HEIGHT || area.width < 50 {
         // Tiny terminal — render a single-line warning instead of a
@@ -95,7 +96,12 @@ pub fn render(
         .constraints([Constraint::Min(3), Constraint::Length(2)])
         .split(inner);
 
-    let body_para = Paragraph::new(body_lines).wrap(Wrap { trim: false });
+    // Apply caller-supplied vertical scroll so long approval
+    // summaries / diff previews can be inspected before granting.
+    // Closes codex R21 P1.
+    let body_para = Paragraph::new(body_lines)
+        .wrap(Wrap { trim: false })
+        .scroll((body_scroll, 0));
     f.render_widget(body_para, chunks[0]);
 
     // Buttons declared as data so labels, prefixes, and click targets
@@ -248,7 +254,7 @@ mod tests {
             let mut click_map: Vec<Vec<(std::ops::Range<u16>, ClickTarget)>> =
                 vec![Vec::new(); h as usize];
             terminal
-                .draw(|f| render(f, f.area(), &req, &theme, &mut click_map))
+                .draw(|f| render(f, f.area(), &req, &theme, &mut click_map, 0))
                 .expect("no panic on small terminal");
         }
     }
@@ -261,7 +267,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         let mut click_map: Vec<Vec<(std::ops::Range<u16>, ClickTarget)>> = vec![Vec::new(); 30];
         terminal
-            .draw(|f| render(f, f.area(), &req, &theme, &mut click_map))
+            .draw(|f| render(f, f.area(), &req, &theme, &mut click_map, 0))
             .unwrap();
         // Sheet must register the four button click targets on its
         // action row so mouse users can grant/deny without the keyboard.

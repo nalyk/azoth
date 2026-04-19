@@ -132,6 +132,11 @@ pub struct AppState {
     pending_user_text: Option<String>,
     pending_contract: Option<Contract>,
     pub pending_approval: Option<ApprovalRequestMsg>,
+    /// Scroll offset within the approval sheet body (rows from top).
+    /// Reset to 0 on each new pending_approval; advanced by scroll
+    /// wheel / arrow keys while a sheet is open. Closes codex R21
+    /// P1 (long approval summaries got silently clipped).
+    pub sheet_scroll_offset: u16,
     pub run_id: String,
     pub session_path: String,
     pub committed_turns: u32,
@@ -198,6 +203,7 @@ impl AppState {
             pending_user_text: None,
             pending_contract: None,
             pending_approval: None,
+            sheet_scroll_offset: 0,
             run_id: String::new(),
             session_path: String::new(),
             committed_turns: 0,
@@ -380,11 +386,27 @@ impl AppState {
                 ));
             }
             PaletteAction::JumpToTurn(idx) => {
-                let _ = idx; // rail jump — passive in this build, scroll remains manual
-                self.notes.push(Note::info(format!(
-                    "rail selected turn {} · scroll to navigate",
-                    idx + 1
-                )));
+                // Sum cached row counts for cards [0..idx) to find
+                // where the target card starts in the full transcript
+                // y-coord. Then set scroll_offset so that y lands at
+                // the top of the visible window. Closes codex R21 P2
+                // (jump N was previously a note-only no-op).
+                if idx < self.cards.len() {
+                    let prefix_y: usize = self.cards[..idx]
+                        .iter()
+                        .map(|c| c.last_rendered_rows.max(4))
+                        .sum();
+                    self.scroll_offset = u16::try_from(prefix_y).unwrap_or(u16::MAX);
+                    self.scroll_locked = true;
+                    self.notes
+                        .push(Note::info(format!("jumped to turn {}", idx + 1)));
+                } else {
+                    self.notes.push(Note::warn(format!(
+                        "jump · turn {} out of range (have {})",
+                        idx + 1,
+                        self.cards.len()
+                    )));
+                }
             }
             PaletteAction::UnknownSlash(name) => {
                 self.notes
@@ -458,14 +480,24 @@ impl AppState {
         use crossterm::event::{MouseButton, MouseEventKind};
         match me.kind {
             MouseEventKind::ScrollUp => {
-                self.scroll_offset = self.scroll_offset.saturating_add(3);
-                self.scroll_locked = true;
+                if self.pending_approval.is_some() {
+                    // Route wheel into sheet body when the modal is
+                    // active (codex R21 P1).
+                    self.sheet_scroll_offset = self.sheet_scroll_offset.saturating_sub(3);
+                } else {
+                    self.scroll_offset = self.scroll_offset.saturating_add(3);
+                    self.scroll_locked = true;
+                }
                 self.dirty = true;
             }
             MouseEventKind::ScrollDown => {
-                self.scroll_offset = self.scroll_offset.saturating_sub(3);
-                if self.scroll_offset == 0 {
-                    self.scroll_locked = false;
+                if self.pending_approval.is_some() {
+                    self.sheet_scroll_offset = self.sheet_scroll_offset.saturating_add(3);
+                } else {
+                    self.scroll_offset = self.scroll_offset.saturating_sub(3);
+                    if self.scroll_offset == 0 {
+                        self.scroll_locked = false;
+                    }
                 }
                 self.dirty = true;
             }
@@ -640,6 +672,21 @@ impl AppState {
                         let _ = req.responder.send(ApprovalResponse::Deny);
                         self.notes.push(Note::warn("approval · denied"));
                     }
+                }
+                // Sheet body scroll — long approval summaries used to
+                // be silently clipped (codex R21 P1). ↑/↓ + PgUp/PgDn
+                // adjust the offset within the sheet body.
+                (KeyCode::Up, _) => {
+                    self.sheet_scroll_offset = self.sheet_scroll_offset.saturating_sub(1);
+                }
+                (KeyCode::Down, _) => {
+                    self.sheet_scroll_offset = self.sheet_scroll_offset.saturating_add(1);
+                }
+                (KeyCode::PageUp, _) => {
+                    self.sheet_scroll_offset = self.sheet_scroll_offset.saturating_sub(5);
+                }
+                (KeyCode::PageDown, _) => {
+                    self.sheet_scroll_offset = self.sheet_scroll_offset.saturating_add(5);
                 }
                 _ => {}
             }
@@ -2090,6 +2137,7 @@ pub async fn run_app(resume: Option<String>) -> io::Result<()> {
             Some(req) = approval_req_rx.recv() => {
                 state.set_card_awaiting_approval(&req.turn_id);
                 state.pending_approval = Some(req);
+                state.sheet_scroll_offset = 0;
                 state.dirty = true;
             }
             Some(err) = error_rx.recv() => {

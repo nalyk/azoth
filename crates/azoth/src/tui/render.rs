@@ -119,7 +119,14 @@ pub fn frame(f: &mut Frame, state: &mut AppState) {
         palette::render(f, size, &state.palette, &theme, state.cards.len());
     }
     if let Some(req) = state.pending_approval.as_ref() {
-        sheet::render(f, canvas_area, req, &theme, &mut state.click_map);
+        sheet::render(
+            f,
+            canvas_area,
+            req,
+            &theme,
+            &mut state.click_map,
+            state.sheet_scroll_offset,
+        );
     }
 }
 
