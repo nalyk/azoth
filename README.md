@@ -2,7 +2,7 @@
   <img src="assets/logos/azoth-logo.svg" alt="azoth logo" width="120" height="120">
 </p>
 
-# azoth
+<h1 align="center">azoth</h1>
 
 <p align="center">
   <a href="https://github.com/nalyk/azoth/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/nalyk/azoth?include_prereleases&sort=semver&display_name=tag&label=release&color=blue"></a>
