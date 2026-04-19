@@ -544,6 +544,12 @@ impl AppState {
                         self.cards
                             .push(TurnCard::user(user_turn_id, content.clone()));
                         self.pending_user_text = Some(content);
+                        // Queued state — spinner appears in the
+                        // whisper row immediately so there's no silent
+                        // gap between keystroke and the first
+                        // SessionEvent from the worker. TurnStarted
+                        // overrides this to "thinking".
+                        self.whisper.set("queued · waiting for the worker");
                     }
                     self.dirty = true;
                 }
