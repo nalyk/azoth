@@ -237,13 +237,44 @@ impl AppState {
         }
     }
 
-    /// True when something on the canvas is currently animating —
-    /// pulse on a Live/AwaitingApproval bar, cursor blink, sweep on
-    /// a pending tool cell, or the whisper-row spinner. The tick
-    /// handler uses this to mark `dirty = true` only when redraw
-    /// would be visible; idle sessions pay zero per-tick redraws.
+    /// True when something on the canvas is currently animating or
+    /// transitioning under a time window — live/awaiting bar pulse,
+    /// cursor blink, pending-cell sweep, whisper spinner, recent
+    /// note that needs to fade out at the 5s mark, post-commit
+    /// bloom decay (~600ms), or post-append shimmer decay (~400ms).
+    /// The tick handler uses this to mark `dirty = true` only when
+    /// a redraw would be visible; idle sessions still pay zero
+    /// per-tick redraws.
+    ///
+    /// Earlier code only checked `is_live() || is_narrating()` — so
+    /// notes stayed visually stuck past the 5s window until input
+    /// arrived, and the bloom decay on a Committed bar froze on
+    /// the first frame after commit.
     fn has_active_animation(&self) -> bool {
-        self.cards.iter().any(|c| c.is_live()) || self.whisper.is_narrating()
+        if self.cards.iter().any(|c| c.is_live()) || self.whisper.is_narrating() {
+            return true;
+        }
+        // Note fade window — Whisper.render_line shows latest_note
+        // when its `.at.elapsed() < 5s`. Match that threshold so the
+        // last frame of a fading note actually paints.
+        const NOTE_TTL_SECS: f32 = 5.0;
+        if let Some(latest) = self.notes.last() {
+            if latest.at.elapsed().as_secs_f32() < NOTE_TTL_SECS {
+                return true;
+            }
+        }
+        // Commit-bloom decay window — see `motion::bloom_phase`.
+        const BLOOM_MS: u128 = 600;
+        // Streaming-shimmer decay window — see `motion::shimmer_chars`.
+        const SHIMMER_MS: u128 = 400;
+        self.cards.iter().any(|c| {
+            c.committed_at
+                .map(|t| t.elapsed().as_millis() < BLOOM_MS)
+                .unwrap_or(false)
+                || c.last_append
+                    .map(|t| t.elapsed().as_millis() < SHIMMER_MS)
+                    .unwrap_or(false)
+        })
     }
 
     /// Take the pending approval request and roll any `AwaitingApproval`

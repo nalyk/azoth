@@ -107,6 +107,11 @@ impl Theme {
     /// Turn arrow separators in the inspector/evidence.
     pub const BULLET: GlyphPair = GlyphPair::new("▎", "|");
 
+    /// Selection chevron — used in the palette result list to mark the
+    /// active row. Routed through Theme so the ASCII fallback path
+    /// (LC_ALL=C / non-UTF-8 terminals) gets `>` instead of mojibake.
+    pub const CHEVRON: GlyphPair = GlyphPair::new("▸", ">");
+
     // --- Style helpers ---
 
     pub fn ink(&self, color: Color) -> Style {

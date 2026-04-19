@@ -314,7 +314,11 @@ pub fn render(f: &mut Frame, area: Rect, state: &PaletteState, theme: &Theme, tu
         .enumerate()
         .map(|(i, e)| {
             let selected = i == state.selected;
-            let marker = if selected { "▸ " } else { "  " };
+            let marker: String = if selected {
+                format!("{} ", theme.glyph(Theme::CHEVRON))
+            } else {
+                "  ".to_string()
+            };
             let marker_style = if selected {
                 theme.accent().add_modifier(Modifier::BOLD)
             } else {
@@ -333,7 +337,7 @@ pub fn render(f: &mut Frame, area: Rect, state: &PaletteState, theme: &Theme, tu
                 format!("     {}", e.hint)
             };
             Line::from(vec![
-                Span::styled(marker.to_string(), marker_style),
+                Span::styled(marker, marker_style),
                 Span::styled(e.label.to_string(), label_style),
                 Span::styled(hint, theme.dim()),
             ])
