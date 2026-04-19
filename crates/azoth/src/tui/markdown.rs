@@ -480,30 +480,16 @@ fn tint_code(line: &str, lang: &str, theme: &Theme) -> Vec<Span<'static>> {
     while i < bytes.len() {
         let b = bytes[i];
 
-        // Comments — language-dependent sniff.
-        let is_comment_start = match lang_l.as_str() {
-            "rust" | "rs" | "javascript" | "js" | "typescript" | "ts" | "tsx" | "jsx" => {
-                i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'/'
-            }
-            "python" | "py" | "bash" | "sh" | "shell" | "zsh" | "toml" => b == b'#',
-            _ => false,
-        };
-        if is_comment_start {
-            // `get(i..)` returns Option to make any future tokenizer
-            // change that lands `i` mid-codepoint degrade gracefully
-            // instead of panicking on slice. Today the loops only
-            // increment past ASCII boundaries (always char-aligned),
-            // so this is belt-and-suspenders.
-            let rest = line.get(i..).unwrap_or("");
-            spans.push(Span::styled(rest.to_string(), theme.italic_dim()));
-            return spans;
-        }
-
-        // String literal — double-quoted always; single-quoted in
-        // Python (str) + JS/TS (string) + Rust (char literal). Rust's
-        // char literal is one-codepoint-then-close, but the same
-        // backslash-aware loop handles it correctly because the close
-        // quote always lands within a few bytes.
+        // String literal — checked BEFORE comments so `//` or `#`
+        // inside a string ("http://example.com" / "tag #foo")
+        // doesn't get misread as comment start. Round-20 fix:
+        // earlier order let comment win and broke highlighting on
+        // every URL string in JS/TS/Rust code.
+        // Double-quoted always; single-quoted in Python (str) +
+        // JS/TS (string) + Rust (char literal). Rust's char literal
+        // is one-codepoint-then-close; the same backslash-aware
+        // loop handles it because the close quote lands within a
+        // few bytes.
         if b == b'"'
             || (b == b'\''
                 && matches!(
@@ -533,6 +519,25 @@ fn tint_code(line: &str, lang: &str, theme: &Theme) -> Vec<Span<'static>> {
                     .add_modifier(Modifier::ITALIC),
             ));
             continue;
+        }
+
+        // Comments — language-dependent sniff. Runs AFTER the string
+        // literal branch above so `"http://..."` or `"#tag"` inside a
+        // string literal isn't misread as a comment.
+        let is_comment_start = match lang_l.as_str() {
+            "rust" | "rs" | "javascript" | "js" | "typescript" | "ts" | "tsx" | "jsx" => {
+                i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'/'
+            }
+            "python" | "py" | "bash" | "sh" | "shell" | "zsh" | "toml" => b == b'#',
+            _ => false,
+        };
+        if is_comment_start {
+            // `get(i..)` returns Option so any future tokenizer
+            // change that lands `i` mid-codepoint degrades gracefully
+            // instead of panicking on slice.
+            let rest = line.get(i..).unwrap_or("");
+            spans.push(Span::styled(rest.to_string(), theme.italic_dim()));
+            return spans;
         }
 
         // Word — tokenise by simple ASCII-word boundary.
@@ -672,6 +677,44 @@ mod tests {
             .flat_map(|l| l.spans.iter())
             .any(|s| s.content.contains("•"));
         assert!(has_bullet);
+    }
+
+    #[test]
+    fn tint_code_does_not_misread_url_inside_string_as_comment() {
+        let theme = Theme { unicode: true };
+        // Round-20 fix: `"http://example.com"` would trigger the
+        // `//` comment branch and render the rest of the line as a
+        // dim italic comment, breaking the string highlight.
+        // Spans returned should include the FULL quoted literal.
+        let spans = tint_code(r#"let url = "http://example.com";"#, "rust", &theme);
+        let combined: String = spans
+            .iter()
+            .map(|s| s.content.as_ref().to_string())
+            .collect();
+        assert_eq!(combined, r#"let url = "http://example.com";"#);
+        // The double-quoted region must be one styled span (the
+        // string-literal branch consumes it whole).
+        assert!(
+            spans
+                .iter()
+                .any(|s| s.content.as_ref() == r#""http://example.com""#),
+            "string literal containing `//` must be one span, not split by comment branch"
+        );
+    }
+
+    #[test]
+    fn tint_code_does_not_misread_hash_inside_python_string_as_comment() {
+        let theme = Theme { unicode: true };
+        // Same shape for Python's `#` comment marker — `"tag #foo"`
+        // would otherwise consume the closing quote and `;` as a
+        // comment.
+        let spans = tint_code(r#"x = "tag #foo""#, "py", &theme);
+        let combined: String = spans
+            .iter()
+            .map(|s| s.content.as_ref().to_string())
+            .collect();
+        assert_eq!(combined, r#"x = "tag #foo""#);
+        assert!(spans.iter().any(|s| s.content.as_ref() == r#""tag #foo""#));
     }
 
     #[test]

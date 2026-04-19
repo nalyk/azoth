@@ -336,10 +336,11 @@ impl TurnCard {
         }
         let mut parts = text.split('\n');
         if let Some(first) = parts.next() {
+            // `last_mut()` is guaranteed Some by the is_empty check
+            // above; the unwrap is unreachable in practice but keeps
+            // the borrow ergonomic.
             if let Some(last) = self.thoughts.last_mut() {
                 last.push_str(first);
-            } else {
-                self.thoughts.push(first.to_string());
             }
         }
         for line in parts {
@@ -533,7 +534,7 @@ impl TurnCard {
             // the abort fired). The abort signal now lives entirely in
             // the bar color + the explicit "aborted · <reason>" footer;
             // prose keeps its real styling so you can read it.
-            let tail_chars = match (self.state.clone(), self.last_append) {
+            let tail_chars = match (&self.state, self.last_append) {
                 (CardState::Live, Some(at)) => motion::shimmer_chars(at.elapsed().as_millis()),
                 _ => 0,
             };
@@ -643,6 +644,12 @@ impl TurnCard {
             let cell_line = Line::from(vec![
                 Span::styled(format!("   {focus_marker}{disclosure} "), theme.accent()),
                 Span::styled(format!("{prefix} "), theme.dim()),
+                // `cell.name.clone()` — same architectural constraint
+                // as the prose span clone (see render_rows comment
+                // ~line 530): `out: Vec<Line<'static>>` requires
+                // owned content; borrowing from `cell` ties the
+                // lifetime to &mut self and breaks the canvas
+                // aggregation in render_canvas.
                 Span::styled(cell.name.clone(), theme.bold()),
                 Span::styled(format!("  {}", truncate(&cell.summary, 56)), theme.dim()),
                 result_chip,
@@ -667,7 +674,7 @@ impl TurnCard {
             if let CellResult::Err { message } = &cell.result {
                 out.push((
                     Line::from(vec![
-                        Span::styled("     ".to_string(), theme.dim()),
+                        Span::styled("     ", theme.dim()),
                         Span::styled(
                             truncate(message, 80).into_owned(),
                             theme.ink(Palette::ABORT),
@@ -768,9 +775,9 @@ impl TurnCard {
         let first_prose = self.prose.lines().next().unwrap_or("…");
         let excerpt = truncate(first_prose, 18).to_string();
         Line::from(vec![
-            Span::styled(bar.to_string(), self.bar_style()),
+            Span::styled(bar, self.bar_style()),
             Span::raw(" "),
-            Span::styled(role.to_string(), theme.bold()),
+            Span::styled(role, theme.bold()),
             Span::raw(" "),
             Span::styled(excerpt, theme.dim()),
         ])
@@ -792,7 +799,7 @@ fn render_cell_preview_line(line: &str, theme: &Theme) -> Line<'static> {
     if let Some(rest) = trimmed.strip_prefix('+') {
         if !rest.starts_with('+') {
             return Line::from(vec![
-                Span::styled("     ".to_string(), theme.dim()),
+                Span::styled("     ", theme.dim()),
                 Span::styled(
                     line.to_string(),
                     Style::default()
@@ -805,7 +812,7 @@ fn render_cell_preview_line(line: &str, theme: &Theme) -> Line<'static> {
     if let Some(rest) = trimmed.strip_prefix('-') {
         if !rest.starts_with('-') {
             return Line::from(vec![
-                Span::styled("     ".to_string(), theme.dim()),
+                Span::styled("     ", theme.dim()),
                 Span::styled(
                     line.to_string(),
                     Style::default()
@@ -828,7 +835,7 @@ fn render_cell_preview_line(line: &str, theme: &Theme) -> Line<'static> {
             let first_idx = line.find(first).unwrap_or(0);
             let rest = &line[first_idx + first.len()..];
             return Line::from(vec![
-                Span::styled("     ".to_string(), theme.dim()),
+                Span::styled("     ", theme.dim()),
                 Span::styled(
                     first.to_string(),
                     Style::default()
