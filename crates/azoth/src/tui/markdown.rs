@@ -297,8 +297,11 @@ fn render_table(out: &mut Vec<Line<'static>>, t: &TableBuf, theme: &Theme) {
 
     let mut header_spans: Vec<Span<'static>> = vec![Span::raw("  ")];
     for (i, width) in widths.iter().enumerate().take(col_count) {
-        let cell = t.header.get(i).cloned().unwrap_or_default();
-        header_spans.push(Span::styled(pad_to(&cell, *width), header_style));
+        // Round-25 fix: pad_to takes &str — no need to clone the
+        // header String. Earlier `t.header.get(i).cloned()` allocated
+        // a fresh owned String per cell on every render.
+        let cell = t.header.get(i).map(|s| s.as_str()).unwrap_or("");
+        header_spans.push(Span::styled(pad_to(cell, *width), header_style));
         if i + 1 < col_count {
             header_spans.push(Span::styled(gap.clone(), theme.dim()));
         }

@@ -125,14 +125,20 @@ impl PaletteState {
 pub fn match_entries(query: &str, turn_count: usize) -> Vec<PaletteEntry> {
     let q = query.trim().trim_start_matches('/').to_lowercase();
 
-    let static_pool: Vec<PaletteEntry> = STATIC_ENTRIES
-        .iter()
-        .map(|(label, hint, builder)| PaletteEntry {
-            label,
-            hint,
-            action: builder(),
-        })
-        .collect();
+    // Round-25 fix: build PaletteEntry on demand from STATIC_ENTRIES
+    // rather than materialising a fresh `Vec<PaletteEntry>` on every
+    // call. The two consumers below (extend + filter_map.collect)
+    // each iterate STATIC_ENTRIES independently — same per-entry
+    // alloc cost, one less wrapping Vec allocation per call.
+    let static_iter = || {
+        STATIC_ENTRIES
+            .iter()
+            .map(|(label, hint, builder)| PaletteEntry {
+                label,
+                hint,
+                action: builder(),
+            })
+    };
 
     let mut pinned: Vec<PaletteEntry> = Vec::new();
 
@@ -192,11 +198,10 @@ pub fn match_entries(query: &str, turn_count: usize) -> Vec<PaletteEntry> {
     // fuzzy-matched statics fill below.
     let mut out = pinned;
     if q.is_empty() {
-        out.extend(static_pool);
+        out.extend(static_iter());
         return out;
     }
-    let mut scored: Vec<(i32, PaletteEntry)> = static_pool
-        .into_iter()
+    let mut scored: Vec<(i32, PaletteEntry)> = static_iter()
         .filter_map(|e| {
             let label_score = score(&q, e.label);
             let hint_score = score(&q, e.hint);
