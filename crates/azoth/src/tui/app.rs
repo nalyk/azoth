@@ -319,6 +319,11 @@ impl AppState {
                      partial output and finish."
                         .to_string(),
                 );
+                // Note added in round 14 to match the slash-handler
+                // behaviour — earlier the palette path silently queued
+                // the prompt with no user feedback, while /continue
+                // showed "continue requested". Now both paths agree.
+                self.notes.push(Note::info("continue requested"));
             }
             PaletteAction::DraftContract(Some(goal)) => {
                 let mut draft = azoth_core::contract::draft(goal.clone());
@@ -358,7 +363,25 @@ impl AppState {
     }
 
     fn handle_slash(&mut self, cmd: SlashCommand) {
+        // Delegate to `run_palette_action` for every variant that
+        // already has a palette equivalent — gemini round-14 MED
+        // flagged the duplication that had silently drifted
+        // (e.g. /continue used to show a note but the palette
+        // version didn't). Slash-only branches (Help, Status, the
+        // Resume `<id>` shortcut) stay inline.
         match cmd {
+            SlashCommand::Context => self.run_palette_action(PaletteAction::ShowContext),
+            SlashCommand::Contract(arg) => {
+                self.run_palette_action(PaletteAction::DraftContract(arg))
+            }
+            SlashCommand::Approve(arg) => self.run_palette_action(PaletteAction::Approve(arg)),
+            SlashCommand::Quit => self.run_palette_action(PaletteAction::Quit),
+            SlashCommand::Continue => self.run_palette_action(PaletteAction::Continue),
+            SlashCommand::Unknown(name) => {
+                self.run_palette_action(PaletteAction::UnknownSlash(name))
+            }
+            // Slash-only — these have no palette equivalent or take a
+            // CLI-specific argument the palette can't supply.
             SlashCommand::Help => {
                 self.notes.push(Note::help(
                     "press ⌃K for the palette · all commands live there",
@@ -379,71 +402,15 @@ impl AppState {
                         .unwrap_or_else(|| "none".to_string())
                 )));
             }
-            SlashCommand::Context => match &self.last_context_summary {
-                Some(summary) => {
-                    for line in summary.lines() {
-                        self.notes.push(Note::info(line.to_string()));
-                    }
-                }
-                None => {
-                    self.notes
-                        .push(Note::help("no packet compiled yet — send a message first"));
-                }
-            },
-            SlashCommand::Contract(rest) => match rest {
-                None => {
-                    self.notes.push(Note::help("usage: /contract <goal text>"));
-                }
-                Some(goal) => {
-                    let mut c = azoth_core::contract::draft(goal.clone());
-                    c.success_criteria.push(format!("delivers: {goal}"));
-                    self.notes
-                        .push(Note::info(format!("contract drafted: {goal}")));
-                    self.pending_contract = Some(c);
-                }
-            },
-            SlashCommand::Approve(arg) => match arg {
-                Some(tool_name) => {
-                    self.notes.push(Note::info(format!(
-                        "approve: queuing session-scoped pre-approval for {tool_name}"
-                    )));
-                    self.pending_approve = Some(tool_name);
-                }
-                None => {
-                    self.notes.push(Note::help("usage: /approve <tool_name>"));
-                }
-            },
-            SlashCommand::Quit => {
+            SlashCommand::Resume(Some(id)) => {
+                // Slash-only behaviour: print restart instruction +
+                // quit. The palette `Resume` variant just shows help.
+                self.notes.push(Note::info(format!(
+                    "/resume not supported at runtime — restart with: azoth resume {id}"
+                )));
                 self.should_quit = true;
             }
-            SlashCommand::Resume(arg) => match arg {
-                Some(id) => {
-                    self.notes.push(Note::info(format!(
-                        "/resume not supported at runtime — restart with: azoth resume {id}"
-                    )));
-                    self.should_quit = true;
-                }
-                None => {
-                    self.notes.push(Note::help("usage: /resume <run_id>"));
-                }
-            },
-            SlashCommand::Continue => {
-                // Sprint 7.5 preserved: queue a synthetic user prompt
-                // nudging the model to resume after a max_tokens
-                // truncation. The next turn starts with this nudge
-                // and the model's own conversation history still
-                // contains the partial output.
-                self.pending_user_text = Some(
-                    "Please continue from where you left off — pick up the \
-                     partial output and finish."
-                        .to_string(),
-                );
-                self.notes.push(Note::info("continue requested"));
-            }
-            SlashCommand::Unknown(name) => {
-                self.notes
-                    .push(Note::warn(format!("unknown command: /{name}")));
-            }
+            SlashCommand::Resume(None) => self.run_palette_action(PaletteAction::Resume),
         }
         self.dirty = true;
     }

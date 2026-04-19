@@ -166,12 +166,4 @@ fn render_section_header(f: &mut Frame, inner: Rect, y: u16, label: &str, theme:
     );
 }
 
-fn truncate(s: &str, limit: usize) -> String {
-    if s.chars().count() <= limit {
-        s.to_string()
-    } else {
-        let mut t: String = s.chars().take(limit.saturating_sub(1)).collect();
-        t.push('…');
-        t
-    }
-}
+use super::util::truncate;

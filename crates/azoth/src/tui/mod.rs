@@ -15,6 +15,7 @@ pub mod render;
 pub mod sheet;
 pub mod splash;
 pub mod theme;
+pub mod util;
 pub mod whisper;
 
 pub fn run(resume: Option<String>) -> std::io::Result<()> {

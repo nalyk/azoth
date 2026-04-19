@@ -414,12 +414,4 @@ fn render_composer(f: &mut Frame, area: Rect, state: &mut AppState, theme: &Them
     f.render_widget(&state.textarea, inner);
 }
 
-fn trunc(s: &str, limit: usize) -> String {
-    if s.chars().count() <= limit {
-        s.to_string()
-    } else {
-        let mut t: String = s.chars().take(limit.saturating_sub(1)).collect();
-        t.push('…');
-        t
-    }
-}
+use super::util::truncate as trunc;

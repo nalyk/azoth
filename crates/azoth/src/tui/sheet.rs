@@ -186,15 +186,7 @@ pub fn render(
     }
 }
 
-fn truncate_for_title(s: &str, limit: usize) -> String {
-    if s.chars().count() <= limit {
-        s.to_string()
-    } else {
-        let mut t: String = s.chars().take(limit.saturating_sub(1)).collect();
-        t.push('…');
-        t
-    }
-}
+use super::util::truncate as truncate_for_title;
 
 fn effect_preview(req: &ApprovalRequestMsg) -> Vec<Line<'static>> {
     let mut out = Vec::new();
