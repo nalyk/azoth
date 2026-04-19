@@ -4,7 +4,7 @@
 //! arithmetic. Zero allocations per frame; the caller picks a glyph
 //! from a static table based on `elapsed_ms`.
 
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::Span;
 
 use super::theme::{Palette, Theme};
@@ -131,7 +131,7 @@ pub fn bloom_bar_style(intensity: f32) -> Style {
             .fg(Palette::ACCENT)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::Indexed(73)) // slightly muted accent
+        Style::default().fg(Palette::SHIMMER_TAIL)
     }
 }
 

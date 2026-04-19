@@ -17,7 +17,7 @@
 //! - Paragraphs separated by blank lines.
 
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use super::theme::{Palette, Theme};
@@ -219,7 +219,7 @@ pub fn render(md: &str, theme: &Theme) -> Vec<Line<'static>> {
                     current_spans.push(Span::styled(
                         text.to_string(),
                         top.fg(Palette::ACCENT)
-                            .bg(Color::Indexed(236))
+                            .bg(Palette::CODE_BG)
                             .add_modifier(Modifier::BOLD),
                     ));
                 }
@@ -555,7 +555,7 @@ fn tint_code(line: &str, lang: &str, theme: &Theme) -> Vec<Span<'static>> {
             spans.push(Span::styled(
                 literal,
                 Style::default()
-                    .fg(Color::Indexed(186)) // soft gold
+                    .fg(Palette::SYNTAX_STRING)
                     .add_modifier(Modifier::ITALIC),
             ));
             continue;
@@ -611,7 +611,7 @@ fn tint_code(line: &str, lang: &str, theme: &Theme) -> Vec<Span<'static>> {
             let number = line.get(start..i).unwrap_or("").to_string();
             spans.push(Span::styled(
                 number,
-                Style::default().fg(Color::Indexed(179)),
+                Style::default().fg(Palette::SYNTAX_NUMBER),
             ));
             continue;
         }

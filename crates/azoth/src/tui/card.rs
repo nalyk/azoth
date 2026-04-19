@@ -8,7 +8,7 @@
 
 use std::time::{Instant, SystemTime};
 
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use super::markdown;
@@ -516,6 +516,24 @@ impl TurnCard {
         // a sensible floor for never-rendered cards (the canvas's
         // never_rendered branch forces a real render anyway, so the
         // exact number doesn't matter — only the alloc count does).
+        //
+        // R27 deferred — codex P2 render.rs:317 (within-card virtualisation):
+        // when a card's emitted rows exceed the remaining viewport,
+        // the overflow is wasted work (ratatui `scroll + Paragraph`
+        // crops it out). A proper fix requires lazy emission — taking
+        // `(max_rows, &mut out, return full_logical_height)` — and a
+        // rewrite of every `out.push` path inside this method (there
+        // are ~30, across header / thoughts / prose / cells / footer
+        // branches). The cache layer from R27 Phase 2 already clamps
+        // the dominant cost (per-line `format!` + branch logic) so
+        // the remaining overhead is Vec<Span> clones at ~50ns each,
+        // dominated by the FTS5 + markdown parse paths elsewhere.
+        // Prerequisite for a clean implementation: structure every
+        // section through a single `push_row!` macro with the bound
+        // check; until then the instrumentation cost exceeds the gain.
+        // Tracked for a dedicated round alongside the RefCell prose
+        // refactor (gemini HIGH card.rs:562) where the two changes
+        // can share the new emission shape.
         let mut out: Vec<(Line<'static>, Option<RowHint>)> =
             Vec::with_capacity(self.last_rendered_rows.max(8));
 
@@ -991,7 +1009,7 @@ fn render_cell_preview_line(line: &str, theme: &Theme) -> Line<'static> {
                 Span::styled(
                     line.to_string(),
                     Style::default()
-                        .fg(Color::Indexed(108))
+                        .fg(Palette::DIFF_ADD)
                         .add_modifier(Modifier::BOLD),
                 ),
             ]);
@@ -1004,7 +1022,7 @@ fn render_cell_preview_line(line: &str, theme: &Theme) -> Line<'static> {
                 Span::styled(
                     line.to_string(),
                     Style::default()
-                        .fg(Color::Indexed(167))
+                        .fg(Palette::DIFF_DEL)
                         .add_modifier(Modifier::BOLD),
                 ),
             ]);

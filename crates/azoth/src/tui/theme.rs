@@ -27,6 +27,35 @@ impl Palette {
     pub const INK_2: Color = Color::Indexed(244);
     pub const INK_3: Color = Color::Indexed(240); // dim metadata
     pub const INK_4: Color = Color::Indexed(237); // hairlines
+
+    // ----------------------------------------------------------------
+    // R27 semantic entries (gemini MED theme.rs:29). The values below
+    // were previously hardcoded as `Color::Indexed(N)` scattered across
+    // markdown / motion / card. Routing them through `Palette` makes
+    // them retint-able in one place, discoverable via autocomplete,
+    // and testable against future theme variants (ASCII-only,
+    // high-contrast, dark/light).
+    // ----------------------------------------------------------------
+
+    /// Inline-code background — a shade below the dim-metadata ink so
+    /// inline `code` reads as a subtle chip against normal prose.
+    pub const CODE_BG: Color = Color::Indexed(236);
+    /// String-literal tint in `tint_code` — soft gold. Quoted
+    /// literals sit above numeric ones in visual weight because
+    /// strings usually carry meaning a reader wants to scan for.
+    pub const SYNTAX_STRING: Color = Color::Indexed(186);
+    /// Numeric-literal tint in `tint_code` — muted yellow, one step
+    /// darker than strings so numbers read as data without stealing
+    /// the eye from identifier flow.
+    pub const SYNTAX_NUMBER: Color = Color::Indexed(179);
+    /// Diff `+ added` line tint — muted green.
+    pub const DIFF_ADD: Color = Color::Indexed(108);
+    /// Diff `- removed` line tint — muted red.
+    pub const DIFF_DEL: Color = Color::Indexed(167);
+    /// Streaming-shimmer tail — slightly muted accent. Sits just
+    /// below `ACCENT` in saturation so the shimmer reads as a
+    /// *trailing* effect, not a bar-equivalent state.
+    pub const SHIMMER_TAIL: Color = Color::Indexed(73);
 }
 
 /// A pair of glyphs — Unicode primary, ASCII fallback.
