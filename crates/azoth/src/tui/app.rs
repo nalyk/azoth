@@ -152,6 +152,12 @@ pub struct AppState {
     /// ToolUse handlers). Replaces an O(N+M) walk-allocate-collect on
     /// every Tab keystroke.
     tab_order_cache: Option<Vec<(usize, usize)>>,
+    /// Index into `tab_order_cache` for the currently-focused cell.
+    /// `None` after every cache invalidation; reseeded on first Tab
+    /// from `card.cell_focus` via one O(N) scan, then O(1) advances
+    /// (`(idx + 1) % len`) for every subsequent Tab. Earlier the Tab
+    /// handler called `order.iter().position()` on every keystroke.
+    tab_cursor: Option<usize>,
 }
 
 impl AppState {
@@ -203,6 +209,7 @@ impl AppState {
             scroll_offset: 0,
             scroll_locked: false,
             tab_order_cache: None,
+            tab_cursor: None,
         }
     }
 
@@ -660,30 +667,40 @@ impl AppState {
                         .flat_map(|(ci, card)| (0..card.cells.len()).rev().map(move |xi| (ci, xi)))
                         .collect();
                     self.tab_order_cache = Some(order);
+                    self.tab_cursor = None;
                 }
                 let order = self.tab_order_cache.as_ref().unwrap();
                 if !order.is_empty() {
-                    // Focus is almost always on a recent card — search
-                    // from newest first so long sessions don't pay an
-                    // O(N) scan for what's typically the first result.
-                    let current = self
-                        .cards
-                        .iter()
-                        .enumerate()
-                        .rev()
-                        .find_map(|(ci, c)| c.cell_focus.map(|xi| (ci, xi)));
-                    let next = match current.and_then(|p| order.iter().position(|&q| q == p)) {
-                        Some(i) if i + 1 < order.len() => order[i + 1],
-                        _ => order[0],
+                    // Cursor is reseeded once after each cache rebuild
+                    // by scanning `cell_focus` from the newest card —
+                    // recent cards win. Subsequent Tabs read from the
+                    // cursor and advance with `(idx + 1) % len`, O(1).
+                    if self.tab_cursor.is_none() {
+                        if let Some(prev) = self
+                            .cards
+                            .iter()
+                            .enumerate()
+                            .rev()
+                            .find_map(|(ci, c)| c.cell_focus.map(|xi| (ci, xi)))
+                        {
+                            self.tab_cursor = order.iter().position(|&q| q == prev);
+                        }
+                    }
+                    let next_idx = match self.tab_cursor {
+                        Some(i) => (i + 1) % order.len(),
+                        None => 0,
                     };
+                    let next = order[next_idx];
                     // Only the previously-focused cell needs unfocus +
                     // collapse — earlier this swept all cards and all
                     // cells on every Tab press, O(N+M) per keystroke.
-                    if let Some((pci, pxi)) = current {
-                        if let Some(prev_card) = self.cards.get_mut(pci) {
-                            prev_card.cell_focus = None;
-                            if let Some(prev_cell) = prev_card.cells.get_mut(pxi) {
-                                prev_cell.expanded = false;
+                    if let Some(prev_idx) = self.tab_cursor {
+                        if let Some(&(pci, pxi)) = order.get(prev_idx) {
+                            if let Some(prev_card) = self.cards.get_mut(pci) {
+                                prev_card.cell_focus = None;
+                                if let Some(prev_cell) = prev_card.cells.get_mut(pxi) {
+                                    prev_cell.expanded = false;
+                                }
                             }
                         }
                     }
@@ -694,6 +711,7 @@ impl AppState {
                         }
                         card.cell_focus = Some(xi);
                     }
+                    self.tab_cursor = Some(next_idx);
                     self.dirty = true;
                     return;
                 }
@@ -746,6 +764,7 @@ impl AppState {
                         self.cards
                             .push(TurnCard::user(user_turn_id, content.clone()));
                         self.tab_order_cache = None;
+                        self.tab_cursor = None;
                         self.pending_user_text = Some(content);
                         // Queued state — spinner appears in the
                         // whisper row immediately so there's no silent
@@ -880,6 +899,7 @@ impl AppState {
             SessionEvent::TurnStarted { turn_id, .. } => {
                 self.cards.push(TurnCard::agent(turn_id.to_string()));
                 self.tab_order_cache = None;
+                self.tab_cursor = None;
                 self.whisper.set("thinking");
                 // Evidence lanes are per-turn — flush so the inspector
                 // shows what *this* turn retrieved, not the prior one's
@@ -936,6 +956,7 @@ impl AppState {
                         if let Some(card) = self.card_by_turn_id_mut(&tid) {
                             card.add_cell(cell);
                             self.tab_order_cache = None;
+                            self.tab_cursor = None;
                         }
                         let narration: String = summary.chars().take(40).collect();
                         self.whisper.set(format!("running {name} · {narration}"));
@@ -2397,6 +2418,40 @@ mod tests {
             state.inspector_data.evidence_lanes.is_empty(),
             "prior-turn evidence must not bleed into the fresh turn"
         );
+    }
+
+    #[test]
+    fn tab_cursor_advances_in_o1_after_first_seed() {
+        use azoth_core::schemas::ToolUseId;
+        let mut state = AppState::new();
+        for tid in ["t1", "t2", "t3"] {
+            state.handle_session_event(SessionEvent::TurnStarted {
+                turn_id: TurnId::from(tid.to_string()),
+                run_id: RunId::new(),
+                parent_turn: None,
+                timestamp: "2026-04-19T00:00:00Z".into(),
+            });
+            for cell in ["a", "b"] {
+                state.handle_session_event(SessionEvent::ContentBlock {
+                    turn_id: TurnId::from(tid.to_string()),
+                    index: 0,
+                    block: ContentBlock::ToolUse {
+                        id: ToolUseId::from(format!("tu_{tid}_{cell}")),
+                        name: "bash".into(),
+                        input: serde_json::json!({}),
+                        call_group: None,
+                    },
+                });
+            }
+        }
+        let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+        let mut visited: Vec<usize> = Vec::new();
+        for _ in 0..7 {
+            state.handle_key(tab);
+            visited.push(state.tab_cursor.expect("cursor populated after Tab"));
+        }
+        // 6 cells total → expect 0,1,2,3,4,5,0 (wrap to start).
+        assert_eq!(visited, vec![0, 1, 2, 3, 4, 5, 0]);
     }
 
     #[test]

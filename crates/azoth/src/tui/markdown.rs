@@ -489,7 +489,12 @@ fn tint_code(line: &str, lang: &str, theme: &Theme) -> Vec<Span<'static>> {
             _ => false,
         };
         if is_comment_start {
-            let rest = &line[i..];
+            // `get(i..)` returns Option to make any future tokenizer
+            // change that lands `i` mid-codepoint degrade gracefully
+            // instead of panicking on slice. Today the loops only
+            // increment past ASCII boundaries (always char-aligned),
+            // so this is belt-and-suspenders.
+            let rest = line.get(i..).unwrap_or("");
             spans.push(Span::styled(rest.to_string(), theme.italic_dim()));
             return spans;
         }
@@ -520,7 +525,7 @@ fn tint_code(line: &str, lang: &str, theme: &Theme) -> Vec<Span<'static>> {
                 }
                 i += 1;
             }
-            let literal: String = line[start..i].to_string();
+            let literal: String = line.get(start..i).unwrap_or("").to_string();
             spans.push(Span::styled(
                 literal,
                 Style::default()
@@ -536,7 +541,7 @@ fn tint_code(line: &str, lang: &str, theme: &Theme) -> Vec<Span<'static>> {
             while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
                 i += 1;
             }
-            let word = &line[start..i];
+            let word = line.get(start..i).unwrap_or("");
             if keywords.contains(&word) {
                 spans.push(Span::styled(
                     word.to_string(),
@@ -558,7 +563,7 @@ fn tint_code(line: &str, lang: &str, theme: &Theme) -> Vec<Span<'static>> {
             {
                 i += 1;
             }
-            let number = line[start..i].to_string();
+            let number = line.get(start..i).unwrap_or("").to_string();
             spans.push(Span::styled(
                 number,
                 Style::default().fg(Color::Indexed(179)),
@@ -582,7 +587,7 @@ fn tint_code(line: &str, lang: &str, theme: &Theme) -> Vec<Span<'static>> {
         {
             i += 1;
         }
-        let chunk = &line[start..i];
+        let chunk = line.get(start..i).unwrap_or("");
         spans.push(Span::styled(chunk.to_string(), theme.ink(Palette::INK_1)));
     }
     spans
