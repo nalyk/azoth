@@ -650,6 +650,17 @@ impl TurnCard {
                 // owned content; borrowing from `cell` ties the
                 // lifetime to &mut self and breaks the canvas
                 // aggregation in render_canvas.
+                //
+                // Round-22 follow-up: gemini suggested switching to
+                // `Arc<str>` for cached span content to make clones
+                // O(1) refcount bumps. Doesn't apply: `Span<'a>.content`
+                // is `Cow<'a, str>`, which has only Owned(String) and
+                // Borrowed(&str) variants. Wrapping an Arc<str> in
+                // `Cow::Borrowed(&*arc)` reintroduces the same
+                // borrow-checker conflict (lifetime ties to the Arc's
+                // location, which lives in `&state.cards[N]`).
+                // `Cow::Owned(arc.to_string())` would still allocate.
+                // No win.
                 Span::styled(cell.name.clone(), theme.bold()),
                 Span::styled(format!("  {}", truncate(&cell.summary, 56)), theme.dim()),
                 result_chip,

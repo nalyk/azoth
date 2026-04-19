@@ -287,8 +287,17 @@ fn render_canvas(
         let est_h_val = est_h(state.cards[card_idx].last_rendered_rows);
         let card_y_end = cursor_y + est_h_val;
         let intersects = card_y_end > est_target_top && cursor_y < est_target_bot;
-        let never_rendered = state.cards[card_idx].last_rendered_rows == 0;
-        if intersects || never_rendered {
+        // Round-22 HIGH: dropped the `|| never_rendered` force-render.
+        // On session resume every card has `last_rendered_rows == 0`,
+        // so the old code rendered every turn from first-visible to
+        // end of session in a single frame (lag/hang on startup).
+        // `intersects` already estimates with UNRENDERED_HEIGHT_HINT,
+        // so cards near the viewport still get painted; cards far
+        // above stay skipped until the user scrolls toward them.
+        // Trade-off: first-time scroll-up over old cards may feel
+        // jumpy as their actual heights paint in (the hint of 4 rows
+        // is usually less than reality).
+        if intersects {
             // Compute the local-skip if this is the FIRST intersecting
             // card AND its top sits above the viewport. After we
             // render it, scroll_pos becomes that local skip plus 0
@@ -302,12 +311,13 @@ fn render_canvas(
                 lines.push(line);
                 row_hints.push(hint.map(|h| (card_idx, h)));
             }
-            // Stop after we've rendered enough to fill the viewport.
-            // We render all cards that intersect, including ones that
-            // straddle the bottom — early-exit fires only when the
-            // NEXT card would be entirely below.
+            // Once we've filled the viewport, every subsequent card is
+            // entirely below est_target_bot — `break` instead of
+            // `continue` to skip the rest of the iteration. Round-22
+            // MED fix; previous `continue` walked the remaining cards
+            // (cheap but unnecessary on long sessions).
             if cursor_y >= est_target_bot {
-                continue;
+                break;
             }
         } else if cursor_y < est_target_top {
             // Above the viewport — accumulate and skip render.
