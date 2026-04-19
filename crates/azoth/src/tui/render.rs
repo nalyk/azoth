@@ -184,29 +184,78 @@ fn render_canvas(
         (0..state.cards.len()).collect()
     };
 
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    // Hint parallel with `lines` (same index). None on blank/prose lines.
-    let mut row_hints: Vec<Option<(usize, super::card::RowHint)>> = Vec::new();
+    let visible_height = area.height;
+    let visible_h_usize = visible_height as usize;
 
-    for &card_idx in &visible_indices {
-        lines.push(Line::from(""));
-        row_hints.push(None);
-        let rows = state.cards[card_idx].render_rows(theme, cursor_phase, bar_phase);
-        for (line, hint) in rows {
-            lines.push(line);
-            row_hints.push(hint.map(|h| (card_idx, h)));
+    // Pass 1 — estimate per-card heights from the cache. A card with
+    // `last_rendered_rows == 0` has never been painted; we MUST render
+    // it this pass to learn its actual height, otherwise the
+    // viewport-virtualisation skip below would hide it forever. Such
+    // cards get an estimate equal to the visible height so the
+    // subsequent in-viewport check forces a real render.
+    let est_heights: Vec<usize> = visible_indices
+        .iter()
+        .map(|&i| {
+            let h = state.cards[i].last_rendered_rows;
+            if h == 0 {
+                visible_h_usize.max(1)
+            } else {
+                h
+            }
+        })
+        .collect();
+    let est_total: usize = est_heights.iter().sum();
+    let est_max_scroll = est_total.saturating_sub(visible_h_usize);
+    let scroll_offset = state.scroll_offset as usize;
+    let est_target_top = if state.scroll_locked {
+        est_max_scroll.saturating_sub(scroll_offset)
+    } else {
+        state.scroll_offset = 0;
+        est_max_scroll
+    };
+    let est_target_bot = est_target_top + visible_h_usize;
+
+    // Pass 2 — for each card, render fully when it intersects the
+    // estimated viewport (or has never been painted). Cards entirely
+    // off-screen get blank-line placeholders matching their cached
+    // height so scroll math + click_map indices stay consistent
+    // without paying `render_rows` cost (which includes markdown
+    // restyling, cell preview restyling, etc.). On long-running
+    // sessions this turns O(N) per-frame work into O(rows on screen).
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut row_hints: Vec<Option<(usize, super::card::RowHint)>> = Vec::new();
+    let mut cursor_y: usize = 0;
+    for (idx, &card_idx) in visible_indices.iter().enumerate() {
+        let est_h = est_heights[idx];
+        let card_y_end = cursor_y + est_h;
+        let intersects = card_y_end >= est_target_top && cursor_y <= est_target_bot;
+        let never_rendered = state.cards[card_idx].last_rendered_rows == 0;
+        if intersects || never_rendered {
+            let rows = state.cards[card_idx].render_rows(theme, cursor_phase, bar_phase);
+            cursor_y += rows.len();
+            for (line, hint) in rows {
+                lines.push(line);
+                row_hints.push(hint.map(|h| (card_idx, h)));
+            }
+        } else {
+            for _ in 0..est_h {
+                lines.push(Line::from(""));
+                row_hints.push(None);
+            }
+            cursor_y += est_h;
         }
     }
 
+    // Recompute scroll from actual line count — estimates may be off
+    // by a few rows after a card streams new prose, and the actual
+    // total is what `Paragraph::scroll` consumes.
     let total = lines.len() as u16;
-    let visible_height = area.height;
     let max_scroll = total.saturating_sub(visible_height);
     let scroll_pos = if state.scroll_locked {
         max_scroll
             .saturating_sub(state.scroll_offset)
             .min(max_scroll)
     } else {
-        state.scroll_offset = 0;
         max_scroll
     };
 

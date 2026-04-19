@@ -227,6 +227,14 @@ pub struct TurnCard {
     pub last_append: Option<Instant>,
     pub contract_goal: Option<String>,
     pub cell_focus: Option<usize>,
+    /// Number of rows the card produced on its most-recent render.
+    /// `0` means "never rendered" — the canvas treats that as dirty
+    /// and forces a full render to learn the height. Used for the
+    /// viewport-virtualisation pass: cards entirely outside the
+    /// visible window get blank-line placeholders matching this
+    /// count, so off-screen cards skip `render_rows` entirely on
+    /// long sessions.
+    pub last_rendered_rows: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -263,6 +271,7 @@ impl TurnCard {
             last_append: None,
             contract_goal: None,
             cell_focus: None,
+            last_rendered_rows: 0,
         }
     }
     pub fn agent(turn_id: impl Into<String>) -> Self {
@@ -282,6 +291,7 @@ impl TurnCard {
             last_append: None,
             contract_goal: None,
             cell_focus: None,
+            last_rendered_rows: 0,
         }
     }
 
@@ -626,6 +636,9 @@ impl TurnCard {
         }
 
         out.push((Line::from(""), None));
+        // Record the actual row count for the canvas's viewport
+        // virtualisation pass — see `render_canvas`.
+        self.last_rendered_rows = out.len();
         out
     }
 
@@ -926,6 +939,21 @@ mod tests {
         assert!(
             !cached_after,
             "unicode flip must invalidate the markdown cache"
+        );
+    }
+
+    #[test]
+    fn render_rows_records_actual_row_count() {
+        let mut c = TurnCard::agent("t-rowcount");
+        c.append_prose("hi");
+        let theme = Theme { unicode: true };
+        assert_eq!(c.last_rendered_rows, 0, "fresh card has no cached count");
+        let lines = c.render_lines(&theme, true, true);
+        assert!(c.last_rendered_rows > 0);
+        assert_eq!(
+            c.last_rendered_rows,
+            lines.len(),
+            "cached count must match what the canvas will see"
         );
     }
 

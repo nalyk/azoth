@@ -221,6 +221,15 @@ impl AppState {
         }
     }
 
+    /// True when something on the canvas is currently animating —
+    /// pulse on a Live/AwaitingApproval bar, cursor blink, sweep on
+    /// a pending tool cell, or the whisper-row spinner. The tick
+    /// handler uses this to mark `dirty = true` only when redraw
+    /// would be visible; idle sessions pay zero per-tick redraws.
+    fn has_active_animation(&self) -> bool {
+        self.cards.iter().any(|c| c.is_live()) || self.whisper.is_narrating()
+    }
+
     /// Take the pending approval request and roll any `AwaitingApproval`
     /// card back to `Live`. Every grant/deny path goes through here so
     /// the amber accent never lingers after the sheet closes.
@@ -913,12 +922,22 @@ impl AppState {
                                 // Single streaming pass: take at most 4
                                 // preview + 24 full + count, never
                                 // materialising a `Vec<&str>` over the
-                                // whole output.
+                                // whole output. The walk is hard-capped
+                                // at MAX_LINES_SCANNED so a tool emitting
+                                // millions of lines (a runaway `find /`
+                                // or a giant log) cannot lock the UI
+                                // thread while we count.
+                                const MAX_LINES_SCANNED: usize = 10_000;
                                 let mut preview: Vec<String> = Vec::with_capacity(5);
                                 let mut full: Vec<String> = Vec::with_capacity(24);
                                 let mut total_lines: u32 = 0;
                                 let mut first_line: Option<String> = None;
-                                for line in preview_text.lines() {
+                                let mut truncated = false;
+                                for (i, line) in preview_text.lines().enumerate() {
+                                    if i >= MAX_LINES_SCANNED {
+                                        truncated = true;
+                                        break;
+                                    }
                                     if total_lines == 0 {
                                         first_line = Some(line.to_string());
                                     }
@@ -931,7 +950,12 @@ impl AppState {
                                     }
                                 }
                                 if total_lines > 4 {
-                                    preview.push(format!("… +{} more lines", total_lines - 4));
+                                    let suffix = if truncated { "+" } else { "" };
+                                    preview.push(format!(
+                                        "… +{}{} more lines",
+                                        total_lines - 4,
+                                        suffix
+                                    ));
                                 }
                                 cell.set_preview_lines(preview);
                                 cell.set_full_lines(full);
@@ -941,8 +965,9 @@ impl AppState {
                                             .unwrap_or_else(|| "tool error".to_string()),
                                     }
                                 } else if total_lines > 0 {
+                                    let suffix = if truncated { "+" } else { "" };
                                     CellResult::Ok {
-                                        count_hint: Some(format!("{total_lines} lines")),
+                                        count_hint: Some(format!("{total_lines}{suffix} lines")),
                                     }
                                 } else {
                                     CellResult::Ok { count_hint: None }
@@ -1855,7 +1880,11 @@ pub async fn run_app(resume: Option<String>) -> io::Result<()> {
     state
         .notes
         .push(Note::info(format!("{banner} · {}", session_path.display())));
-    let mut ticker = tokio::time::interval(std::time::Duration::from_millis(200));
+    // 50ms tick = 20fps, fast enough for the 80ms spinner cadence to
+    // land on a frame boundary without skipping. The handler below
+    // only marks dirty when an animation is actually running, so a
+    // truly idle session pays ~0 redraws regardless of tick rate.
+    let mut ticker = tokio::time::interval(std::time::Duration::from_millis(50));
 
     loop {
         tokio::select! {
@@ -1896,9 +1925,11 @@ pub async fn run_app(resume: Option<String>) -> io::Result<()> {
                 state.dirty = true;
             }
             _ = ticker.tick() => {
-                // Splashscreen animates via the tick — spinner needs
-                // re-render even when no channel is active.
-                if state.booting {
+                // Splash spinner OR any in-flight animation needs a
+                // re-render even when no channel is active. Idle
+                // session (all cards committed/aborted, whisper
+                // silent) pays nothing.
+                if state.booting || state.has_active_animation() {
                     state.dirty = true;
                 }
             }
@@ -2305,6 +2336,84 @@ mod tests {
             state.inspector_data.evidence_lanes.is_empty(),
             "prior-turn evidence must not bleed into the fresh turn"
         );
+    }
+
+    #[test]
+    fn tool_result_caps_scan_at_max_lines_to_keep_ui_responsive() {
+        let mut state = AppState::new();
+        let turn_id = TurnId::new();
+        state.handle_session_event(SessionEvent::TurnStarted {
+            turn_id: turn_id.clone(),
+            run_id: RunId::new(),
+            parent_turn: None,
+            timestamp: "2026-04-19T00:00:00Z".into(),
+        });
+        let tu = azoth_core::schemas::ToolUseId::from("tu_huge".to_string());
+        state.handle_session_event(SessionEvent::ContentBlock {
+            turn_id: turn_id.clone(),
+            index: 0,
+            block: ContentBlock::ToolUse {
+                id: tu.clone(),
+                name: "bash".to_string(),
+                input: serde_json::json!({"command": "find /"}),
+                call_group: None,
+            },
+        });
+        // 50k lines — well above the 10k scan cap.
+        let huge: String = (0..50_000)
+            .map(|i| format!("line_{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        state.handle_session_event(SessionEvent::ContentBlock {
+            turn_id,
+            index: 1,
+            block: ContentBlock::ToolResult {
+                tool_use_id: tu,
+                content: vec![ContentBlock::Text { text: huge }],
+                is_error: false,
+            },
+        });
+        let cell = &state.cards[0].cells[0];
+        // Scan capped at 10k → count_hint reflects the cap with `+`.
+        match &cell.result {
+            CellResult::Ok { count_hint } => {
+                let hint = count_hint.as_deref().unwrap_or("");
+                assert!(
+                    hint.ends_with("+ lines"),
+                    "count_hint should mark the truncation: {hint:?}"
+                );
+                assert!(
+                    hint.starts_with("10000"),
+                    "scan should cap at 10k: {hint:?}"
+                );
+            }
+            other => panic!("expected Ok with cap hint, got {other:?}"),
+        }
+        assert!(cell.preview_lines.last().unwrap().contains("+ more lines"));
+    }
+
+    #[test]
+    fn has_active_animation_reflects_live_cards_and_whisper() {
+        let mut state = AppState::new();
+        // Idle: zero cards, silent whisper → no animation needed.
+        assert!(!state.has_active_animation());
+        // Whisper alone activates animation (spinner needs redraw).
+        state.whisper.set("thinking");
+        assert!(state.has_active_animation());
+        state.whisper.clear();
+        assert!(!state.has_active_animation());
+        // A live agent card activates animation.
+        state.handle_session_event(SessionEvent::TurnStarted {
+            turn_id: TurnId::new(),
+            run_id: RunId::new(),
+            parent_turn: None,
+            timestamp: "2026-04-19T00:00:00Z".into(),
+        });
+        state.whisper.clear();
+        assert!(state.has_active_animation());
+        // Once committed, animation stops.
+        state.cards[0].state = super::super::card::CardState::Committed;
+        assert!(!state.has_active_animation());
     }
 
     #[test]
