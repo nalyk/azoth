@@ -130,6 +130,18 @@ impl Note {
     }
 }
 
+/// Cached markdown render of a card's prose. Invalidated when the
+/// prose revision bumps (any append) or when the theme's unicode flag
+/// flips (glyph fallbacks differ). Eliminates the per-frame
+/// `pulldown_cmark` re-parse, which was the dominant render cost on
+/// long agent cards.
+#[derive(Debug, Clone)]
+pub struct CachedProse {
+    revision: u64,
+    unicode: bool,
+    lines: Vec<Line<'static>>,
+}
+
 /// The card itself.
 #[derive(Debug, Clone)]
 pub struct TurnCard {
@@ -140,6 +152,12 @@ pub struct TurnCard {
     /// at paint time so inline bold/italic/code, fenced code islands,
     /// headings, and bullets become real typography.
     pub prose: Vec<String>,
+    /// Bumped on every `append_prose`. Drives `cached_prose` invalidation.
+    pub prose_revision: u64,
+    /// Cached markdown render of `prose`. None when never rendered or
+    /// when the previous render's `(revision, unicode)` no longer match
+    /// the current pair. Recomputed on demand inside `render_rows`.
+    pub cached_prose: Option<CachedProse>,
     /// Extended-thinking content (from Anthropic reasoning blocks).
     /// Rendered as a collapsible block above the prose. Hidden by
     /// default; `⇥` on the live card toggles.
@@ -181,6 +199,8 @@ impl TurnCard {
             role: CardRole::User,
             state: CardState::Committed,
             prose: text.into().lines().map(String::from).collect(),
+            prose_revision: 1,
+            cached_prose: None,
             thoughts: Vec::new(),
             thoughts_expanded: false,
             cells: Vec::new(),
@@ -198,6 +218,8 @@ impl TurnCard {
             role: CardRole::Agent,
             state: CardState::Live,
             prose: Vec::new(),
+            prose_revision: 0,
+            cached_prose: None,
             thoughts: Vec::new(),
             thoughts_expanded: false,
             cells: Vec::new(),
@@ -223,6 +245,8 @@ impl TurnCard {
             }
         }
         self.last_append = Some(Instant::now());
+        // Invalidate the markdown cache — next render recomputes.
+        self.prose_revision = self.prose_revision.wrapping_add(1);
     }
 
     pub fn append_thought(&mut self, text: &str) {
@@ -244,9 +268,11 @@ impl TurnCard {
     }
 
     /// Convenience wrapper — renders the card and drops click hints.
-    /// Kept for tests and simpler callers.
+    /// Kept for tests and simpler callers. Takes `&mut self` so the
+    /// markdown cache populated by `render_rows` survives across
+    /// frames; without that, every paint re-runs `pulldown_cmark`.
     pub fn render_lines(
-        &self,
+        &mut self,
         theme: &Theme,
         live_cursor_phase: bool,
         pulse_phase_a: bool,
@@ -261,9 +287,11 @@ impl TurnCard {
     /// `RowHint`s for mouse-click routing. The caller provides pulse/
     /// cursor phase from a single monotonic clock; this fn reads
     /// `Instant::now()` only for the commit-bloom and shimmer decay
-    /// windows.
+    /// windows. Mutates `cached_prose` so the markdown re-parse only
+    /// runs when prose actually changes (or when the theme's unicode
+    /// flag flips).
     pub fn render_rows(
-        &self,
+        &mut self,
         theme: &Theme,
         live_cursor_phase: bool,
         pulse_phase_a: bool,
@@ -346,15 +374,36 @@ impl TurnCard {
         }
 
         // Prose — markdown-rendered for agents; plain for users.
+        // Cached on the card; recomputed only when prose mutates or
+        // theme.unicode flips. Pre-cache, every paint re-ran
+        // `pulldown_cmark::Parser` over the full message body — the
+        // dominant render cost on long replies.
         if !self.prose.is_empty() {
-            let joined = self.prose.join("\n");
-            let prose_lines: Vec<Line<'static>> = match self.role {
-                CardRole::Agent => markdown::render(&joined, theme),
-                _ => joined
-                    .lines()
-                    .map(|l| Line::from(Span::styled(l.to_string(), theme.ink(Palette::INK_0))))
-                    .collect(),
-            };
+            let needs_refresh = self
+                .cached_prose
+                .as_ref()
+                .map(|c| c.revision != self.prose_revision || c.unicode != theme.unicode)
+                .unwrap_or(true);
+            if needs_refresh {
+                let joined = self.prose.join("\n");
+                let lines: Vec<Line<'static>> = match self.role {
+                    CardRole::Agent => markdown::render(&joined, theme),
+                    _ => joined
+                        .lines()
+                        .map(|l| Line::from(Span::styled(l.to_string(), theme.ink(Palette::INK_0))))
+                        .collect(),
+                };
+                self.cached_prose = Some(CachedProse {
+                    revision: self.prose_revision,
+                    unicode: theme.unicode,
+                    lines,
+                });
+            }
+            let prose_lines: &[Line<'static>] = self
+                .cached_prose
+                .as_ref()
+                .map(|c| c.lines.as_slice())
+                .unwrap_or(&[]);
             // Aborted cards used to strike-through every prose span, which
             // rendered the reply unreadable (especially brutal when the
             // model had already streamed a full useful answer before
@@ -369,10 +418,14 @@ impl TurnCard {
                 .iter()
                 .rposition(|l| l.spans.iter().any(|s| !s.content.trim().is_empty()));
 
-            for (i, line) in prose_lines.into_iter().enumerate() {
-                let mut spans: Vec<Span<'static>> = vec![Span::raw("   ")];
-                for s in line.spans {
-                    spans.push(Span::styled(s.content.into_owned(), s.style));
+            for (i, line) in prose_lines.iter().enumerate() {
+                let mut spans: Vec<Span<'static>> = Vec::with_capacity(line.spans.len() + 2);
+                spans.push(Span::raw("   "));
+                for s in &line.spans {
+                    // Cow<'static, str>::clone() is cheap for Borrowed
+                    // (pointer copy) and a String memcpy for Owned —
+                    // way under the cost of re-running pulldown_cmark.
+                    spans.push(Span::styled(s.content.clone(), s.style));
                 }
                 if Some(i) == last_non_blank_idx && tail_chars > 0 {
                     if let Some(last_span) = spans.pop() {
@@ -753,5 +806,66 @@ mod tests {
         assert!(!lines.is_empty());
         // Header + blank + 1 prose + blank + cell line + 1 preview + trailing blank
         assert!(lines.len() >= 6);
+    }
+
+    #[test]
+    fn append_prose_bumps_revision_and_invalidates_cache() {
+        let mut c = TurnCard::agent("t-cache");
+        c.append_prose("hello");
+        let theme = Theme { unicode: true };
+        let _ = c.render_lines(&theme, true, true);
+        let cached_rev = c
+            .cached_prose
+            .as_ref()
+            .expect("first render fills cache")
+            .revision;
+        assert_eq!(cached_rev, c.prose_revision);
+
+        // Stamp the cache with a sentinel so we can prove it gets replaced.
+        c.cached_prose
+            .as_mut()
+            .unwrap()
+            .lines
+            .push(Line::from(Span::raw("SENTINEL")));
+        let stamped_revision = c
+            .cached_prose
+            .as_ref()
+            .unwrap()
+            .lines
+            .iter()
+            .any(|l| l.spans.iter().any(|s| s.content.as_ref() == "SENTINEL"));
+        assert!(stamped_revision);
+
+        // Append → revision bumps → render rebuilds → sentinel evicted.
+        c.append_prose(" world");
+        let _ = c.render_lines(&theme, true, true);
+        let still_has_sentinel = c
+            .cached_prose
+            .as_ref()
+            .unwrap()
+            .lines
+            .iter()
+            .any(|l| l.spans.iter().any(|s| s.content.as_ref() == "SENTINEL"));
+        assert!(
+            !still_has_sentinel,
+            "cache must be rebuilt on append, not patched in place"
+        );
+    }
+
+    #[test]
+    fn cached_prose_invalidates_on_unicode_flip() {
+        let mut c = TurnCard::agent("t-flip");
+        c.append_prose("fence test");
+        let unicode_theme = Theme { unicode: true };
+        let _ = c.render_lines(&unicode_theme, true, true);
+        let cached_unicode = c.cached_prose.as_ref().unwrap().unicode;
+        assert!(cached_unicode);
+        let ascii_theme = Theme { unicode: false };
+        let _ = c.render_lines(&ascii_theme, true, true);
+        let cached_after = c.cached_prose.as_ref().unwrap().unicode;
+        assert!(
+            !cached_after,
+            "unicode flip must invalidate the markdown cache"
+        );
     }
 }

@@ -209,6 +209,31 @@ impl AppState {
         self.cards.iter_mut().rev().find(|c| c.turn_id == turn_id)
     }
 
+    /// Flip the card driving `turn_id` to `AwaitingApproval` so the user
+    /// can see which turn is blocked while the approval sheet is open.
+    /// Only mutates Live cards — terminal states are left alone.
+    fn set_card_awaiting_approval(&mut self, turn_id: &TurnId) {
+        let tid = turn_id.to_string();
+        if let Some(card) = self.card_by_turn_id_mut(&tid) {
+            if matches!(card.state, CardState::Live) {
+                card.state = CardState::AwaitingApproval;
+            }
+        }
+    }
+
+    /// Take the pending approval request and roll any `AwaitingApproval`
+    /// card back to `Live`. Every grant/deny path goes through here so
+    /// the amber accent never lingers after the sheet closes.
+    fn take_pending_approval(&mut self) -> Option<ApprovalRequestMsg> {
+        let req = self.pending_approval.take();
+        for card in self.cards.iter_mut() {
+            if matches!(card.state, CardState::AwaitingApproval) {
+                card.state = CardState::Live;
+            }
+        }
+        req
+    }
+
     fn run_palette_action(&mut self, action: PaletteAction) {
         match action {
             PaletteAction::ShowContext => {
@@ -444,7 +469,7 @@ impl AppState {
                 }
             }
             ClickTarget::SheetApproveOnce => {
-                if let Some(req) = self.pending_approval.take() {
+                if let Some(req) = self.take_pending_approval() {
                     let _ = req.responder.send(ApprovalResponse::Grant {
                         scope: ApprovalScope::Once,
                     });
@@ -452,7 +477,7 @@ impl AppState {
                 }
             }
             ClickTarget::SheetApproveSession => {
-                if let Some(req) = self.pending_approval.take() {
+                if let Some(req) = self.take_pending_approval() {
                     let _ = req.responder.send(ApprovalResponse::Grant {
                         scope: ApprovalScope::Session,
                     });
@@ -460,7 +485,7 @@ impl AppState {
                 }
             }
             ClickTarget::SheetDeny => {
-                if let Some(req) = self.pending_approval.take() {
+                if let Some(req) = self.take_pending_approval() {
                     let _ = req.responder.send(ApprovalResponse::Deny);
                     self.notes.push(Note::warn("approval · denied"));
                 }
@@ -518,7 +543,7 @@ impl AppState {
         if self.pending_approval.is_some() {
             match (key.code, key.modifiers) {
                 (KeyCode::Enter, _) | (KeyCode::Char('y'), _) | (KeyCode::Char('Y'), _) => {
-                    if let Some(req) = self.pending_approval.take() {
+                    if let Some(req) = self.take_pending_approval() {
                         let _ = req.responder.send(ApprovalResponse::Grant {
                             scope: ApprovalScope::Once,
                         });
@@ -526,7 +551,7 @@ impl AppState {
                     }
                 }
                 (KeyCode::Char('s'), _) | (KeyCode::Char('S'), _) => {
-                    if let Some(req) = self.pending_approval.take() {
+                    if let Some(req) = self.take_pending_approval() {
                         let _ = req.responder.send(ApprovalResponse::Grant {
                             scope: ApprovalScope::Session,
                         });
@@ -538,7 +563,7 @@ impl AppState {
                     // so we route to session-scope and surface a note so
                     // the user knows the batch-plan sheet isn't in this
                     // build yet. Bona-fide ScopedPaths lands in v2.1.
-                    if let Some(req) = self.pending_approval.take() {
+                    if let Some(req) = self.take_pending_approval() {
                         let _ = req.responder.send(ApprovalResponse::Grant {
                             scope: ApprovalScope::Session,
                         });
@@ -548,7 +573,7 @@ impl AppState {
                     }
                 }
                 (KeyCode::Esc, _) | (KeyCode::Char('n'), _) | (KeyCode::Char('N'), _) => {
-                    if let Some(req) = self.pending_approval.take() {
+                    if let Some(req) = self.take_pending_approval() {
                         let _ = req.responder.send(ApprovalResponse::Deny);
                         self.notes.push(Note::warn("approval · denied"));
                     }
@@ -596,35 +621,63 @@ impl AppState {
                 return;
             }
             (KeyCode::Tab, m) if !m.contains(KeyModifiers::SHIFT) => {
-                // Priority: cells on the latest agent card (toggle
-                // the last one), then thoughts on the latest agent
-                // card that carries them. Falls through to the
-                // textarea when neither applies.
-                let mut consumed = false;
-                if let Some(card) = self.cards.iter_mut().rev().find(|c| !c.cells.is_empty()) {
-                    if let Some(last) = card.cells.last_mut() {
-                        last.expanded = !last.expanded;
-                        consumed = true;
+                // Tab walks focus through every tool cell across every
+                // card, newest→oldest, wrapping. The focused cell is the
+                // only one expanded. Earlier builds only toggled the
+                // last cell of the most recent card, leaving older cells
+                // unreachable from the keyboard. Falls through to
+                // thoughts / textarea when no cells exist anywhere.
+                let order: Vec<(usize, usize)> = self
+                    .cards
+                    .iter()
+                    .enumerate()
+                    .rev()
+                    .flat_map(|(ci, card)| (0..card.cells.len()).rev().map(move |xi| (ci, xi)))
+                    .collect();
+                if !order.is_empty() {
+                    let current = self
+                        .cards
+                        .iter()
+                        .enumerate()
+                        .find_map(|(ci, c)| c.cell_focus.map(|xi| (ci, xi)));
+                    let next = match current.and_then(|p| order.iter().position(|&q| q == p)) {
+                        Some(i) if i + 1 < order.len() => order[i + 1],
+                        _ => order[0],
+                    };
+                    for card in self.cards.iter_mut() {
+                        for cell in card.cells.iter_mut() {
+                            cell.expanded = false;
+                        }
+                        card.cell_focus = None;
                     }
-                }
-                if !consumed {
-                    if let Some(card) = self.cards.iter_mut().rev().find(|c| !c.thoughts.is_empty())
-                    {
-                        card.thoughts_expanded = !card.thoughts_expanded;
-                        consumed = true;
+                    let (ci, xi) = next;
+                    if let Some(card) = self.cards.get_mut(ci) {
+                        if let Some(cell) = card.cells.get_mut(xi) {
+                            cell.expanded = true;
+                        }
+                        card.cell_focus = Some(xi);
                     }
+                    self.dirty = true;
+                    return;
                 }
-                if consumed {
+                // No cells anywhere — fall back to the latest card's
+                // thoughts (still useful when the model only emits
+                // reasoning blocks without tool calls).
+                if let Some(card) = self.cards.iter_mut().rev().find(|c| !c.thoughts.is_empty()) {
+                    card.thoughts_expanded = !card.thoughts_expanded;
                     self.dirty = true;
                     return;
                 }
                 // No expandable content — fall through to textarea.
             }
             (KeyCode::BackTab, _) | (KeyCode::Tab, KeyModifiers::SHIFT) => {
+                // Collapse everything + drop focus. Equivalent to "back
+                // to the closed view" so Tab restarts from the latest.
                 for card in self.cards.iter_mut() {
                     for cell in card.cells.iter_mut() {
                         cell.expanded = false;
                     }
+                    card.cell_focus = None;
                 }
                 self.dirty = true;
                 return;
@@ -778,6 +831,11 @@ impl AppState {
             SessionEvent::TurnStarted { turn_id, .. } => {
                 self.cards.push(TurnCard::agent(turn_id.to_string()));
                 self.whisper.set("thinking");
+                // Evidence lanes are per-turn — flush so the inspector
+                // shows what *this* turn retrieved, not the prior one's
+                // residue. Repopulated by RetrievalQueried / SymbolResolved
+                // arms below.
+                self.inspector_data.evidence_lanes.clear();
             }
             SessionEvent::ModelRequest { .. } => {
                 self.whisper.set("waiting for the model");
@@ -844,20 +902,25 @@ impl AppState {
                         let tu_id = tool_use_id.to_string();
                         if let Some(card) = self.card_by_turn_id_mut(&tid) {
                             if let Some(cell) = card.cell_by_id_mut(&tu_id) {
+                                // Walk lines once — reused for preview, full,
+                                // total count, and error first-line. Earlier
+                                // version called `.lines()` four times per
+                                // ToolResult event.
+                                let line_refs: Vec<&str> = preview_text.lines().collect();
+                                let total_lines = line_refs.len();
                                 let mut preview: Vec<String> =
-                                    preview_text.lines().take(4).map(String::from).collect();
-                                let total_lines = preview_text.lines().count();
+                                    line_refs.iter().take(4).map(|s| s.to_string()).collect();
                                 if total_lines > 4 {
                                     preview.push(format!("… +{} more lines", total_lines - 4));
                                 }
                                 let full: Vec<String> =
-                                    preview_text.lines().take(24).map(String::from).collect();
+                                    line_refs.iter().take(24).map(|s| s.to_string()).collect();
                                 cell.preview_lines = preview;
                                 cell.full_lines = full;
                                 cell.result = if is_error {
-                                    let msg: String = preview_text
-                                        .lines()
-                                        .next()
+                                    let msg: String = line_refs
+                                        .first()
+                                        .copied()
                                         .unwrap_or("tool error")
                                         .to_string();
                                     CellResult::Err { message: msg }
@@ -887,6 +950,33 @@ impl AppState {
                         effect.tool_name, effect.error
                     )));
                 }
+            }
+            SessionEvent::RetrievalQueried {
+                backend,
+                query,
+                result_count,
+                ..
+            } => {
+                let label = format!(
+                    "{query} · {result_count} hit{}",
+                    if result_count == 1 { "" } else { "s" }
+                );
+                self.inspector_data.evidence_lanes.push((backend, label));
+            }
+            SessionEvent::SymbolResolved {
+                backend,
+                query,
+                matched,
+                ..
+            } => {
+                let label = format!(
+                    "{query} · {} match{}",
+                    matched.len(),
+                    if matched.len() == 1 { "" } else { "es" }
+                );
+                self.inspector_data
+                    .evidence_lanes
+                    .push((format!("symbol/{backend}"), label));
             }
             SessionEvent::ToolResult {
                 turn_id,
@@ -1775,6 +1865,7 @@ pub async fn run_app(resume: Option<String>) -> io::Result<()> {
             }
             Some(ev) = session_rx.recv() => state.handle_session_event(ev),
             Some(req) = approval_req_rx.recv() => {
+                state.set_card_awaiting_approval(&req.turn_id);
                 state.pending_approval = Some(req);
                 state.dirty = true;
             }
@@ -2084,5 +2175,167 @@ mod tests {
         terminal
             .draw(|f| super::super::render::frame(f, &mut state))
             .expect("narrow-terminal ASCII render");
+    }
+
+    #[test]
+    fn set_card_awaiting_approval_only_mutates_live_cards() {
+        let mut state = AppState::new();
+        let turn_id = TurnId::new();
+        state.handle_session_event(SessionEvent::TurnStarted {
+            turn_id: turn_id.clone(),
+            run_id: RunId::new(),
+            parent_turn: None,
+            timestamp: "2026-04-19T00:00:00Z".into(),
+        });
+        state.set_card_awaiting_approval(&turn_id);
+        assert!(matches!(
+            state.cards[0].state,
+            super::super::card::CardState::AwaitingApproval
+        ));
+
+        // Mark as Committed, then confirm the helper refuses to
+        // overwrite a terminal state.
+        state.cards[0].state = super::super::card::CardState::Committed;
+        state.set_card_awaiting_approval(&turn_id);
+        assert!(matches!(
+            state.cards[0].state,
+            super::super::card::CardState::Committed
+        ));
+    }
+
+    #[test]
+    fn take_pending_approval_restores_live_state() {
+        let mut state = AppState::new();
+        let turn_id = TurnId::new();
+        state.handle_session_event(SessionEvent::TurnStarted {
+            turn_id: turn_id.clone(),
+            run_id: RunId::new(),
+            parent_turn: None,
+            timestamp: "2026-04-19T00:00:00Z".into(),
+        });
+        state.set_card_awaiting_approval(&turn_id);
+        assert!(matches!(
+            state.cards[0].state,
+            super::super::card::CardState::AwaitingApproval
+        ));
+        // Simulate a pending request (responder is dropped — that is
+        // fine here, we only care about card-state bookkeeping).
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        state.pending_approval = Some(ApprovalRequestMsg {
+            turn_id: turn_id.clone(),
+            approval_id: ApprovalId::new(),
+            tool_name: "fs_write".into(),
+            effect_class: azoth_core::schemas::EffectClass::ApplyLocal,
+            summary: "write foo".into(),
+            responder: tx,
+        });
+        let taken = state.take_pending_approval();
+        assert!(taken.is_some());
+        assert!(matches!(
+            state.cards[0].state,
+            super::super::card::CardState::Live
+        ));
+    }
+
+    #[test]
+    fn retrieval_queried_pushes_to_evidence_lanes() {
+        let mut state = AppState::new();
+        let turn_id = TurnId::new();
+        state.handle_session_event(SessionEvent::TurnStarted {
+            turn_id: turn_id.clone(),
+            run_id: RunId::new(),
+            parent_turn: None,
+            timestamp: "2026-04-19T00:00:00Z".into(),
+        });
+        assert!(state.inspector_data.evidence_lanes.is_empty());
+        state.handle_session_event(SessionEvent::RetrievalQueried {
+            turn_id: turn_id.clone(),
+            backend: "fts".to_string(),
+            query: "TurnDriver".to_string(),
+            result_count: 3,
+            latency_ms: 7,
+        });
+        state.handle_session_event(SessionEvent::SymbolResolved {
+            turn_id: turn_id.clone(),
+            backend: "sqlite".to_string(),
+            query: "TurnDriver".to_string(),
+            matched: vec![1, 2],
+        });
+        assert_eq!(state.inspector_data.evidence_lanes.len(), 2);
+        assert_eq!(state.inspector_data.evidence_lanes[0].0, "fts");
+        assert!(state.inspector_data.evidence_lanes[0].1.contains("3 hits"));
+        assert_eq!(state.inspector_data.evidence_lanes[1].0, "symbol/sqlite");
+        assert!(state.inspector_data.evidence_lanes[1]
+            .1
+            .contains("2 matches"));
+    }
+
+    #[test]
+    fn turn_started_clears_stale_evidence_lanes() {
+        let mut state = AppState::new();
+        state
+            .inspector_data
+            .evidence_lanes
+            .push(("ripgrep".to_string(), "stale · 42 hits".to_string()));
+        state.handle_session_event(SessionEvent::TurnStarted {
+            turn_id: TurnId::new(),
+            run_id: RunId::new(),
+            parent_turn: None,
+            timestamp: "2026-04-19T00:00:00Z".into(),
+        });
+        assert!(
+            state.inspector_data.evidence_lanes.is_empty(),
+            "prior-turn evidence must not bleed into the fresh turn"
+        );
+    }
+
+    #[test]
+    fn tab_reaches_older_cell_not_just_last_of_last() {
+        use azoth_core::schemas::ToolUseId;
+        let mut state = AppState::new();
+        // Two turns, each with a tool cell.
+        for (tid, name) in [("t1", "old_tool"), ("t2", "recent_tool")] {
+            state.handle_session_event(SessionEvent::TurnStarted {
+                turn_id: TurnId::from(tid.to_string()),
+                run_id: RunId::new(),
+                parent_turn: None,
+                timestamp: "2026-04-19T00:00:00Z".into(),
+            });
+            state.handle_session_event(SessionEvent::ContentBlock {
+                turn_id: TurnId::from(tid.to_string()),
+                index: 0,
+                block: ContentBlock::ToolUse {
+                    id: ToolUseId::from(format!("tu_{tid}")),
+                    name: name.to_string(),
+                    input: serde_json::json!({"q": "x"}),
+                    call_group: None,
+                },
+            });
+        }
+        let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+        // First Tab: focus + expand latest card's latest cell (t2/recent_tool).
+        state.handle_key(tab);
+        assert!(
+            state.cards[1].cells[0].expanded,
+            "first Tab should expand the newest cell"
+        );
+        assert!(
+            !state.cards[0].cells[0].expanded,
+            "older cell stays closed until we step to it"
+        );
+        // Second Tab: advance to the older cell; newer collapses.
+        state.handle_key(tab);
+        assert!(
+            !state.cards[1].cells[0].expanded,
+            "previous focus collapses as Tab advances"
+        );
+        assert!(
+            state.cards[0].cells[0].expanded,
+            "second Tab must reach the older cell — previously unreachable from the keyboard"
+        );
+        // Third Tab wraps back to the newest.
+        state.handle_key(tab);
+        assert!(state.cards[1].cells[0].expanded);
+        assert!(!state.cards[0].cells[0].expanded);
     }
 }

@@ -139,10 +139,15 @@ pub fn render(f: &mut Frame, area: Rect, data: &InspectorData, theme: &Theme) {
             if y >= inner.y + inner.height {
                 break;
             }
+            // Borrow both spans from caller-owned strings — earlier
+            // build allocated `"  ".to_string()` and `tool.clone()`
+            // every frame for every tool. Span::styled accepts any
+            // `Into<Cow<'a, str>>`, so `&str` slices land as
+            // `Cow::Borrowed` with zero allocation.
             f.render_widget(
                 Paragraph::new(Line::from(vec![
-                    Span::styled("  ".to_string(), theme.dim()),
-                    Span::styled(tool.clone(), theme.ink(Colors::INK_1)),
+                    Span::styled("  ", theme.dim()),
+                    Span::styled(tool.as_str(), theme.ink(Colors::INK_1)),
                 ])),
                 Rect::new(inner.x, y, inner.width, 1),
             );
