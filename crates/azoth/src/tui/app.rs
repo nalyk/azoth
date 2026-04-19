@@ -69,6 +69,22 @@ pub enum InputEvent {
     Resize,
 }
 
+/// A mouse-click target registered by the render path, resolved at
+/// click time by `AppState::handle_mouse`. Keyed by absolute Y in
+/// the terminal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClickTarget {
+    ThoughtsToggle { card_idx: usize },
+    CellToggle { card_idx: usize, cell_idx: usize },
+    SheetApproveOnce,
+    SheetApproveSession,
+    SheetDeny,
+    PaletteOpen,
+    FocusToggle,
+    RailToggle,
+    InspectorToggle,
+}
+
 pub struct AppState {
     pub textarea: TextArea<'static>,
     /// PAPER cards — the visible manuscript. Replaces the flat `Vec<String>`
@@ -93,6 +109,19 @@ pub struct AppState {
     pub focus_mode: bool,
     /// Structured data driving the inspector drawer.
     pub inspector_data: InspectorData,
+
+    /// Splashscreen flag — true while the worker is initialising
+    /// (opening JSONL, SQLite mirror, tree-sitter index, FTS index,
+    /// co-edit graph, adapter). The UI draws a centered splash
+    /// instead of the canvas until the worker signals ready.
+    pub booting: bool,
+    /// Splash phase narration — updated as the worker progresses.
+    pub boot_phase: String,
+
+    /// Click targets registered by the render path for mouse
+    /// handling. Keyed by absolute terminal Y. Repopulated every
+    /// frame so stale entries don't fire.
+    pub click_map: Vec<Option<ClickTarget>>,
 
     pub status: String,
     pub ctx_pct: u8,
@@ -145,6 +174,9 @@ impl AppState {
             rail_open: false,
             focus_mode: false,
             inspector_data,
+            booting: true,
+            boot_phase: "starting up".to_string(),
+            click_map: Vec::new(),
             status: "ready".to_string(),
             ctx_pct: 0,
             dirty: true,
@@ -371,7 +403,7 @@ impl AppState {
     }
 
     fn handle_mouse(&mut self, me: crossterm::event::MouseEvent) {
-        use crossterm::event::MouseEventKind;
+        use crossterm::event::{MouseButton, MouseEventKind};
         match me.kind {
             MouseEventKind::ScrollUp => {
                 self.scroll_offset = self.scroll_offset.saturating_add(3);
@@ -385,7 +417,66 @@ impl AppState {
                 }
                 self.dirty = true;
             }
+            MouseEventKind::Down(MouseButton::Left) => {
+                let y = me.row as usize;
+                let target = self.click_map.get(y).cloned().flatten();
+                if let Some(t) = target {
+                    self.handle_click_target(t);
+                    self.dirty = true;
+                }
+            }
             _ => {}
+        }
+    }
+
+    fn handle_click_target(&mut self, target: ClickTarget) {
+        match target {
+            ClickTarget::ThoughtsToggle { card_idx } => {
+                if let Some(card) = self.cards.get_mut(card_idx) {
+                    card.thoughts_expanded = !card.thoughts_expanded;
+                }
+            }
+            ClickTarget::CellToggle { card_idx, cell_idx } => {
+                if let Some(card) = self.cards.get_mut(card_idx) {
+                    if let Some(cell) = card.cells.get_mut(cell_idx) {
+                        cell.expanded = !cell.expanded;
+                    }
+                }
+            }
+            ClickTarget::SheetApproveOnce => {
+                if let Some(req) = self.pending_approval.take() {
+                    let _ = req.responder.send(ApprovalResponse::Grant {
+                        scope: ApprovalScope::Once,
+                    });
+                    self.notes.push(Note::info("approval · granted once"));
+                }
+            }
+            ClickTarget::SheetApproveSession => {
+                if let Some(req) = self.pending_approval.take() {
+                    let _ = req.responder.send(ApprovalResponse::Grant {
+                        scope: ApprovalScope::Session,
+                    });
+                    self.notes.push(Note::info("approval · granted session"));
+                }
+            }
+            ClickTarget::SheetDeny => {
+                if let Some(req) = self.pending_approval.take() {
+                    let _ = req.responder.send(ApprovalResponse::Deny);
+                    self.notes.push(Note::warn("approval · denied"));
+                }
+            }
+            ClickTarget::PaletteOpen => {
+                self.palette.open();
+            }
+            ClickTarget::FocusToggle => {
+                self.focus_mode = !self.focus_mode;
+            }
+            ClickTarget::RailToggle => {
+                self.rail_open = !self.rail_open;
+            }
+            ClickTarget::InspectorToggle => {
+                self.inspector_open = !self.inspector_open;
+            }
         }
     }
 
@@ -492,6 +583,16 @@ impl AppState {
             (KeyCode::Char('\\'), KeyModifiers::CONTROL) => {
                 self.focus_mode = !self.focus_mode;
                 self.dirty = true;
+                return;
+            }
+            (KeyCode::Char('t'), KeyModifiers::CONTROL) => {
+                // Dedicated thoughts toggle on the latest agent card
+                // with thoughts. Independent of Tab (which prioritises
+                // tool cells); ⌃T always targets thoughts.
+                if let Some(card) = self.cards.iter_mut().rev().find(|c| !c.thoughts.is_empty()) {
+                    card.thoughts_expanded = !card.thoughts_expanded;
+                    self.dirty = true;
+                }
                 return;
             }
             (KeyCode::Tab, m) if !m.contains(KeyModifiers::SHIFT) => {
@@ -720,6 +821,7 @@ impl AppState {
                             result: CellResult::Pending,
                             preview_lines: Vec::new(),
                             full_lines: Vec::new(),
+                            created_at: Instant::now(),
                         };
                         if let Some(card) = self.card_by_turn_id_mut(&tid) {
                             card.add_cell(cell);
@@ -1036,6 +1138,12 @@ pub async fn run_app(resume: Option<String>) -> io::Result<()> {
     let (error_tx, mut error_rx) = mpsc::channel::<String>(8);
     let (approval_req_tx, mut approval_req_rx) = mpsc::channel::<ApprovalRequestMsg>(8);
     let (approve_tx, mut approve_rx) = mpsc::channel::<String>(8);
+    // Worker → UI "ready" signal. Fired once when the worker has
+    // opened every subsystem (JSONL, SQLite mirror, artifact store,
+    // dispatcher, retrieval backends, adapter). Lets the UI drop
+    // the splashscreen at the right moment — not on a timer.
+    let (boot_phase_tx, mut boot_phase_rx) = mpsc::channel::<String>(8);
+    let (ready_tx, mut ready_rx) = mpsc::channel::<()>(1);
 
     // Dedicated input task — prevents the keyboard reader from being starved
     // by model streaming in the main select loop.
@@ -1078,6 +1186,8 @@ pub async fn run_app(resume: Option<String>) -> io::Result<()> {
 
     let worker_session_tx = session_tx.clone();
     let worker_error_tx = error_tx.clone();
+    let worker_boot_phase_tx = boot_phase_tx.clone();
+    let worker_ready_tx = ready_tx.clone();
     let worker_run_id = run_id.clone();
     let worker_cwd = cwd.clone();
     let worker_session_path = session_path.clone();
@@ -1120,6 +1230,9 @@ pub async fn run_app(resume: Option<String>) -> io::Result<()> {
             }
         }
         writer.set_tap(worker_session_tx.clone());
+        let _ = worker_boot_phase_tx
+            .send("opening session log".to_string())
+            .await;
 
         // Single binding for the shared mirror DB path. SqliteMirror,
         // RepoIndexer, FtsLexicalRetrieval, SqliteSymbolIndex, and
@@ -1202,6 +1315,9 @@ pub async fn run_app(resume: Option<String>) -> io::Result<()> {
             model = %provider_profile.model_id,
             "resolved provider profile"
         );
+        let _ = worker_boot_phase_tx
+            .send(format!("connecting to {}", provider_profile.name))
+            .await;
         let adapter = super::config::build_adapter(&provider_profile);
 
         // Evidence collector. Sprint 7 ship defaults are `composite`
@@ -1233,8 +1349,14 @@ pub async fn run_app(resume: Option<String>) -> io::Result<()> {
             root: worker_cwd.clone(),
         });
 
+        let _ = worker_boot_phase_tx
+            .send("indexing repo (FTS + symbols + co-edit)".to_string())
+            .await;
         let indexer_backends =
             build_indexer_backends(&db_path, &worker_cwd, retrieval_cfg.co_edit).await;
+        let _ = worker_boot_phase_tx
+            .send("finishing indexer".to_string())
+            .await;
 
         let (fts_retrieval, symbol_retrieval) = match indexer_backends.as_ref() {
             Some(b) => (Some(Arc::clone(&b.fts)), Some(Arc::clone(&b.symbols))),
@@ -1406,6 +1528,9 @@ pub async fn run_app(resume: Option<String>) -> io::Result<()> {
                     .any(|e| matches!(e.0, SessionEvent::RunStarted { .. }))
             })
             .unwrap_or(false);
+
+        // Worker is fully booted — drop the splashscreen.
+        let _ = worker_ready_tx.send(()).await;
 
         loop {
             let user_text = tokio::select! {
@@ -1654,7 +1779,22 @@ pub async fn run_app(resume: Option<String>) -> io::Result<()> {
                 state.dirty = true;
             }
             Some(err) = error_rx.recv() => state.push_error(err),
-            _ = ticker.tick() => {}
+            Some(phase) = boot_phase_rx.recv() => {
+                state.boot_phase = phase;
+                state.dirty = true;
+            }
+            Some(_) = ready_rx.recv() => {
+                state.booting = false;
+                state.boot_phase = "ready".to_string();
+                state.dirty = true;
+            }
+            _ = ticker.tick() => {
+                // Splashscreen animates via the tick — spinner needs
+                // re-render even when no channel is active.
+                if state.booting {
+                    state.dirty = true;
+                }
+            }
             else => break,
         }
 
@@ -1908,6 +2048,7 @@ mod tests {
             },
             preview_lines: vec!["src/auth/tokens.rs:42".into()],
             full_lines: vec!["src/auth/tokens.rs:42".into()],
+            created_at: std::time::Instant::now(),
         });
         state.cards.push(agent);
 

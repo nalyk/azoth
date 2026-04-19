@@ -277,13 +277,14 @@ fn render_table(out: &mut Vec<Line<'static>>, t: &TableBuf, theme: &Theme) {
     const MAX_COL: usize = 48;
     const GAP: usize = 2;
 
+    use unicode_width::UnicodeWidthStr;
     let mut widths = vec![0usize; col_count];
     for (i, cell) in t.header.iter().enumerate().take(col_count) {
-        widths[i] = widths[i].max(cell.chars().count());
+        widths[i] = widths[i].max(UnicodeWidthStr::width(cell.as_str()));
     }
     for row in &t.body {
         for (i, cell) in row.iter().enumerate().take(col_count) {
-            widths[i] = widths[i].max(cell.chars().count());
+            widths[i] = widths[i].max(UnicodeWidthStr::width(cell.as_str()));
         }
     }
     for w in &mut widths {
@@ -326,21 +327,41 @@ fn render_table(out: &mut Vec<Line<'static>>, t: &TableBuf, theme: &Theme) {
     }
 }
 
-/// Pad or truncate a string to exactly `width` visible chars. Uses
-/// `chars().count()` as a proxy for display width — correct for
-/// ASCII/Latin; wide Unicode (CJK / emoji) may misalign by a column
-/// until a full `unicode-width` pass lands.
+/// Pad or truncate a string to exactly `width` display columns. Uses
+/// `unicode-width` so CJK double-wide characters and wide emoji align
+/// correctly; ASCII / Latin pay no cost (cached single-char widths).
+/// Preserves content intact when it fits; appends `…` on truncation
+/// so the result never overruns `width`.
 fn pad_to(s: &str, width: usize) -> String {
-    let count = s.chars().count();
-    match count.cmp(&width) {
+    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+    let total_w = UnicodeWidthStr::width(s);
+    match total_w.cmp(&width) {
         std::cmp::Ordering::Greater => {
-            let mut t: String = s.chars().take(width.saturating_sub(1)).collect();
-            t.push('…');
-            t
+            // Truncate chars until we're within `width - 1`, then
+            // append ellipsis.
+            let target = width.saturating_sub(1);
+            let mut taken = String::with_capacity(s.len());
+            let mut acc = 0usize;
+            for c in s.chars() {
+                let cw = UnicodeWidthChar::width(c).unwrap_or(0);
+                if acc + cw > target {
+                    break;
+                }
+                taken.push(c);
+                acc += cw;
+            }
+            taken.push('…');
+            // Ensure exact width (ellipsis is width=1).
+            let out_w = UnicodeWidthStr::width(taken.as_str());
+            let mut out = taken;
+            for _ in out_w..width {
+                out.push(' ');
+            }
+            out
         }
         std::cmp::Ordering::Less => {
             let mut out = s.to_string();
-            for _ in 0..(width - count) {
+            for _ in 0..(width - total_w) {
                 out.push(' ');
             }
             out

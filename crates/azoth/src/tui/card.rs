@@ -67,6 +67,11 @@ pub struct ToolCell {
     pub result: CellResult,
     pub preview_lines: Vec<String>, // first 4 lines of result, for collapsed view
     pub full_lines: Vec<String>,
+    /// Creation timestamp — drives the sweep/spinner progression.
+    /// Before this field existed, all pending cells shared a
+    /// process-wide boot clock which left stuck cells (turn committed
+    /// without a ToolResult event) animating forever on scroll-back.
+    pub created_at: Instant,
 }
 
 /// Tool cell outcome.
@@ -159,6 +164,15 @@ pub struct UsageChip {
     pub output_tokens: u32,
 }
 
+/// Annotation emitted alongside each rendered line so the frame
+/// orchestrator can register click targets without re-computing card
+/// layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowHint {
+    ThoughtsHeader,
+    CellHeader { cell_idx: usize },
+}
+
 impl TurnCard {
     pub fn user(turn_id: impl Into<String>, text: impl Into<String>) -> Self {
         let now = Instant::now();
@@ -229,17 +243,33 @@ impl TurnCard {
         matches!(self.state, CardState::Live | CardState::AwaitingApproval)
     }
 
-    /// Render this card into a sequence of styled `Line` values for the
-    /// canvas pane. The caller provides pulse/cursor phase from a
-    /// single monotonic clock; this fn reads `Instant::now()` only
-    /// for the commit-bloom and streaming-shimmer decay windows.
+    /// Convenience wrapper — renders the card and drops click hints.
+    /// Kept for tests and simpler callers.
     pub fn render_lines(
         &self,
         theme: &Theme,
         live_cursor_phase: bool,
         pulse_phase_a: bool,
     ) -> Vec<Line<'static>> {
-        let mut out = Vec::with_capacity(self.prose.len() + self.cells.len() * 4 + 6);
+        self.render_rows(theme, live_cursor_phase, pulse_phase_a)
+            .into_iter()
+            .map(|(l, _)| l)
+            .collect()
+    }
+
+    /// Render this card into styled `Line` values paired with optional
+    /// `RowHint`s for mouse-click routing. The caller provides pulse/
+    /// cursor phase from a single monotonic clock; this fn reads
+    /// `Instant::now()` only for the commit-bloom and shimmer decay
+    /// windows.
+    pub fn render_rows(
+        &self,
+        theme: &Theme,
+        live_cursor_phase: bool,
+        pulse_phase_a: bool,
+    ) -> Vec<(Line<'static>, Option<RowHint>)> {
+        let mut out: Vec<(Line<'static>, Option<RowHint>)> =
+            Vec::with_capacity(self.prose.len() + self.cells.len() * 4 + 6);
 
         let bar = self.bar_glyph(theme, pulse_phase_a);
         let bar_style = self.effective_bar_style();
@@ -272,8 +302,8 @@ impl TurnCard {
             ));
         }
         header.push(Span::styled(format!("    {ts_label}"), theme.dim()));
-        out.push(Line::from(header));
-        out.push(Line::from(""));
+        out.push((Line::from(header), None));
+        out.push((Line::from(""), None));
 
         // Thoughts block — collapsible, above the prose.
         if !self.thoughts.is_empty() {
@@ -281,25 +311,32 @@ impl TurnCard {
             let fold_hint = if self.thoughts_expanded {
                 "⇥ fold"
             } else {
-                "⇥ unfold"
+                "⇥ unfold · click to open"
             };
             let header_text = format!(
                 "{diamond} thoughts ({} lines · {fold_hint})",
                 self.thoughts.len()
             );
-            out.push(Line::from(vec![
-                Span::raw("   "),
-                Span::styled(header_text, theme.italic_dim()),
-            ]));
+            // Hint: clicking this row toggles thoughts on this card.
+            out.push((
+                Line::from(vec![
+                    Span::raw("   "),
+                    Span::styled(header_text, theme.italic_dim()),
+                ]),
+                Some(RowHint::ThoughtsHeader),
+            ));
             if self.thoughts_expanded {
                 for line in &self.thoughts {
-                    out.push(Line::from(vec![
-                        Span::raw("     "),
-                        Span::styled(line.clone(), theme.italic_dim()),
-                    ]));
+                    out.push((
+                        Line::from(vec![
+                            Span::raw("     "),
+                            Span::styled(line.clone(), theme.italic_dim()),
+                        ]),
+                        None,
+                    ));
                 }
             }
-            out.push(Line::from(""));
+            out.push((Line::from(""), None));
         }
 
         // Prose — markdown-rendered for agents; plain for users.
@@ -322,8 +359,6 @@ impl TurnCard {
                 .rposition(|l| l.spans.iter().any(|s| !s.content.trim().is_empty()));
 
             for (i, line) in prose_lines.into_iter().enumerate() {
-                // Indent every line into the 3-col gutter and apply
-                // aborted-body strike when applicable.
                 let mut spans: Vec<Span<'static>> = vec![Span::raw("   ")];
                 for s in line.spans {
                     let style = if is_aborted {
@@ -349,29 +384,31 @@ impl TurnCard {
                     });
                     spans.push(Span::styled(cursor_glyph.to_string(), theme.accent()));
                 }
-                out.push(Line::from(spans));
+                out.push((Line::from(spans), None));
             }
         } else if matches!(self.state, CardState::Live) {
-            // Pre-stream: no prose yet. Show typing dots where the
-            // cursor would be.
             let dots = motion::typing_frame(theme, self.started.elapsed().as_millis());
-            out.push(Line::from(vec![
-                Span::raw("   "),
-                Span::styled(dots.to_string(), theme.accent()),
-            ]));
+            out.push((
+                Line::from(vec![
+                    Span::raw("   "),
+                    Span::styled(dots.to_string(), theme.accent()),
+                ]),
+                None,
+            ));
         }
 
         // Cells — indented, collapsed by default.
         for (i, cell) in self.cells.iter().enumerate() {
-            out.push(Line::from(""));
+            out.push((Line::from(""), None));
             let prefix = theme.glyph(Theme::CELL_PREFIX);
             let focus_marker = if self.cell_focus == Some(i) {
                 "·"
             } else {
                 " "
             };
+            let card_live = matches!(self.state, CardState::Live | CardState::AwaitingApproval);
             let result_chip = match &cell.result {
-                CellResult::Pending => {
+                CellResult::Pending if card_live => {
                     let age_ms = cell_pending_age(cell);
                     if age_ms > 1500 {
                         Span::styled(
@@ -385,6 +422,7 @@ impl TurnCard {
                         )
                     }
                 }
+                CellResult::Pending => Span::styled(" —".to_string(), theme.dim()),
                 CellResult::Ok { count_hint } => {
                     let c = count_hint
                         .clone()
@@ -402,7 +440,8 @@ impl TurnCard {
                 Span::styled(format!("  {}", truncate(&cell.summary, 56)), theme.dim()),
                 result_chip,
             ]);
-            out.push(cell_line);
+            // Hint: clicking this row toggles the cell's expansion.
+            out.push((cell_line, Some(RowHint::CellHeader { cell_idx: i })));
 
             let preview: Vec<&String> = if cell.expanded {
                 cell.full_lines.iter().take(24).collect()
@@ -410,41 +449,50 @@ impl TurnCard {
                 cell.preview_lines.iter().take(4).collect()
             };
             for p in preview {
-                out.push(render_cell_preview_line(p, theme));
+                out.push((render_cell_preview_line(p, theme), None));
             }
             if let CellResult::Err { message } = &cell.result {
-                out.push(Line::from(vec![
-                    Span::styled("     ".to_string(), theme.dim()),
-                    Span::styled(truncate(message, 80), theme.ink(Palette::ABORT)),
-                ]));
+                out.push((
+                    Line::from(vec![
+                        Span::styled("     ".to_string(), theme.dim()),
+                        Span::styled(truncate(message, 80), theme.ink(Palette::ABORT)),
+                    ]),
+                    None,
+                ));
             }
         }
 
         // Terminal-state footer.
         match &self.state {
             CardState::Aborted { reason, detail } => {
-                out.push(Line::from(""));
-                out.push(Line::from(vec![
-                    Span::styled("   aborted · ".to_string(), theme.dim()),
-                    Span::styled(reason.clone(), theme.ink(Palette::ABORT)),
-                    if detail.is_empty() {
-                        Span::raw("")
-                    } else {
-                        Span::styled(format!(" · {detail}"), theme.dim())
-                    },
-                ]));
+                out.push((Line::from(""), None));
+                out.push((
+                    Line::from(vec![
+                        Span::styled("   aborted · ".to_string(), theme.dim()),
+                        Span::styled(reason.clone(), theme.ink(Palette::ABORT)),
+                        if detail.is_empty() {
+                            Span::raw("")
+                        } else {
+                            Span::styled(format!(" · {detail}"), theme.dim())
+                        },
+                    ]),
+                    None,
+                ));
             }
             CardState::Interrupted { reason } => {
-                out.push(Line::from(""));
-                out.push(Line::from(vec![
-                    Span::styled("   interrupted · ".to_string(), theme.dim()),
-                    Span::styled(reason.clone(), theme.italic_dim()),
-                ]));
+                out.push((Line::from(""), None));
+                out.push((
+                    Line::from(vec![
+                        Span::styled("   interrupted · ".to_string(), theme.dim()),
+                        Span::styled(reason.clone(), theme.italic_dim()),
+                    ]),
+                    None,
+                ));
             }
             _ => {}
         }
 
-        out.push(Line::from(""));
+        out.push((Line::from(""), None));
         out
     }
 
@@ -514,16 +562,11 @@ impl TurnCard {
     }
 }
 
-/// Age in milliseconds since a tool cell was created — approximated
-/// from the card's render pass. For the motion spinner we just need
-/// "roughly 80ms ticks", so we piggyback on the process-wide boot
-/// `Instant` via a thread-local on render. Since cells don't carry
-/// their own timestamp, we use a coarse monotonic elapsed here.
-fn cell_pending_age(_cell: &ToolCell) -> u128 {
-    use std::sync::OnceLock;
-    static BOOT: OnceLock<Instant> = OnceLock::new();
-    let b = BOOT.get_or_init(Instant::now);
-    b.elapsed().as_millis()
+/// Age in milliseconds since a tool cell was created. Per-cell now
+/// (was process-wide), so a stuck Pending cell from a committed turn
+/// no longer keeps animating against the app's boot clock.
+fn cell_pending_age(cell: &ToolCell) -> u128 {
+    cell.created_at.elapsed().as_millis()
 }
 
 /// Render a single preview line from a tool cell, with diff and
@@ -660,6 +703,7 @@ mod tests {
             result: CellResult::Pending,
             preview_lines: vec!["p1".into()],
             full_lines: vec!["p1".into(), "p2".into()],
+            created_at: Instant::now(),
         });
         assert_eq!(c.cells.len(), 1);
         c.cells[0].expanded = true;
@@ -678,6 +722,7 @@ mod tests {
             result: CellResult::Ok { count_hint: None },
             preview_lines: vec!["file1".into()],
             full_lines: vec!["file1".into()],
+            created_at: Instant::now(),
         });
         let theme = Theme { unicode: true };
         let lines = c.render_lines(&theme, true, true);

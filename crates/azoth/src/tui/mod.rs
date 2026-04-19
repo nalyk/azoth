@@ -13,6 +13,7 @@ pub mod palette;
 pub mod rail;
 pub mod render;
 pub mod sheet;
+pub mod splash;
 pub mod theme;
 pub mod whisper;
 

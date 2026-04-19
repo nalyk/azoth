@@ -13,15 +13,14 @@
 //! When Focus Mode is on, all turns except the active one are hidden.
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::Style;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
 use ratatui::Frame;
 
-use super::app::AppState;
-use super::card::TurnCard;
+use super::app::{AppState, ClickTarget};
 use super::theme::{pulse_phase, Palette as Colors, Theme};
-use super::{inspector, palette, rail, sheet};
+use super::{inspector, palette, rail, sheet, splash};
 
 pub fn frame(f: &mut Frame, state: &mut AppState) {
     let size = f.area();
@@ -29,6 +28,17 @@ pub fn frame(f: &mut Frame, state: &mut AppState) {
     let elapsed_ms = state.boot.elapsed().as_millis();
     let bar_phase = pulse_phase(elapsed_ms, 600);
     let cursor_phase = pulse_phase(elapsed_ms, 500);
+
+    // Reset click map every frame; render paths register hit regions
+    // by absolute terminal Y.
+    state.click_map.clear();
+    state.click_map.resize(size.height as usize + 4, None);
+
+    // Splashscreen takes the whole canvas while the worker boots.
+    if state.booting {
+        splash::render(f, size, &theme, &state.boot_phase, elapsed_ms);
+        return;
+    }
 
     let show_rail = state.rail_open;
     let show_inspector = state.inspector_open && size.width >= 100;
@@ -91,7 +101,6 @@ pub fn frame(f: &mut Frame, state: &mut AppState) {
 }
 
 fn render_status(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
-    let clock = theme.glyph(Theme::CLOCK);
     let mut spans: Vec<Span<'static>> = vec![
         Span::raw("  "),
         Span::styled("azoth".to_string(), theme.bold()),
@@ -101,21 +110,31 @@ fn render_status(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         .inspector_data
         .contract_goal
         .as_deref()
-        .map(|g| trunc(g, 48))
+        .map(|g| trunc(g, 40))
         .unwrap_or_else(|| "no contract yet".to_string());
     spans.push(Span::styled(contract_label, theme.ink(Colors::INK_1)));
-    if !state.run_id.is_empty() {
+    // Model / profile label (from AppState.status, set to
+    // "<profile> · <model_id>" at worker init).
+    if !state.status.is_empty() && state.status != "ready" {
+        spans.push(Span::styled(" · ".to_string(), theme.dim()));
         spans.push(Span::styled(
-            format!(" · {}", trunc(&state.run_id, 20)),
-            theme.dim(),
+            trunc(&state.status, 48),
+            theme.ink(Colors::INK_2),
         ));
     }
+    // Turn count.
+    spans.push(Span::styled(
+        format!("  ·  {} turns", state.committed_turns),
+        theme.dim(),
+    ));
+    // Context percentage — no broken clock glyph; the label + color
+    // carries the meaning.
     let ctx_style = if state.ctx_pct >= 80 {
-        theme.ink(Colors::ABORT)
+        theme.ink(Colors::ABORT).add_modifier(Modifier::BOLD)
     } else {
-        theme.ink(Colors::ACCENT)
+        theme.ink(Colors::ACCENT).add_modifier(Modifier::BOLD)
     };
-    spans.push(Span::styled(format!("        {clock}  "), theme.dim()));
+    spans.push(Span::styled("     ctx ".to_string(), theme.dim()));
     spans.push(Span::styled(format!("{}%", state.ctx_pct), ctx_style));
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
@@ -142,22 +161,41 @@ fn render_canvas(
         return;
     }
 
-    let visible: Vec<&TurnCard> = if state.focus_mode {
-        state
+    // Which card indices map into the visible iterator.
+    let visible_indices: Vec<usize> = if state.focus_mode {
+        // The last live card, else the last card overall.
+        let live = state
             .cards
             .iter()
+            .enumerate()
             .rev()
-            .find(|c| c.is_live())
-            .map(|c| vec![c])
-            .unwrap_or_else(|| state.cards.last().map(|c| vec![c]).unwrap_or_default())
+            .find(|(_, c)| c.is_live())
+            .map(|(i, _)| i);
+        match live {
+            Some(i) => vec![i],
+            None => state
+                .cards
+                .len()
+                .checked_sub(1)
+                .map(|i| vec![i])
+                .unwrap_or_default(),
+        }
     } else {
-        state.cards.iter().collect()
+        (0..state.cards.len()).collect()
     };
 
     let mut lines: Vec<Line<'static>> = Vec::new();
-    for card in &visible {
+    // Hint parallel with `lines` (same index). None on blank/prose lines.
+    let mut row_hints: Vec<Option<(usize, super::card::RowHint)>> = Vec::new();
+
+    for &card_idx in &visible_indices {
         lines.push(Line::from(""));
-        lines.extend(card.render_lines(theme, cursor_phase, bar_phase));
+        row_hints.push(None);
+        let rows = state.cards[card_idx].render_rows(theme, cursor_phase, bar_phase);
+        for (line, hint) in rows {
+            lines.push(line);
+            row_hints.push(hint.map(|h| (card_idx, h)));
+        }
     }
 
     let total = lines.len() as u16;
@@ -171,6 +209,32 @@ fn render_canvas(
         state.scroll_offset = 0;
         max_scroll
     };
+
+    // Populate click_map by mapping each visible row to its absolute
+    // terminal Y. Rows scrolled off-screen contribute nothing.
+    let first_visible = scroll_pos as usize;
+    let last_visible = (scroll_pos + visible_height) as usize;
+    for (line_idx, hint) in row_hints.iter().enumerate() {
+        if line_idx < first_visible || line_idx >= last_visible {
+            continue;
+        }
+        let relative_y = line_idx - first_visible;
+        let absolute_y = area.y as usize + relative_y;
+        if let Some((card_idx, h)) = hint {
+            let target = match h {
+                super::card::RowHint::ThoughtsHeader => ClickTarget::ThoughtsToggle {
+                    card_idx: *card_idx,
+                },
+                super::card::RowHint::CellHeader { cell_idx } => ClickTarget::CellToggle {
+                    card_idx: *card_idx,
+                    cell_idx: *cell_idx,
+                },
+            };
+            if absolute_y < state.click_map.len() {
+                state.click_map[absolute_y] = Some(target);
+            }
+        }
+    }
 
     let body = Paragraph::new(lines)
         .wrap(Wrap { trim: false })
