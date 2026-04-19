@@ -49,12 +49,16 @@ pub struct Theme {
 }
 
 impl Theme {
-    /// Probe the environment once at startup.
+    /// Probe the environment once at startup. Locale precedence per
+    /// POSIX: `LC_ALL` overrides everything, then `LC_CTYPE`, then
+    /// `LANG`. Earlier code probed `LANG` first, so a system with
+    /// `LANG=en_US.UTF-8 LC_ALL=C` would incorrectly enable Unicode
+    /// glyphs (mojibake risk in cwd-locale-restricted shells).
     pub fn detect() -> Self {
         let term_ok = std::env::var("TERM").map(|t| t != "dumb").unwrap_or(true);
-        let utf_ok = std::env::var("LANG")
-            .or_else(|_| std::env::var("LC_ALL"))
+        let utf_ok = std::env::var("LC_ALL")
             .or_else(|_| std::env::var("LC_CTYPE"))
+            .or_else(|_| std::env::var("LANG"))
             .map(|v| v.to_uppercase().contains("UTF-8") || v.to_uppercase().contains("UTF8"))
             .unwrap_or(false);
         Self {

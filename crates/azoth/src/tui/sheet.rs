@@ -128,19 +128,32 @@ pub fn render(
 
     // Register click targets for each button on the action row.
     // Layout (relative to chunks[1].x): "↵ approve once   s session
-    // p scoped paths   ⎋ deny". Width offsets match the spans built
-    // above. Mouse hits in these X spans on the action row Y route
-    // through `handle_click_target`.
+    // p scoped paths   ⎋ deny". Each button is clamped to the actual
+    // chunks[1] span — earlier code used a fixed `base + 56` upper
+    // bound that overshot narrow sheets, leaving the rightmost
+    // buttons unclickable when the sheet rendered at its 48-col floor.
     let action_y = chunks[1].y as usize;
     if action_y < click_map.len() {
         let base = chunks[1].x;
-        click_map[action_y].push((base..base + 17, ClickTarget::SheetApproveOnce));
-        click_map[action_y].push((base + 17..base + 29, ClickTarget::SheetApproveSession));
+        let bound = base.saturating_add(chunks[1].width);
+        let clamp = |start: u16, end: u16| -> std::ops::Range<u16> {
+            let s = start.min(bound);
+            let e = end.min(bound);
+            s..e
+        };
+        click_map[action_y].push((clamp(base, base + 17), ClickTarget::SheetApproveOnce));
+        click_map[action_y].push((
+            clamp(base + 17, base + 29),
+            ClickTarget::SheetApproveSession,
+        ));
         // Scoped-paths shares the SheetApproveSession action in v1
         // (per the keyboard handler comment), so route the click the
         // same way for now.
-        click_map[action_y].push((base + 29..base + 46, ClickTarget::SheetApproveSession));
-        click_map[action_y].push((base + 46..base + 56, ClickTarget::SheetDeny));
+        click_map[action_y].push((
+            clamp(base + 29, base + 46),
+            ClickTarget::SheetApproveSession,
+        ));
+        click_map[action_y].push((clamp(base + 46, base + 56), ClickTarget::SheetDeny));
     }
 }
 
