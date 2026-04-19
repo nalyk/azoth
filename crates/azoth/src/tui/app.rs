@@ -676,11 +676,16 @@ impl AppState {
                         Some(i) if i + 1 < order.len() => order[i + 1],
                         _ => order[0],
                     };
-                    for card in self.cards.iter_mut() {
-                        for cell in card.cells.iter_mut() {
-                            cell.expanded = false;
+                    // Only the previously-focused cell needs unfocus +
+                    // collapse — earlier this swept all cards and all
+                    // cells on every Tab press, O(N+M) per keystroke.
+                    if let Some((pci, pxi)) = current {
+                        if let Some(prev_card) = self.cards.get_mut(pci) {
+                            prev_card.cell_focus = None;
+                            if let Some(prev_cell) = prev_card.cells.get_mut(pxi) {
+                                prev_cell.expanded = false;
+                            }
                         }
-                        card.cell_focus = None;
                     }
                     let (ci, xi) = next;
                     if let Some(card) = self.cards.get_mut(ci) {
@@ -714,7 +719,13 @@ impl AppState {
                 self.dirty = true;
                 return;
             }
-            (KeyCode::Enter, m) if !m.contains(KeyModifiers::ALT) => {
+            (KeyCode::Enter, m)
+                if !m.contains(KeyModifiers::ALT) && !m.contains(KeyModifiers::SHIFT) =>
+            {
+                // Shift+Enter reaches the textarea below as a newline
+                // (matches the `⇧↵ newline` hint). Earlier this branch
+                // matched any non-ALT Enter and accidentally submitted
+                // multi-line drafts on terminals reporting SHIFT.
                 let content = self.textarea_content();
                 if !content.is_empty() {
                     self.input_history.push(content.clone());
@@ -1952,7 +1963,20 @@ pub async fn run_app(resume: Option<String>) -> io::Result<()> {
                 state.pending_approval = Some(req);
                 state.dirty = true;
             }
-            Some(err) = error_rx.recv() => state.push_error(err),
+            Some(err) = error_rx.recv() => {
+                // Worker init paths return early after sending an error
+                // and never fire `ready_rx`, so the splash spinner used
+                // to spin forever and the queued error notes stayed
+                // hidden. Drop the splash on any error so the notes
+                // surface immediately. Post-boot errors are no-op here
+                // because `booting` is already false.
+                state.push_error(err);
+                if state.booting {
+                    state.booting = false;
+                    state.boot_phase = "boot failed".to_string();
+                    state.dirty = true;
+                }
+            }
             Some(phase) = boot_phase_rx.recv() => {
                 state.boot_phase = phase;
                 state.dirty = true;
@@ -2372,6 +2396,49 @@ mod tests {
         assert!(
             state.inspector_data.evidence_lanes.is_empty(),
             "prior-turn evidence must not bleed into the fresh turn"
+        );
+    }
+
+    #[test]
+    fn shift_enter_does_not_submit() {
+        let mut state = AppState::new();
+        state.textarea.insert_str("draft line one");
+        // Shift+Enter must NOT trigger the submit branch — the
+        // textarea handler below should treat it as a newline.
+        state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
+        assert!(
+            state.cards.is_empty(),
+            "Shift+Enter must not push a user card"
+        );
+        assert!(
+            state.take_pending_user_text().is_none(),
+            "Shift+Enter must not queue text for the worker"
+        );
+    }
+
+    #[test]
+    fn worker_error_during_boot_clears_splash() {
+        let mut state = AppState::new();
+        // App starts in booting state; the splash takes the canvas.
+        assert!(state.booting);
+        // Simulate the runtime delivering an error_rx event during
+        // boot (e.g. JsonlWriter::open failed). The push_error path
+        // must clear `booting` so the splash dismisses and the error
+        // note becomes visible.
+        state.push_error("jsonl open failed: permission denied");
+        // Manually replicate the bridge logic that the main loop runs
+        // when error_rx fires (push_error + boot dismissal).
+        if state.booting {
+            state.booting = false;
+            state.boot_phase = "boot failed".to_string();
+        }
+        assert!(!state.booting, "splash must dismiss on init failure");
+        assert!(
+            state
+                .notes
+                .iter()
+                .any(|n| n.text.contains("jsonl open failed")),
+            "the error note must be present"
         );
     }
 

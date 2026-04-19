@@ -427,16 +427,6 @@ fn render_code_island(out: &mut Vec<Line<'static>>, theme: &Theme, lang: Option<
 /// Python, JSON/TOML basics, JS/TS. Falls through to plain for
 /// unknown languages.
 fn tint_code(line: &str, lang: &str, theme: &Theme) -> Vec<Span<'static>> {
-    // The byte-level tokenizer below is only safe + meaningful on
-    // pure ASCII source. Multi-byte characters (Cyrillic identifiers,
-    // emoji in string literals, unicode operators) bypass every
-    // ASCII-byte check, so the loops still produce char-aligned
-    // slices but the highlighting becomes meaningless. Bail to plain
-    // ink on non-ASCII input — better to under-highlight than to
-    // mis-tint or risk a future tokenizer change panicking.
-    if !line.is_ascii() {
-        return vec![Span::styled(line.to_string(), theme.ink(Palette::INK_1))];
-    }
     let lang_l = lang.to_lowercase();
     let keywords: &[&str] = match lang_l.as_str() {
         "rust" | "rs" => &[
@@ -504,8 +494,18 @@ fn tint_code(line: &str, lang: &str, theme: &Theme) -> Vec<Span<'static>> {
             return spans;
         }
 
-        // String literal — double-quoted.
-        if b == b'"' || (b == b'\'' && (lang_l == "python" || lang_l == "py")) {
+        // String literal — double-quoted always; single-quoted in
+        // Python (str) + JS/TS (string) + Rust (char literal). Rust's
+        // char literal is one-codepoint-then-close, but the same
+        // backslash-aware loop handles it correctly because the close
+        // quote always lands within a few bytes.
+        if b == b'"'
+            || (b == b'\''
+                && matches!(
+                    lang_l.as_str(),
+                    "python" | "py" | "javascript" | "js" | "typescript" | "ts" | "rust" | "rs"
+                ))
+        {
             let quote = b;
             let start = i;
             i += 1;
@@ -670,15 +670,42 @@ mod tests {
     }
 
     #[test]
-    fn tint_code_falls_through_to_plain_on_non_ascii() {
+    fn tint_code_handles_mixed_ascii_and_multi_byte_content() {
         let theme = Theme { unicode: true };
-        // Rust keyword `let` would normally get accent. With non-ASCII
-        // (Cyrillic identifier or emoji) anywhere in the line, the
-        // tokenizer bails to plain — better than mis-tinting or
-        // risking a future panic on byte-level slicing.
+        // Round 6: tokenizer is UTF-8 safe — ASCII-byte exit checks
+        // always land on char boundaries, so slicing never panics.
+        // ASCII tokens still get highlighting around multi-byte runs;
+        // multi-byte content falls through to plain ink. No char is
+        // dropped on round-trip.
         let spans = tint_code("let café = 1;", "rust", &theme);
-        assert_eq!(spans.len(), 1, "non-ASCII line collapses to a single span");
-        assert!(spans[0].content.contains("café"));
+        assert!(
+            spans.len() > 1,
+            "ASCII tokens still split out around multi-byte content"
+        );
+        let combined: String = spans
+            .iter()
+            .map(|s| s.content.as_ref().to_string())
+            .collect();
+        assert_eq!(combined, "let café = 1;", "no character is dropped");
+    }
+
+    #[test]
+    fn tint_code_recognises_single_quoted_strings_in_js_and_ts() {
+        let theme = Theme { unicode: true };
+        // Round 6: single-quote string literals now highlight in JS,
+        // TypeScript, and Rust (char literal) — previously only Python.
+        for lang in ["js", "ts", "javascript", "typescript", "rust"] {
+            let spans = tint_code("let x = 'hi';", lang, &theme);
+            let combined: String = spans
+                .iter()
+                .map(|s| s.content.as_ref().to_string())
+                .collect();
+            assert_eq!(combined, "let x = 'hi';", "{lang}: round-trip");
+            assert!(
+                spans.iter().any(|s| s.content.as_ref() == "'hi'"),
+                "{lang}: single-quoted span recognised as a literal"
+            );
+        }
     }
 
     #[test]

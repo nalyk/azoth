@@ -19,7 +19,12 @@ use super::theme::{Palette as Colors, Theme};
 /// the active card (which is top-most in the canvas).
 pub fn render(f: &mut Frame, area: Rect, req: &ApprovalRequestMsg, theme: &Theme) {
     let body_lines = effect_preview(req);
-    let body_height = (body_lines.len() as u16 + 5).clamp(9, area.height.saturating_sub(6));
+    // On a small terminal `area.height - 6` can fall below the
+    // minimum-height floor of 9 — the previous `clamp(9, max)` then
+    // panics because min > max. Normalise the upper bound to be at
+    // least 9 (we'll cap with `area.height - 4` below regardless).
+    let upper = area.height.saturating_sub(6).max(9);
+    let body_height = (body_lines.len() as u16 + 5).clamp(9, upper);
 
     let w = (area.width.saturating_mul(72) / 100).clamp(48, 120);
     let x = area.x + area.width.saturating_sub(w) / 2;
