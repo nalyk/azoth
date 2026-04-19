@@ -1049,6 +1049,7 @@ impl AppState {
                             created_at: Instant::now(),
                             cached_preview_render: None,
                             cached_full_render: None,
+                            cached_header_parts: None,
                         };
                         if let Some(card) = self.card_by_turn_id_mut(&tid) {
                             card.add_cell(cell);
@@ -1300,6 +1301,11 @@ impl AppState {
                     card.state = CardState::Committed;
                     card.usage = Some(chip);
                     card.committed_at = Some(Instant::now());
+                    // Wall-clock counterpart for resume-stable "t+Xs"
+                    // labels. `committed_at` stays monotonic for the
+                    // bloom animation; `committed_wall` is what the
+                    // header cache reads.
+                    card.committed_wall = Some(std::time::SystemTime::now());
                 }
                 self.committed_turns = self.committed_turns.saturating_add(1);
                 self.whisper.clear();
@@ -2434,6 +2440,7 @@ mod tests {
             created_at: std::time::Instant::now(),
             cached_preview_render: None,
             cached_full_render: None,
+            cached_header_parts: None,
         });
         state.cards.push(agent);
 

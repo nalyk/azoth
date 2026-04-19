@@ -51,10 +51,35 @@ pub fn render(md: &str, theme: &Theme) -> Vec<Line<'static>> {
 
     for ev in parser {
         match ev {
-            Event::Start(Tag::Paragraph) => {}
+            Event::Start(Tag::Paragraph) => {
+                // R27 fix (gemini MED, markdown.rs:123): when a list
+                // item holds multiple paragraphs, the marker + indent
+                // are only pushed at `Start(Tag::Item)`. Subsequent
+                // paragraphs begin with `current_spans` empty (the
+                // previous End(Paragraph) flushed them) and therefore
+                // wrap flush-left, visually escaping the item.
+                // Compute the continuation indent from `list_depth` so
+                // follow-up paragraphs align under the marker column:
+                // `Start(Tag::Item)` pushes `"  ".repeat(depth-1)`
+                // then a 2-char marker; continuation = `"  ".repeat(depth)`.
+                if list_depth > 0 && current_spans.is_empty() {
+                    let indent = "  ".repeat(list_depth);
+                    current_spans.push(Span::raw(indent));
+                }
+            }
             Event::End(TagEnd::Paragraph) => {
                 flush(&mut out, &mut current_spans);
-                out.push(Line::from(""));
+                // R27 fix (gemini MED, markdown.rs:58): the blank line
+                // between paragraphs inside a blockquote must carry
+                // the `│ ` bar; otherwise the left rail collapses and
+                // the blockquote visually splits into two unrelated
+                // paragraphs. Non-blockquote contexts keep the plain
+                // blank separator.
+                if in_blockquote {
+                    out.push(Line::from(Span::styled("│ ", theme.ink(Palette::ACCENT))));
+                } else {
+                    out.push(Line::from(""));
+                }
             }
             Event::Start(Tag::Heading { level, .. }) => {
                 flush(&mut out, &mut current_spans);
@@ -703,6 +728,56 @@ mod tests {
         assert_eq!(pad_to("hello", 0), "");
         assert_eq!(pad_to("", 0), "");
         assert_eq!(pad_to("é", 0), ""); // multi-byte char also empty
+    }
+
+    #[test]
+    fn blockquote_blank_between_paragraphs_carries_bar() {
+        // R27 fix (gemini MED markdown.rs:58): a blank line between
+        // two paragraphs inside a blockquote must still render the
+        // `│ ` bar. Otherwise the left rail collapses between
+        // paragraphs and the blockquote visually fractures.
+        let theme = Theme { unicode: true };
+        let md = "> First paragraph.\n>\n> Second paragraph.\n";
+        let lines = render(md, &theme);
+        let has_bar_blank = lines
+            .iter()
+            .any(|l| l.spans.len() == 1 && l.spans[0].content.starts_with('│'));
+        assert!(
+            has_bar_blank,
+            "expected a blank line carrying the `│ ` bar between blockquote paragraphs; got rendered lines: {:?}",
+            lines
+                .iter()
+                .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn list_item_continuation_paragraph_keeps_indent() {
+        // R27 fix (gemini MED markdown.rs:123): a list item holding
+        // multiple paragraphs must indent every paragraph, not just
+        // the first. `Start(Tag::Item)` only emits the marker once,
+        // so follow-up paragraphs flush left without help.
+        let theme = Theme { unicode: true };
+        let md = "- First paragraph of item.\n\n  Second paragraph of same item.\n";
+        let lines = render(md, &theme);
+        // Locate the line containing "Second paragraph" — the first
+        // span on that line must be a non-empty whitespace indent.
+        let second = lines
+            .iter()
+            .find(|l| {
+                l.spans
+                    .iter()
+                    .any(|s| s.content.contains("Second paragraph"))
+            })
+            .expect("rendered output should contain the second paragraph");
+        let first_span = &second.spans[0];
+        assert!(
+            !first_span.content.is_empty()
+                && first_span.content.chars().all(|c| c == ' '),
+            "expected continuation paragraph to start with whitespace indent; got first span content {:?}",
+            first_span.content
+        );
     }
 
     #[test]

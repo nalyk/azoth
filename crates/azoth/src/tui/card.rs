@@ -6,7 +6,7 @@
 //! values, avoiding the per-frame `String::clone` tax the old
 //! `Vec<String>` + `Line::from(s.clone())` loop paid.
 
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -79,6 +79,31 @@ pub struct ToolCell {
     pub cached_preview_render: Option<Vec<Line<'static>>>,
     /// Same lazy cache for the expanded view (`full_lines`).
     pub cached_full_render: Option<Vec<Line<'static>>>,
+    /// R27: cached pre-formatted strings for the cell header row.
+    /// Prevents the per-frame `format!` of chevron + summary on every
+    /// visible cell (gemini MED card.rs:664). The result-chip + focus
+    /// marker are still rebuilt per-frame because they depend on
+    /// animation phase / keyboard focus which change outside the cell.
+    pub cached_header_parts: Option<CachedCellHeaderParts>,
+}
+
+/// Pre-formatted fragments of a `ToolCell` header, cached until its
+/// inputs change. `expanded`, `has_content`, and `theme.unicode` are
+/// all part of the key because they flip the disclosure glyph.
+/// Focus marker is NOT cached — it changes on every keyboard Tab,
+/// while everything else in the header moves at cell-update velocity
+/// (set_preview_lines / set_full_lines).
+#[derive(Debug, Clone)]
+pub struct CachedCellHeaderParts {
+    unicode: bool,
+    expanded: bool,
+    has_content: bool,
+    name_snapshot: String,
+    summary_snapshot: String,
+    /// Disclosure glyph — `&'static str` from `theme.glyph()` branch.
+    pub disclosure_char: &'static str,
+    /// Pre-formatted `"  {truncated_summary}"` span content.
+    pub summary_fragment: String,
 }
 
 impl ToolCell {
@@ -87,6 +112,9 @@ impl ToolCell {
     pub fn set_preview_lines(&mut self, lines: Vec<String>) {
         self.preview_lines = lines;
         self.cached_preview_render = None;
+        // `has_content` changes when preview transitions between empty
+        // and non-empty — invalidate the header disclosure glyph cache.
+        self.cached_header_parts = None;
     }
 
     /// Replace the full lines and drop the rendered cache so the next
@@ -94,6 +122,52 @@ impl ToolCell {
     pub fn set_full_lines(&mut self, lines: Vec<String>) {
         self.full_lines = lines;
         self.cached_full_render = None;
+        self.cached_header_parts = None;
+    }
+
+    /// Build the disclosure + summary header fragments lazily,
+    /// reusing the cached version when every input matches.
+    pub fn ensure_header_parts_cache(
+        &mut self,
+        theme: &Theme,
+        has_content: bool,
+    ) -> &CachedCellHeaderParts {
+        let need_rebuild = match &self.cached_header_parts {
+            None => true,
+            Some(c) => {
+                c.unicode != theme.unicode
+                    || c.expanded != self.expanded
+                    || c.has_content != has_content
+                    || c.name_snapshot != self.name
+                    || c.summary_snapshot != self.summary
+            }
+        };
+        if need_rebuild {
+            let disclosure_char: &'static str = if !has_content {
+                " "
+            } else if self.expanded {
+                if theme.unicode {
+                    "▾"
+                } else {
+                    "-"
+                }
+            } else if theme.unicode {
+                "▸"
+            } else {
+                "+"
+            };
+            let summary_fragment = format!("  {}", truncate(&self.summary, 56));
+            self.cached_header_parts = Some(CachedCellHeaderParts {
+                unicode: theme.unicode,
+                expanded: self.expanded,
+                has_content,
+                name_snapshot: self.name.clone(),
+                summary_snapshot: self.summary.clone(),
+                disclosure_char,
+                summary_fragment,
+            });
+        }
+        self.cached_header_parts.as_ref().unwrap()
     }
 
     /// Return the rendered preview lines (collapsed view), refreshing
@@ -232,9 +306,24 @@ pub struct TurnCard {
     pub cells: Vec<ToolCell>,
     pub usage: Option<UsageChip>,
     pub started: Instant,
+    /// Wall-clock counterpart to `started`, persistable across session
+    /// resume. `Instant` is monotonic but resets on process restart;
+    /// loading a JSONL session rebuilds `started` with `Instant::now()`
+    /// at resume time, making "t+Xs" display read `0s` for every
+    /// historical card (gemini MED card.rs:416). `started_wall` lets
+    /// the display compute elapsed against the ORIGINAL turn timestamp,
+    /// while animation clocks keep using the mono `started` field.
+    /// Defaults to `SystemTime::now()` at construction; resume path
+    /// can override with the event's wall-clock timestamp.
+    pub started_wall: SystemTime,
     /// Set when the card transitions to `Committed`. Used to drive
     /// the commit-bloom effect (accent bar glows brighter for ~600ms).
     pub committed_at: Option<Instant>,
+    /// Wall-clock counterpart to `committed_at`. Frozen "t+Xs" labels
+    /// for terminal cards compute as `committed_wall - started_wall`,
+    /// which stays stable across session resume. Bloom animation
+    /// continues to use the mono `committed_at` field.
+    pub committed_wall: Option<SystemTime>,
     /// Last time prose was appended — drives the streaming shimmer
     /// (trailing accent glow on newly-typed characters).
     pub last_append: Option<Instant>,
@@ -248,6 +337,30 @@ pub struct TurnCard {
     /// count, so off-screen cards skip `render_rows` entirely on
     /// long sessions.
     pub last_rendered_rows: usize,
+    /// R27: cached pre-formatted timestamp + usage chip strings for
+    /// the card header. Addresses gemini MED card.rs:436 — the header
+    /// runs several `format!` calls per frame per visible card even
+    /// though its inputs only change on a 1Hz timestamp tick, a
+    /// terminal-state transition, or a usage-chip update. The bar
+    /// glyph and bar style still compute per-frame because they
+    /// animate with `pulse_phase_a`.
+    pub cached_header: Option<CachedCardHeader>,
+}
+
+/// Pre-formatted non-bar header strings, keyed so cache invalidates on:
+/// a 1Hz timestamp tick while live, a commit bucket freeze, a usage
+/// update, or a theme.unicode flip. The bar span is rebuilt every
+/// frame (it animates) but everything else comes from this cache.
+#[derive(Debug, Clone)]
+pub struct CachedCardHeader {
+    unicode: bool,
+    ts_bucket: u64,
+    usage_snapshot: Option<UsageChip>,
+    state_frozen: bool,
+    /// Pre-formatted timestamp span content: `"    t+Xs"`.
+    pub ts_span: String,
+    /// Pre-formatted usage-chip span content, if any: `"   X↓ Y↑"`.
+    pub usage_span: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -268,6 +381,7 @@ pub enum RowHint {
 impl TurnCard {
     pub fn user(turn_id: impl Into<String>, text: impl Into<String>) -> Self {
         let now = Instant::now();
+        let now_wall = SystemTime::now();
         Self {
             turn_id: turn_id.into(),
             role: CardRole::User,
@@ -282,11 +396,14 @@ impl TurnCard {
             cells: Vec::new(),
             usage: None,
             started: now,
+            started_wall: now_wall,
             committed_at: Some(now),
+            committed_wall: Some(now_wall),
             last_append: None,
             contract_goal: None,
             cell_focus: None,
             last_rendered_rows: 0,
+            cached_header: None,
         }
     }
     pub fn agent(turn_id: impl Into<String>) -> Self {
@@ -304,11 +421,14 @@ impl TurnCard {
             cells: Vec::new(),
             usage: None,
             started: Instant::now(),
+            started_wall: SystemTime::now(),
             committed_at: None,
+            committed_wall: None,
             last_append: None,
             contract_goal: None,
             cell_focus: None,
             last_rendered_rows: 0,
+            cached_header: None,
         }
     }
 
@@ -407,32 +527,97 @@ impl TurnCard {
             CardRole::System => theme.italic_dim(),
         };
 
-        // Header: bar + role + usage chip + timestamp.
-        let elapsed = self.started.elapsed().as_secs_f32();
-        let ts_label = if elapsed < 10.0 {
-            format!("t+{elapsed:.1}s")
-        } else {
-            format!("t+{:.0}s", elapsed)
+        // R27: non-bar header parts (ts_label + usage chip) come
+        // from a cache keyed on (ts_bucket, usage, unicode). The bar
+        // animates with `pulse_phase_a` so it stays out of the cache
+        // and rebuilds every frame. gemini MED card.rs:436 addressed:
+        // the two `format!` calls (timestamp + usage chip) no longer
+        // fire per-frame on cache hits, only once per second while
+        // live and once per state transition once terminal.
+        let state_frozen = !matches!(self.state, CardState::Live | CardState::AwaitingApproval);
+        // R27 display-elapsed uses `started_wall` + `committed_wall`
+        // (SystemTime) instead of `started` + `committed_at` (Instant)
+        // so that "t+Xs" survives session resume. Animation clocks
+        // (bloom, shimmer, spinner) still use the monotonic fields.
+        let display_elapsed_secs_f32 = |from: SystemTime, to: SystemTime| -> f32 {
+            to.duration_since(from)
+                .unwrap_or_else(|e| e.duration())
+                .as_secs_f32()
         };
+        let ts_bucket = if state_frozen {
+            // Terminal — freeze elapsed at the moment of commit
+            // (wall-clock). If we never set `committed_wall` (e.g.,
+            // abort/interrupt before commit), fall back to the last
+            // known SystemTime::now() for this card's lifetime.
+            if let Some(cw) = self.committed_wall {
+                display_elapsed_secs_f32(self.started_wall, cw) as u64
+            } else {
+                display_elapsed_secs_f32(self.started_wall, SystemTime::now()) as u64
+            }
+        } else {
+            // Live — tick at 1Hz.
+            display_elapsed_secs_f32(self.started_wall, SystemTime::now()) as u64
+        };
+        let need_rebuild = match &self.cached_header {
+            None => true,
+            Some(c) => {
+                c.unicode != theme.unicode
+                    || c.ts_bucket != ts_bucket
+                    || c.usage_snapshot.map(|u| (u.input_tokens, u.output_tokens))
+                        != self.usage.map(|u| (u.input_tokens, u.output_tokens))
+                    || c.state_frozen != state_frozen
+            }
+        };
+        if need_rebuild {
+            // Use the SAME wall-clock reference for display-elapsed
+            // so the decimal precision in the format string matches
+            // the bucket's integer seconds. Reading Instant::elapsed()
+            // here would drift by up to one frame against ts_bucket.
+            let elapsed = if state_frozen {
+                if let Some(cw) = self.committed_wall {
+                    display_elapsed_secs_f32(self.started_wall, cw)
+                } else {
+                    display_elapsed_secs_f32(self.started_wall, SystemTime::now())
+                }
+            } else {
+                display_elapsed_secs_f32(self.started_wall, SystemTime::now())
+            };
+            let ts_span = if elapsed < 10.0 {
+                format!("    t+{elapsed:.1}s")
+            } else {
+                format!("    t+{:.0}s", elapsed)
+            };
+            let usage_span = self.usage.map(|u| {
+                format!(
+                    "   {}↓ {}↑",
+                    chip_num(u.input_tokens),
+                    chip_num(u.output_tokens)
+                )
+            });
+            self.cached_header = Some(CachedCardHeader {
+                unicode: theme.unicode,
+                ts_bucket,
+                usage_snapshot: self.usage,
+                state_frozen,
+                ts_span,
+                usage_span,
+            });
+        }
+        let cache = self.cached_header.as_ref().expect("header cache set above");
         // `bar` and `role.label()` are `&'static str` — pass them
-        // directly to Span::styled (Cow::Borrowed) instead of
-        // allocating String per frame per visible card.
+        // directly. Cached spans are `String` and must be cloned to
+        // satisfy `Line<'static>`; the clone cost is a single
+        // `String::clone` each (2 at most), down from multiple
+        // `format!` heap allocs + formatter machinery per frame.
         let mut header = vec![
             Span::styled(bar, bar_style),
             Span::raw(" "),
             Span::styled(self.role.label(), role_style),
         ];
-        if let Some(usage) = self.usage {
-            header.push(Span::styled(
-                format!(
-                    "   {}↓ {}↑",
-                    chip_num(usage.input_tokens),
-                    chip_num(usage.output_tokens)
-                ),
-                theme.dim(),
-            ));
+        if let Some(usage_span) = &cache.usage_span {
+            header.push(Span::styled(usage_span.clone(), theme.dim()));
         }
-        header.push(Span::styled(format!("    {ts_label}"), theme.dim()));
+        header.push(Span::styled(cache.ts_span.clone(), theme.dim()));
         out.push((Line::from(header), None));
         out.push((Line::from(""), None));
 
@@ -594,22 +779,17 @@ impl TurnCard {
             out.push((Line::from(""), None));
             let prefix = theme.glyph(Theme::CELL_PREFIX);
             let focus_marker = if cell_focus == Some(i) { "·" } else { " " };
-            // Disclosure triangle — makes the cell obviously clickable
-            // and its state obviously toggleable. ▾ when expanded,
-            // ▸ when collapsed, ASCII `+/-` on non-Unicode terminals.
             let has_content = !cell.preview_lines.is_empty() || !cell.full_lines.is_empty();
-            let disclosure = if !has_content {
-                " "
-            } else if cell.expanded {
-                if theme.unicode {
-                    "▾"
-                } else {
-                    "-"
-                }
-            } else if theme.unicode {
-                "▸"
-            } else {
-                "+"
+            // R27: `disclosure_char` + summary_fragment come from a
+            // per-cell cache keyed on (name, summary, expanded,
+            // has_content, theme.unicode). Copy the two fields we
+            // need out of the borrow so cell is usable again by the
+            // `&cell.result` match below. gemini MED card.rs:664
+            // addressed: the branchy disclosure match + `format!("  {}",
+            // truncate(summary, 56))` no longer run per-frame on hits.
+            let (disclosure, summary_fragment) = {
+                let cache = cell.ensure_header_parts_cache(theme, has_content);
+                (cache.disclosure_char, cache.summary_fragment.clone())
             };
             let result_chip = match &cell.result {
                 CellResult::Pending if card_live => {
@@ -659,7 +839,7 @@ impl TurnCard {
                 // `Cow::Owned(arc.to_string())` would still allocate.
                 // No win.
                 Span::styled(cell.name.clone(), theme.bold()),
-                Span::styled(format!("  {}", truncate(&cell.summary, 56)), theme.dim()),
+                Span::styled(summary_fragment, theme.dim()),
                 result_chip,
             ]);
             // Hint: clicking this row toggles the cell's expansion.
@@ -960,6 +1140,7 @@ mod tests {
             created_at: Instant::now(),
             cached_preview_render: None,
             cached_full_render: None,
+            cached_header_parts: None,
         });
         assert_eq!(c.cells.len(), 1);
         c.cells[0].expanded = true;
@@ -981,6 +1162,7 @@ mod tests {
             created_at: Instant::now(),
             cached_preview_render: None,
             cached_full_render: None,
+            cached_header_parts: None,
         });
         let theme = Theme { unicode: true };
         let lines = c.render_lines(&theme, true, true);
@@ -1079,6 +1261,7 @@ mod tests {
             created_at: Instant::now(),
             cached_preview_render: None,
             cached_full_render: None,
+            cached_header_parts: None,
         });
         let theme = Theme { unicode: true };
         // First paint populates the cache.
@@ -1108,5 +1291,134 @@ mod tests {
         // set_preview_lines invalidates.
         c.cells[0].set_preview_lines(vec!["new".into()]);
         assert!(c.cells[0].cached_preview_render.is_none());
+    }
+
+    #[test]
+    fn cached_card_header_survives_same_second_rerender() {
+        // R27 regression test: once the header has been built for a
+        // given ts_bucket + usage + unicode snapshot, a follow-up
+        // render in the same second must reuse the cached strings
+        // rather than rebuild them via `format!`. The sentinel test
+        // cuffs the cache in place and verifies survival.
+        let mut c = TurnCard::agent("t-hdr");
+        c.append_prose("anything");
+        let theme = Theme { unicode: true };
+        let _ = c.render_lines(&theme, true, true);
+        assert!(
+            c.cached_header.is_some(),
+            "first render must fill header cache"
+        );
+        c.cached_header.as_mut().unwrap().ts_span = "HDR_SENTINEL".into();
+        // Second render in the same second.
+        let _ = c.render_lines(&theme, true, true);
+        let still = c
+            .cached_header
+            .as_ref()
+            .unwrap()
+            .ts_span
+            .contains("HDR_SENTINEL");
+        assert!(still, "header cache must survive intra-second rerender");
+    }
+
+    #[test]
+    fn header_ts_label_uses_wall_clock_not_instant_for_resume_stability() {
+        // R27 fix (gemini MED card.rs:416): if "t+Xs" were derived
+        // from `Instant` (mono), historical cards after resume would
+        // all show "t+0.0s" because Instant resets on process restart.
+        // Wall-clock `started_wall` keeps the display honest.
+        let mut c = TurnCard::agent("t-resume");
+        c.append_prose("x");
+        // Simulate a resumed historical card: wind `started_wall`
+        // back 90 seconds while leaving `started` (mono) at now.
+        c.started_wall = std::time::SystemTime::now() - std::time::Duration::from_secs(90);
+        let theme = Theme { unicode: true };
+        let _ = c.render_lines(&theme, true, true);
+        let ts_span = c.cached_header.as_ref().unwrap().ts_span.clone();
+        // Accept anything from 89 to 91 (allow 1s jitter around the
+        // rebuild path). Critically, it must NOT be "0" or "0.0".
+        assert!(
+            ts_span.contains("t+90s") || ts_span.contains("t+89s") || ts_span.contains("t+91s"),
+            "expected wall-clock ts_span around t+90s on a 90s-old resumed card, got {ts_span:?}"
+        );
+    }
+
+    #[test]
+    fn cached_card_header_invalidates_on_usage_change() {
+        // R27: when a card receives a usage chip update, the cached
+        // header's usage_snapshot no longer matches — the cache must
+        // rebuild so the new chip is visible.
+        let mut c = TurnCard::agent("t-hdr-usage");
+        c.append_prose("x");
+        let theme = Theme { unicode: true };
+        let _ = c.render_lines(&theme, true, true);
+        c.cached_header.as_mut().unwrap().ts_span = "HDR_SENTINEL".into();
+        // Change usage — cache key mismatches.
+        c.usage = Some(UsageChip {
+            input_tokens: 10,
+            output_tokens: 20,
+        });
+        let _ = c.render_lines(&theme, true, true);
+        let still = c
+            .cached_header
+            .as_ref()
+            .unwrap()
+            .ts_span
+            .contains("HDR_SENTINEL");
+        assert!(!still, "usage change must invalidate header cache");
+    }
+
+    #[test]
+    fn cached_cell_header_survives_rerender_and_invalidates_on_summary_change() {
+        // R27 regression test: ToolCell's disclosure + summary
+        // fragments survive a same-inputs rerender and rebuild on
+        // set_preview_lines (has_content flip) or summary change.
+        let mut c = TurnCard::agent("t-cellhdr");
+        c.add_cell(ToolCell {
+            tool_use_id: "tu".into(),
+            name: "bash".into(),
+            summary: "initial".into(),
+            expanded: false,
+            result: CellResult::Pending,
+            preview_lines: vec!["line1".into()],
+            full_lines: vec!["line1".into()],
+            created_at: Instant::now(),
+            cached_preview_render: None,
+            cached_full_render: None,
+            cached_header_parts: None,
+        });
+        let theme = Theme { unicode: true };
+        let _ = c.render_lines(&theme, true, true);
+        assert!(
+            c.cells[0].cached_header_parts.is_some(),
+            "cell header cache populated"
+        );
+        // Stamp summary_fragment so we can prove survival.
+        c.cells[0]
+            .cached_header_parts
+            .as_mut()
+            .unwrap()
+            .summary_fragment = "CELL_HDR_SENTINEL".into();
+        let _ = c.render_lines(&theme, true, true);
+        assert_eq!(
+            c.cells[0]
+                .cached_header_parts
+                .as_ref()
+                .unwrap()
+                .summary_fragment,
+            "CELL_HDR_SENTINEL",
+            "same-inputs rerender must reuse cell header cache"
+        );
+        // Summary change triggers rebuild.
+        c.cells[0].summary = "different summary".into();
+        let _ = c.render_lines(&theme, true, true);
+        assert_ne!(
+            c.cells[0]
+                .cached_header_parts
+                .as_ref()
+                .unwrap()
+                .summary_fragment,
+            "CELL_HDR_SENTINEL",
+            "summary change must invalidate cell header cache"
+        );
     }
 }
