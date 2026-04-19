@@ -1,0 +1,220 @@
+name: release
+
+# Fires on any tag matching `vMAJOR.MINOR.PATCH` (optionally with a
+# `-prerelease` suffix). Packaging + publishing is gated on fmt,
+# clippy, the full test matrix, and a `cargo build --release` — this
+# workflow is the only pre-ship gate until a dedicated ci.yml lands.
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+-*"
+
+# Default-deny; grant only what release publishing needs.
+#   contents: write       → create the GitHub Release, upload assets
+#   id-token: write       → OIDC for SLSA build-provenance signing
+#   attestations: write   → attach provenance to the release artifacts
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Ubuntu 22.04 pins glibc 2.35 — widest-compatible Linux
+          # baseline without shipping a second static/musl build.
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+    outputs:
+      stem: ${{ steps.meta.outputs.stem }}
+      version: ${{ steps.meta.outputs.version }}
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - name: Checkout (full history for release notes)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve tag, version, archive stem
+        id: meta
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          version="${tag#v}"
+          stem="azoth-${version}-${{ matrix.target }}"
+          printf 'tag=%s\n'     "$tag"     >> "$GITHUB_OUTPUT"
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+          printf 'stem=%s\n'    "$stem"    >> "$GITHUB_OUTPUT"
+
+      - name: Verify tag matches [workspace.package].version
+        run: |
+          cargo_version=$(
+            awk '
+              /^\[workspace\.package\]/ { in_section = 1; next }
+              /^\[/                     { in_section = 0 }
+              in_section && /^version[[:space:]]*=/ {
+                gsub(/[" ]/, "", $3); print $3; exit
+              }
+            ' Cargo.toml
+          )
+          tag_version='${{ steps.meta.outputs.version }}'
+          if [ "$cargo_version" != "$tag_version" ]; then
+            echo "::error::tag v${tag_version} does not match [workspace.package].version '${cargo_version}' in Cargo.toml"
+            exit 1
+          fi
+          echo "tag ↔ Cargo.toml version agreement verified: ${tag_version}"
+
+      - name: Install Rust toolchain (stable via rust-toolchain.toml)
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup target add '${{ matrix.target }}'
+          rustc --version
+          cargo --version
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-release-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: |
+            cargo-release-${{ matrix.target }}-
+
+      - name: cargo fmt --check
+        run: cargo fmt --all --check
+
+      - name: cargo clippy (workspace, warnings-as-errors)
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      # `--test-threads=1` guards against `backpressure_smoke` flaking
+      # under parallelism (see auto-memory: backpressure_smoke_flaky).
+      - name: cargo test (workspace)
+        run: cargo test --workspace --locked -- --test-threads=1
+
+      - name: cargo build --release (target-specific)
+        run: cargo build --release --locked --target '${{ matrix.target }}' -p azoth
+
+      - name: Stage archive + SHA-256
+        id: archive
+        run: |
+          stem='${{ steps.meta.outputs.stem }}'
+          mkdir -p "dist/${stem}"
+          install -m 0755 \
+            "target/${{ matrix.target }}/release/azoth" \
+            "dist/${stem}/azoth"
+          install -m 0644 README.md      "dist/${stem}/README.md"
+          install -m 0644 LICENSE-APACHE "dist/${stem}/LICENSE-APACHE"
+          install -m 0644 LICENSE-MIT    "dist/${stem}/LICENSE-MIT"
+
+          # Deterministic tar flags: fixed sort order + zero uid/gid so
+          # archives built on different runners are byte-identical
+          # (given an identical binary).
+          tar \
+            --sort=name \
+            --owner=0 --group=0 --numeric-owner \
+            -C dist \
+            -czf "dist/${stem}.tar.gz" \
+            "${stem}"
+
+          ( cd dist && sha256sum "${stem}.tar.gz" > "${stem}.tar.gz.sha256" )
+          cat "dist/${stem}.tar.gz.sha256"
+
+          printf 'archive=dist/%s.tar.gz\n'         "$stem" >> "$GITHUB_OUTPUT"
+          printf 'checksum=dist/%s.tar.gz.sha256\n' "$stem" >> "$GITHUB_OUTPUT"
+
+      - name: SLSA v1.0 build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: ${{ steps.archive.outputs.archive }}
+
+      - name: Upload artifact (tarball + checksum)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.meta.outputs.stem }}
+          path: |
+            ${{ steps.archive.outputs.archive }}
+            ${{ steps.archive.outputs.checksum }}
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: publish github release
+    needs: build
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout (for git log range)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate release notes
+        run: |
+          tag='${{ needs.build.outputs.tag }}'
+          prev=$(git describe --tags --abbrev=0 "${tag}^" 2>/dev/null || true)
+
+          {
+            printf '## azoth %s\n\n' "$tag"
+            if [ -n "$prev" ]; then
+              printf '### Changes since %s\n\n' "$prev"
+              git log --no-merges --pretty=format:'- %s (%h)' "${prev}..${tag}"
+              printf '\n\n'
+            else
+              printf 'Initial tagged release.\n\n'
+            fi
+
+            printf '### Artifacts\n\n'
+            printf -- '- `azoth-%s-<target>.tar.gz` — release tarball (binary + README + LICENSE-{MIT,APACHE}).\n' "${tag#v}"
+            printf -- '- `*.sha256` — SHA-256 checksum sidecar.\n'
+            printf -- '- SLSA v1.0 build provenance attested via GitHub OIDC. Verify with:\n\n'
+            printf '    ```sh\n'
+            printf '    gh attestation verify azoth-%s-<target>.tar.gz --repo %s\n' "${tag#v}" '${{ github.repository }}'
+            printf '    ```\n\n'
+
+            printf '### Install (Linux x86_64)\n\n'
+            printf '```sh\n'
+            printf 'curl -L -o azoth.tar.gz https://github.com/%s/releases/download/%s/azoth-%s-x86_64-unknown-linux-gnu.tar.gz\n' '${{ github.repository }}' "$tag" "${tag#v}"
+            printf 'tar -xzf azoth.tar.gz\n'
+            printf './azoth-%s-x86_64-unknown-linux-gnu/azoth --help\n' "${tag#v}"
+            printf '```\n'
+          } > notes.md
+
+          echo "---- generated notes.md ----"
+          cat notes.md
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.build.outputs.tag }}
+          name: azoth ${{ needs.build.outputs.tag }}
+          body_path: notes.md
+          draft: false
+          prerelease: ${{ contains(needs.build.outputs.tag, '-') }}
+          fail_on_unmatched_files: true
+          files: |
+            artifacts/**/*.tar.gz
+            artifacts/**/*.tar.gz.sha256
