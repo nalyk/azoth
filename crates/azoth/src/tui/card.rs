@@ -510,9 +510,19 @@ impl TurnCard {
                 let mut spans: Vec<Span<'static>> = Vec::with_capacity(line.spans.len() + 2);
                 spans.push(Span::raw("   "));
                 for s in &line.spans {
-                    // Cow<'static, str>::clone() is cheap for Borrowed
-                    // (pointer copy) and a String memcpy for Owned —
-                    // way under the cost of re-running pulldown_cmark.
+                    // The clone is INHERENT to the canvas aggregation
+                    // pattern, not a missed optimisation. `render_canvas`
+                    // walks N cards in pass 2 and accumulates their
+                    // lines into a single `Paragraph::new(Vec<Line>)`.
+                    // Borrowing span content from `cached_prose` would
+                    // require `Vec<Line<'a>>` where 'a borrows from
+                    // `&state.cards[N]` — but the next iteration's
+                    // `render_rows` call needs `&mut state.cards[N+1]`,
+                    // and both go through the same `state.cards` Vec,
+                    // so the borrow checker rejects the aggregate.
+                    // Cow<'static, str>::clone() is pointer-copy for
+                    // Borrowed and a String memcpy for Owned — both
+                    // dominated by the saved markdown re-parse.
                     spans.push(Span::styled(s.content.clone(), s.style));
                 }
                 if Some(i) == last_non_blank_idx && tail_chars > 0 {

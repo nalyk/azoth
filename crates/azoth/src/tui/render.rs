@@ -184,8 +184,13 @@ fn render_canvas(
         return;
     }
 
-    // Which card indices map into the visible iterator.
-    let visible_indices: Vec<usize> = if state.focus_mode {
+    // Which card indices map into the visible iterator. Stored as a
+    // `Range<usize>` so we don't allocate a `Vec<usize>` of size N
+    // every frame on long sessions. Range is Clone (two usize) so
+    // we can iterate it twice (pass 1 + pass 2) without rebuilding.
+    // Focus mode collapses to a single-element range; empty session
+    // collapses to `0..0` which iterates nothing.
+    let visible_indices: std::ops::Range<usize> = if state.focus_mode {
         // The last live card, else the last card overall.
         let live = state
             .cards
@@ -194,17 +199,13 @@ fn render_canvas(
             .rev()
             .find(|(_, c)| c.is_live())
             .map(|(i, _)| i);
-        match live {
-            Some(i) => vec![i],
-            None => state
-                .cards
-                .len()
-                .checked_sub(1)
-                .map(|i| vec![i])
-                .unwrap_or_default(),
+        let idx = live.or_else(|| state.cards.len().checked_sub(1));
+        match idx {
+            Some(i) => i..i + 1,
+            None => 0..0,
         }
     } else {
-        (0..state.cards.len()).collect()
+        0..state.cards.len()
     };
 
     let visible_height = area.height;
@@ -229,9 +230,16 @@ fn render_canvas(
             rows
         }
     }
+    // Pass 1 — O(visible cards) per-frame field reads. Each iteration
+    // is just a `usize` field read against the cached row count;
+    // dominant cost is cache locality, not allocations. For sessions
+    // beyond ~10k cards a Fenwick tree on `last_rendered_rows` would
+    // give O(log N) lookup, but the constant factors of a flat sum
+    // dominate at typical sizes. Flagged for a later round if a real
+    // workload demonstrates the wall.
     let est_total: usize = visible_indices
-        .iter()
-        .map(|&i| est_h(state.cards[i].last_rendered_rows))
+        .clone()
+        .map(|i| est_h(state.cards[i].last_rendered_rows))
         .sum();
     let est_max_scroll = est_total.saturating_sub(visible_h_usize);
     let scroll_offset = state.scroll_offset as usize;
@@ -265,7 +273,7 @@ fn render_canvas(
     let mut cursor_y: usize = 0;
     let mut skipped_above_h: usize = 0;
     let mut first_card_local_skip: Option<usize> = None;
-    for &card_idx in visible_indices.iter() {
+    for card_idx in visible_indices {
         let est_h_val = est_h(state.cards[card_idx].last_rendered_rows);
         let card_y_end = cursor_y + est_h_val;
         let intersects = card_y_end > est_target_top && cursor_y < est_target_bot;
