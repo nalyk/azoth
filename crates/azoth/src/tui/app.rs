@@ -119,9 +119,11 @@ pub struct AppState {
     pub boot_phase: String,
 
     /// Click targets registered by the render path for mouse
-    /// handling. Keyed by absolute terminal Y. Repopulated every
-    /// frame so stale entries don't fire.
-    pub click_map: Vec<Option<ClickTarget>>,
+    /// handling. Outer Vec indexed by absolute terminal Y; inner Vec
+    /// holds `(x_range, ClickTarget)` pairs so multiple buttons on
+    /// one row (sheet action bar, status row toggles) are reachable.
+    /// Repopulated every frame so stale entries don't fire.
+    pub click_map: Vec<Vec<(std::ops::Range<u16>, ClickTarget)>>,
 
     pub status: String,
     pub ctx_pct: u8,
@@ -471,8 +473,29 @@ impl AppState {
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 let y = me.row as usize;
-                let target = self.click_map.get(y).cloned().flatten();
+                let x = me.column;
+                let target = self.click_map.get(y).and_then(|row| {
+                    row.iter()
+                        .find(|(r, _)| r.contains(&x))
+                        .map(|(_, t)| t.clone())
+                });
                 if let Some(t) = target {
+                    // Block canvas click-through while a modal is open
+                    // — clicks on the sheet/palette area must not also
+                    // toggle the underlying card cells. Sheet buttons
+                    // and palette open are explicit modal targets and
+                    // pass through; everything else is dropped.
+                    let modal_active = self.palette.open || self.pending_approval.is_some();
+                    let is_modal_target = matches!(
+                        t,
+                        ClickTarget::SheetApproveOnce
+                            | ClickTarget::SheetApproveSession
+                            | ClickTarget::SheetDeny
+                            | ClickTarget::PaletteOpen
+                    );
+                    if modal_active && !is_modal_target {
+                        return;
+                    }
                     self.handle_click_target(t);
                     self.dirty = true;
                 }
@@ -728,12 +751,16 @@ impl AppState {
             (KeyCode::BackTab, _) | (KeyCode::Tab, KeyModifiers::SHIFT) => {
                 // Collapse everything + drop focus. Equivalent to "back
                 // to the closed view" so Tab restarts from the latest.
+                // Reset `tab_cursor` too — otherwise the next Tab
+                // resumes from the stale cursor position instead of
+                // restarting from the newest cell.
                 for card in self.cards.iter_mut() {
                     for cell in card.cells.iter_mut() {
                         cell.expanded = false;
                     }
                     card.cell_focus = None;
                 }
+                self.tab_cursor = None;
                 self.dirty = true;
                 return;
             }
@@ -2417,6 +2444,72 @@ mod tests {
         assert!(
             state.inspector_data.evidence_lanes.is_empty(),
             "prior-turn evidence must not bleed into the fresh turn"
+        );
+    }
+
+    #[test]
+    fn shift_tab_resets_tab_cursor() {
+        use azoth_core::schemas::ToolUseId;
+        let mut state = AppState::new();
+        for tid in ["t1", "t2"] {
+            state.handle_session_event(SessionEvent::TurnStarted {
+                turn_id: TurnId::from(tid.to_string()),
+                run_id: RunId::new(),
+                parent_turn: None,
+                timestamp: "2026-04-19T00:00:00Z".into(),
+            });
+            state.handle_session_event(SessionEvent::ContentBlock {
+                turn_id: TurnId::from(tid.to_string()),
+                index: 0,
+                block: ContentBlock::ToolUse {
+                    id: ToolUseId::from(format!("tu_{tid}")),
+                    name: "bash".into(),
+                    input: serde_json::json!({}),
+                    call_group: None,
+                },
+            });
+        }
+        let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+        let shift_tab = KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE);
+        state.handle_key(tab);
+        state.handle_key(tab);
+        assert_eq!(state.tab_cursor, Some(1), "two Tabs land on cursor 1");
+        state.handle_key(shift_tab);
+        assert_eq!(
+            state.tab_cursor, None,
+            "Shift+Tab must reset cursor so next Tab restarts at 0"
+        );
+        state.handle_key(tab);
+        assert_eq!(
+            state.tab_cursor,
+            Some(0),
+            "post-reset Tab restarts at the newest cell"
+        );
+    }
+
+    #[test]
+    fn modal_active_blocks_canvas_clicks() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let mut state = AppState::new();
+        // Pre-populate the click_map with a card-target row so a
+        // simulated click would normally fire ThoughtsToggle.
+        state.click_map.resize_with(20, Vec::new);
+        state.click_map[5].push((0..u16::MAX, ClickTarget::ThoughtsToggle { card_idx: 0 }));
+        // No modal — click registers (would dirty state if a card existed,
+        // but the click_target lookup just routes; no card → no-op).
+        // We test the gate, not the downstream effect.
+        // With palette open, clicks on canvas rows must be dropped.
+        state.palette.open();
+        state.dirty = false;
+        state.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 5,
+            row: 5,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        });
+        assert!(
+            !state.dirty,
+            "canvas click while palette open must be dropped"
         );
     }
 

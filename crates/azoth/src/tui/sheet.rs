@@ -12,6 +12,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 
+use super::app::ClickTarget;
 use super::theme::{Palette as Colors, Theme};
 
 /// Render the approval sheet inside `area`. The sheet spans ~70% of
@@ -23,7 +24,13 @@ use super::theme::{Palette as Colors, Theme};
 /// truncated/malformed sheet.
 const MIN_SHEET_CANVAS_HEIGHT: u16 = 13;
 
-pub fn render(f: &mut Frame, area: Rect, req: &ApprovalRequestMsg, theme: &Theme) {
+pub fn render(
+    f: &mut Frame,
+    area: Rect,
+    req: &ApprovalRequestMsg,
+    theme: &Theme,
+    click_map: &mut [Vec<(std::ops::Range<u16>, ClickTarget)>],
+) {
     if area.height < MIN_SHEET_CANVAS_HEIGHT || area.width < 50 {
         // Tiny terminal — render a single-line warning instead of a
         // truncated modal. The earlier code happily produced a
@@ -118,6 +125,23 @@ pub fn render(f: &mut Frame, area: Rect, req: &ApprovalRequestMsg, theme: &Theme
         theme.dim(),
     ));
     f.render_widget(Paragraph::new(vec![action_line, hint_line]), chunks[1]);
+
+    // Register click targets for each button on the action row.
+    // Layout (relative to chunks[1].x): "↵ approve once   s session
+    // p scoped paths   ⎋ deny". Width offsets match the spans built
+    // above. Mouse hits in these X spans on the action row Y route
+    // through `handle_click_target`.
+    let action_y = chunks[1].y as usize;
+    if action_y < click_map.len() {
+        let base = chunks[1].x;
+        click_map[action_y].push((base..base + 17, ClickTarget::SheetApproveOnce));
+        click_map[action_y].push((base + 17..base + 29, ClickTarget::SheetApproveSession));
+        // Scoped-paths shares the SheetApproveSession action in v1
+        // (per the keyboard handler comment), so route the click the
+        // same way for now.
+        click_map[action_y].push((base + 29..base + 46, ClickTarget::SheetApproveSession));
+        click_map[action_y].push((base + 46..base + 56, ClickTarget::SheetDeny));
+    }
 }
 
 fn truncate_for_title(s: &str, limit: usize) -> String {
@@ -187,8 +211,10 @@ mod tests {
         for (w, h) in [(40, 5), (30, 8), (20, 12), (200, 6)] {
             let backend = TestBackend::new(w, h);
             let mut terminal = Terminal::new(backend).unwrap();
+            let mut click_map: Vec<Vec<(std::ops::Range<u16>, ClickTarget)>> =
+                vec![Vec::new(); h as usize];
             terminal
-                .draw(|f| render(f, f.area(), &req, &theme))
+                .draw(|f| render(f, f.area(), &req, &theme, &mut click_map))
                 .expect("no panic on small terminal");
         }
     }
@@ -199,8 +225,30 @@ mod tests {
         let req = mk_req();
         let backend = TestBackend::new(120, 30);
         let mut terminal = Terminal::new(backend).unwrap();
+        let mut click_map: Vec<Vec<(std::ops::Range<u16>, ClickTarget)>> = vec![Vec::new(); 30];
         terminal
-            .draw(|f| render(f, f.area(), &req, &theme))
+            .draw(|f| render(f, f.area(), &req, &theme, &mut click_map))
             .unwrap();
+        // Sheet must register the four button click targets on its
+        // action row so mouse users can grant/deny without the keyboard.
+        let total_targets: usize = click_map.iter().map(|row| row.len()).sum();
+        assert!(
+            total_targets >= 4,
+            "sheet must register at least 4 button targets, got {total_targets}"
+        );
+        assert!(
+            click_map
+                .iter()
+                .flatten()
+                .any(|(_, t)| matches!(t, ClickTarget::SheetApproveOnce)),
+            "approve-once target missing"
+        );
+        assert!(
+            click_map
+                .iter()
+                .flatten()
+                .any(|(_, t)| matches!(t, ClickTarget::SheetDeny)),
+            "deny target missing"
+        );
     }
 }

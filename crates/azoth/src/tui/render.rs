@@ -30,11 +30,11 @@ pub fn frame(f: &mut Frame, state: &mut AppState) {
     let cursor_phase = pulse_phase(elapsed_ms, 500);
 
     // Reset click map every frame; render paths register hit regions
-    // by absolute terminal Y. Sized to exactly the canvas height —
-    // prior code added an arbitrary `+4` slack which wasted memory
-    // and risked masking off-by-one bugs in y mapping.
+    // by absolute terminal Y. Sized to exactly the canvas height.
+    // Each row holds a list of (x_range, target) so multiple buttons
+    // on one row (sheet action bar, status row toggles) are routable.
     state.click_map.clear();
-    state.click_map.resize(size.height as usize, None);
+    state.click_map.resize_with(size.height as usize, Vec::new);
 
     // Splashscreen takes the whole canvas while the worker boots.
     if state.booting {
@@ -58,6 +58,21 @@ pub fn frame(f: &mut Frame, state: &mut AppState) {
         .split(size);
 
     render_status(f, vertical[0], state, &theme);
+    // Status row's "azoth" word opens the palette on click — gives
+    // mouse users a hit target without adding visible button chrome.
+    let status_y = vertical[0].y as usize;
+    if status_y < state.click_map.len() {
+        // "  azoth" — leading 2 spaces + 5-letter brand.
+        state.click_map[status_y].push((2..7, ClickTarget::PaletteOpen));
+        // "ctx 45%" lives on the right side; clicking toggles
+        // inspector. Width-conditional fallback: if status row is
+        // narrower than ~40 cols, the ctx label may be off-screen,
+        // but the click range simply registers no hits in that case.
+        let w = vertical[0].width;
+        if w > 12 {
+            state.click_map[status_y].push((w.saturating_sub(12)..w, ClickTarget::InspectorToggle));
+        }
+    }
     render_hairline(f, vertical[1], &theme);
 
     // Middle row: optional rail + canvas + optional inspector.
@@ -98,7 +113,7 @@ pub fn frame(f: &mut Frame, state: &mut AppState) {
         palette::render(f, size, &state.palette, &theme, state.cards.len());
     }
     if let Some(req) = state.pending_approval.as_ref() {
-        sheet::render(f, canvas_area, req, &theme);
+        sheet::render(f, canvas_area, req, &theme, &mut state.click_map);
     }
 }
 
@@ -287,7 +302,9 @@ fn render_canvas(
                 },
             };
             if absolute_y < state.click_map.len() {
-                state.click_map[absolute_y] = Some(target);
+                // Card hits are full-row — any X on this Y triggers
+                // the cell/thoughts toggle.
+                state.click_map[absolute_y].push((0..u16::MAX, target));
             }
         }
     }
