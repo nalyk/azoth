@@ -1,83 +1,450 @@
-//! ratatui frame builder.
+//! PAPER canvas — the frame orchestrator.
+//!
+//! Layout (rows top-to-bottom):
+//!
+//! 1.  status strip (1 row, no border)
+//! 2.  hairline separator (1 row)
+//! 3.  canvas row: optional rail (left), canvas (flex), optional inspector (right)
+//! 4.  whisper row (1 row, pre-composer narrator)
+//! 5.  hairline separator (1 row)
+//! 6.  composer (3 rows, rounded)
+//!
+//! When the terminal is narrow (<100 cols), the inspector auto-hides.
+//! When Focus Mode is on, all turns except the active one are hidden.
 
-use super::app::AppState;
-use super::widgets::approval_modal;
-use ratatui::layout::{Constraint, Direction, Layout};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{
-    Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
-};
+use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
 use ratatui::Frame;
+
+use super::app::{AppState, ClickTarget};
+use super::theme::{pulse_phase, Palette as Colors, Theme};
+use super::{inspector, palette, rail, sheet, splash};
 
 pub fn frame(f: &mut Frame, state: &mut AppState) {
     let size = f.area();
-    let chunks = Layout::default()
+    let theme = state.theme;
+    let elapsed_ms = state.boot.elapsed().as_millis();
+    let bar_phase = pulse_phase(elapsed_ms, 600);
+    let cursor_phase = pulse_phase(elapsed_ms, 500);
+
+    // Reset click map every frame; render paths register hit regions
+    // by absolute terminal Y. Reuse inner Vecs (clear keeps capacity);
+    // only resize the outer Vec when terminal height changes. Earlier
+    // `clear()` + `resize_with` dropped + reallocated every inner
+    // Vec on every frame at 60fps — significant heap churn on long
+    // sessions (round-24 gemini MED).
+    if state.click_map.len() != size.height as usize {
+        state.click_map.resize_with(size.height as usize, Vec::new);
+    }
+    for row in &mut state.click_map {
+        row.clear();
+    }
+
+    // Splashscreen takes the whole canvas while the worker boots.
+    if state.booting {
+        splash::render(f, size, &theme, &state.boot_phase, elapsed_ms);
+        return;
+    }
+
+    let show_rail = state.rail_open;
+    let show_inspector = state.inspector_open && size.width >= 100;
+
+    let vertical = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),
-            Constraint::Min(3),
-            Constraint::Length(3),
+            Constraint::Length(1), // status
+            Constraint::Length(1), // hairline
+            Constraint::Min(3),    // canvas row
+            Constraint::Length(1), // whisper
+            Constraint::Length(1), // hairline
+            Constraint::Length(3), // composer
         ])
         .split(size);
 
-    let status = Line::from(vec![
-        Span::styled("azoth", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw(" · "),
-        Span::raw(state.status.clone()),
-        Span::raw("  ctx "),
-        Span::styled(
-            format!("{}%", state.ctx_pct),
-            Style::default().fg(if state.ctx_pct >= 80 {
-                Color::Red
-            } else {
-                Color::Cyan
-            }),
-        ),
-    ]);
-    f.render_widget(Paragraph::new(status), chunks[0]);
+    render_status(f, vertical[0], state, &theme);
+    // Status row's "azoth" word opens the palette on click — gives
+    // mouse users a hit target without adding visible button chrome.
+    // Both ranges are anchored to `vertical[0].x` so they survive
+    // any future layout that nests the canvas under a non-zero
+    // horizontal offset (today the top-level split has area.x=0,
+    // but the right answer is still relative).
+    let status_y = vertical[0].y as usize;
+    if status_y < state.click_map.len() {
+        let row_x = vertical[0].x;
+        let row_w = vertical[0].width;
+        // "  azoth" — leading 2 spaces + 5-letter brand.
+        state.click_map[status_y].push((row_x + 2..row_x + 7, ClickTarget::PaletteOpen));
+        // "ctx 45%" lives on the right side; clicking toggles
+        // inspector. Width-conditional fallback: if status row is
+        // narrower than ~40 cols, the ctx label may be off-screen,
+        // but the click range simply registers no hits in that case.
+        if row_w > 12 {
+            let start = row_x + row_w.saturating_sub(12);
+            state.click_map[status_y].push((start..row_x + row_w, ClickTarget::InspectorToggle));
+        }
+    }
+    render_hairline(f, vertical[1], &theme);
 
-    // Transcript with auto-scroll to bottom and manual scroll-back.
-    let body_text: Vec<Line> = state
-        .transcript
-        .iter()
-        .map(|s| Line::from(s.clone()))
-        .collect();
-    let total_lines = body_text.len() as u16;
-    let visible_height = chunks[1].height.saturating_sub(2); // borders
+    // Middle row: optional rail + canvas + optional inspector.
+    let mut mid_constraints: Vec<Constraint> = Vec::new();
+    if show_rail {
+        mid_constraints.push(Constraint::Length(14));
+    }
+    mid_constraints.push(Constraint::Min(20));
+    if show_inspector {
+        mid_constraints.push(Constraint::Length(30));
+    }
+    let mid = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints(mid_constraints)
+        .split(vertical[2]);
 
-    // Compute the scroll position: when not locked, pin to bottom.
-    let max_scroll = total_lines.saturating_sub(visible_height);
-    let scroll_pos = if state.scroll_locked {
-        max_scroll
-            .saturating_sub(state.scroll_offset)
-            .min(max_scroll)
-    } else {
-        // Auto-scroll: always show the latest lines.
-        state.scroll_offset = 0;
-        max_scroll
-    };
+    let mut idx = 0;
+    if show_rail {
+        let rail_area = mid[idx];
+        let selected = state.cards.len().saturating_sub(1);
+        rail::render(f, rail_area, &state.cards, &theme, bar_phase, selected);
+        idx += 1;
+    }
+    let canvas_area = mid[idx];
+    render_canvas(f, canvas_area, state, &theme, bar_phase, cursor_phase);
+    idx += 1;
+    if show_inspector {
+        let inspector_area = mid[idx];
+        inspector::render(f, inspector_area, &state.inspector_data, &theme);
+    }
 
-    let body = Paragraph::new(body_text)
-        .block(Block::default().borders(Borders::ALL).title(" transcript "))
-        .wrap(Wrap { trim: false })
-        .scroll((scroll_pos, 0));
-    f.render_widget(body, chunks[1]);
+    render_whisper(f, vertical[3], state, &theme);
+    render_hairline(f, vertical[4], &theme);
+    render_composer(f, vertical[5], state, &theme);
 
-    // Scrollbar indicator.
-    if total_lines > visible_height {
-        let mut scrollbar_state =
-            ScrollbarState::new(max_scroll as usize).position(scroll_pos as usize);
-        f.render_stateful_widget(
-            Scrollbar::new(ScrollbarOrientation::VerticalRight),
-            chunks[1],
-            &mut scrollbar_state,
+    // Overlays.
+    if state.palette.open {
+        palette::render(f, size, &mut state.palette, &theme, state.cards.len());
+    }
+    if let Some(req) = state.pending_approval.as_ref() {
+        sheet::render(
+            f,
+            canvas_area,
+            req,
+            &theme,
+            &mut state.click_map,
+            state.sheet_scroll_offset,
         );
     }
-
-    f.render_widget(&state.textarea, chunks[2]);
-
-    if let Some(req) = state.pending_approval.as_ref() {
-        approval_modal::render(f, size, req);
-    }
 }
+
+fn render_status(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    // Spans borrow from `state` (status row strings + truncated
+    // labels) — relaxed lifetime annotation since the Vec is
+    // consumed within this fn (Paragraph::new + render_widget).
+    let mut spans: Vec<Span<'_>> = vec![
+        Span::raw("  "),
+        Span::styled("azoth", theme.bold()),
+        Span::styled(" · ", theme.dim()),
+    ];
+    let contract_label = state
+        .inspector_data
+        .contract_goal
+        .as_deref()
+        .map(|g| trunc(g, 40))
+        .unwrap_or(std::borrow::Cow::Borrowed("no contract yet"));
+    spans.push(Span::styled(contract_label, theme.ink(Colors::INK_1)));
+    // Model / profile label (from AppState.status, set to
+    // "<profile> · <model_id>" at worker init).
+    if !state.status.is_empty() && state.status != "ready" {
+        spans.push(Span::styled(" · ", theme.dim()));
+        spans.push(Span::styled(
+            trunc(&state.status, 48),
+            theme.ink(Colors::INK_2),
+        ));
+    }
+    // Turn count.
+    spans.push(Span::styled(
+        format!("  ·  {} turns", state.committed_turns),
+        theme.dim(),
+    ));
+    // Context percentage — no broken clock glyph; the label + color
+    // carries the meaning.
+    let ctx_style = if state.ctx_pct >= 80 {
+        theme.ink(Colors::ABORT).add_modifier(Modifier::BOLD)
+    } else {
+        theme.ink(Colors::ACCENT).add_modifier(Modifier::BOLD)
+    };
+    spans.push(Span::styled("     ctx ", theme.dim()));
+    spans.push(Span::styled(format!("{}%", state.ctx_pct), ctx_style));
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn render_hairline(f: &mut Frame, area: Rect, theme: &Theme) {
+    let w = area.width as usize;
+    let line = Line::from(Span::styled(
+        theme.glyph(Theme::HAIRLINE_CHAR).repeat(w),
+        theme.hairline(),
+    ));
+    f.render_widget(Paragraph::new(line), area);
+}
+
+fn render_canvas(
+    f: &mut Frame,
+    area: Rect,
+    state: &mut AppState,
+    theme: &Theme,
+    bar_phase: bool,
+    cursor_phase: bool,
+) {
+    if state.cards.is_empty() {
+        render_zero_state(f, area, theme);
+        return;
+    }
+
+    // Which card indices map into the visible iterator. Stored as a
+    // `Range<usize>` so we don't allocate a `Vec<usize>` of size N
+    // every frame on long sessions. Range is Clone (two usize) so
+    // we can iterate it twice (pass 1 + pass 2) without rebuilding.
+    // Focus mode collapses to a single-element range; empty session
+    // collapses to `0..0` which iterates nothing.
+    let visible_indices: std::ops::Range<usize> = if state.focus_mode {
+        // The last live card, else the last card overall.
+        let live = state
+            .cards
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, c)| c.is_live())
+            .map(|(i, _)| i);
+        let idx = live.or_else(|| state.cards.len().checked_sub(1));
+        match idx {
+            Some(i) => i..i + 1,
+            None => 0..0,
+        }
+    } else {
+        0..state.cards.len()
+    };
+
+    let visible_height = area.height;
+    let visible_h_usize = visible_height as usize;
+
+    // Pass 1 — estimate the total height by streaming cards through
+    // the same per-card height function. Earlier code collected into
+    // a Vec<usize> just to .sum() it, paying an N-sized allocation
+    // every frame; the helper closure below lets pass 2 read the
+    // same per-card estimate without re-materialising the Vec.
+    //
+    // Future scaling: this is O(visible cards) per frame. For sessions
+    // with >>10k cards a Fenwick/segment tree on `last_rendered_rows`
+    // would give O(log N) lookup. Defer until we see real workloads
+    // that hit the wall — until then the constant factors dominate
+    // and a Vec walk is faster than tree pointer-chasing.
+    const UNRENDERED_HEIGHT_HINT: usize = 4;
+    fn est_h(rows: usize) -> usize {
+        if rows == 0 {
+            UNRENDERED_HEIGHT_HINT
+        } else {
+            rows
+        }
+    }
+    // Pass 1 — O(visible cards) per-frame field reads. Each iteration
+    // is just a `usize` field read against the cached row count;
+    // dominant cost is cache locality, not allocations. For sessions
+    // beyond ~10k cards a Fenwick tree on `last_rendered_rows` would
+    // give O(log N) lookup, but the constant factors of a flat sum
+    // dominate at typical sizes. Flagged for a later round if a real
+    // workload demonstrates the wall.
+    let est_total: usize = visible_indices
+        .clone()
+        .map(|i| est_h(state.cards[i].last_rendered_rows))
+        .sum();
+    let est_max_scroll = est_total.saturating_sub(visible_h_usize);
+    let scroll_offset = state.scroll_offset as usize;
+    let est_target_top = if state.scroll_locked {
+        est_max_scroll.saturating_sub(scroll_offset)
+    } else {
+        state.scroll_offset = 0;
+        est_max_scroll
+    };
+    let est_target_bot = est_target_top + visible_h_usize;
+
+    // Pass 2 — visible-slice virtualisation. Earlier code pushed
+    // blank-line placeholders for every off-screen card so scroll
+    // math worked out; on a 1000-card session that allocated 1000s
+    // of `Line` + `Vec<Span>` per frame just to be invisible. New
+    // approach: skip off-screen cards entirely. We track:
+    //
+    //   skipped_above_h — total estimated height of cards entirely
+    //   above the viewport (used to translate `scroll_pos` from the
+    //   "if-all-rendered" coord system into the "rendered-only" Vec).
+    //
+    //   first_card_local_skip — when the first intersecting card
+    //   straddles the viewport top, this is how many of its rows we
+    //   skip via `Paragraph::scroll`.
+    //
+    // Cards entirely below the viewport are simply not iterated —
+    // we `break` once `cursor_y > est_target_bot`.
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(visible_h_usize.saturating_mul(2));
+    let mut row_hints: Vec<Option<(usize, super::card::RowHint)>> =
+        Vec::with_capacity(visible_h_usize.saturating_mul(2));
+    let mut cursor_y: usize = 0;
+    let mut skipped_above_h: usize = 0;
+    let mut first_card_local_skip: Option<usize> = None;
+    for card_idx in visible_indices {
+        let est_h_val = est_h(state.cards[card_idx].last_rendered_rows);
+        let card_y_end = cursor_y + est_h_val;
+        let intersects = card_y_end > est_target_top && cursor_y < est_target_bot;
+        // Round-22 HIGH: dropped the `|| never_rendered` force-render.
+        // On session resume every card has `last_rendered_rows == 0`,
+        // so the old code rendered every turn from first-visible to
+        // end of session in a single frame (lag/hang on startup).
+        // `intersects` already estimates with UNRENDERED_HEIGHT_HINT,
+        // so cards near the viewport still get painted; cards far
+        // above stay skipped until the user scrolls toward them.
+        // Trade-off: first-time scroll-up over old cards may feel
+        // jumpy as their actual heights paint in (the hint of 4 rows
+        // is usually less than reality).
+        if intersects {
+            // Compute the local-skip if this is the FIRST intersecting
+            // card AND its top sits above the viewport. After we
+            // render it, scroll_pos becomes that local skip plus 0
+            // (since we've already dropped everything above it).
+            if first_card_local_skip.is_none() {
+                first_card_local_skip = Some(est_target_top.saturating_sub(cursor_y));
+            }
+            let rows = state.cards[card_idx].render_rows(theme, cursor_phase, bar_phase);
+            cursor_y += rows.len();
+            for (line, hint) in rows {
+                lines.push(line);
+                row_hints.push(hint.map(|h| (card_idx, h)));
+            }
+            // Once we've filled the viewport, every subsequent card is
+            // entirely below est_target_bot — `break` instead of
+            // `continue` to skip the rest of the iteration. Round-22
+            // MED fix; previous `continue` walked the remaining cards
+            // (cheap but unnecessary on long sessions).
+            if cursor_y >= est_target_bot {
+                break;
+            }
+        } else if cursor_y < est_target_top {
+            // Above the viewport — accumulate and skip render.
+            skipped_above_h = skipped_above_h.saturating_add(est_h_val);
+            cursor_y += est_h_val;
+        } else {
+            // Below the viewport — every subsequent card is also
+            // below. Stop iterating.
+            break;
+        }
+    }
+
+    // scroll_pos is now relative to the rendered-only `lines` Vec,
+    // not the full transcript. The first intersecting card's local
+    // skip gives us exactly the number of rows ratatui must skip at
+    // the top of `lines` to align with the user's scroll target.
+    // When the user has not scrolled (default = bottom-pinned), we
+    // want the visible window to land at the bottom of `lines`.
+    let total = lines.len() as u16;
+    let scroll_pos = if state.scroll_locked {
+        first_card_local_skip.unwrap_or(0).min(u16::MAX as usize) as u16
+    } else {
+        total.saturating_sub(visible_height)
+    };
+    let _ = skipped_above_h; // reserved for explicit-y telemetry / future use
+
+    // Populate click_map by mapping each visible row to its absolute
+    // terminal Y. Iterating only the visible window keeps this O(rows
+    // on screen) instead of O(total transcript lines), which mattered
+    // once long-running sessions accumulated thousands of lines.
+    let first_visible = scroll_pos as usize;
+    for (relative_y, hint) in row_hints
+        .iter()
+        .enumerate()
+        .skip(first_visible)
+        .take(visible_height as usize)
+        .map(|(line_idx, hint)| (line_idx - first_visible, hint))
+    {
+        let absolute_y = area.y as usize + relative_y;
+        if let Some((card_idx, h)) = hint {
+            let target = match h {
+                super::card::RowHint::ThoughtsHeader => ClickTarget::ThoughtsToggle {
+                    card_idx: *card_idx,
+                },
+                super::card::RowHint::CellHeader { cell_idx } => ClickTarget::CellToggle {
+                    card_idx: *card_idx,
+                    cell_idx: *cell_idx,
+                },
+            };
+            if absolute_y < state.click_map.len() {
+                // Card hits are constrained to the canvas X bounds —
+                // earlier `0..u16::MAX` leaked through rail/inspector
+                // panels on the same Y, toggling cards from clicks
+                // landing inside side drawers.
+                let x_range = area.x..(area.x + area.width);
+                state.click_map[absolute_y].push((x_range, target));
+            }
+        }
+    }
+
+    let body = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .scroll((scroll_pos, 0));
+    f.render_widget(body, area);
+}
+
+fn render_zero_state(f: &mut Frame, area: Rect, theme: &Theme) {
+    let inner_y = area.y + area.height / 3;
+    let bar = theme.glyph(Theme::BAR_COMMITTED);
+    let lines = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::raw("     "),
+            Span::styled(bar, theme.accent()),
+            Span::raw("  "),
+            Span::styled("what are we building?", theme.bold()),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::raw("        "),
+            Span::styled(
+                "tell azoth what you want. it will plan, then ask before touching anything.",
+                theme.italic_dim(),
+            ),
+        ]),
+    ];
+    let rect = Rect {
+        x: area.x,
+        y: inner_y,
+        width: area.width,
+        height: lines.len() as u16,
+    };
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), rect);
+}
+
+fn render_whisper(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    let latest_note = state.notes.last();
+    let line = state.whisper.render_line(theme, latest_note);
+    f.render_widget(Paragraph::new(line), area);
+}
+
+fn render_composer(f: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(theme.ink(Colors::INK_3))
+        .title(Line::from(vec![
+            Span::styled(" write", theme.bold()),
+            Span::styled(" ", Style::default()),
+        ]))
+        .title_bottom(Line::from(vec![
+            Span::styled(" ⌃K ", theme.accent()),
+            Span::styled("palette · ", theme.dim()),
+            Span::styled("↵ ", theme.accent()),
+            Span::styled("send · ", theme.dim()),
+            Span::styled("⇧↵ ", theme.accent()),
+            Span::styled("newline ", theme.dim()),
+        ]));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    f.render_widget(&state.textarea, inner);
+}
+
+use super::util::truncate as trunc;

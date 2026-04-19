@@ -1,0 +1,950 @@
+//! Markdown → styled `Line` rendering for PAPER prose.
+//!
+//! Built on `pulldown-cmark`. The model writes real markdown; PAPER
+//! renders it as real typography instead of plaintext.
+//!
+//! Supported:
+//! - Fenced code blocks (```lang ... ```) rendered as **code islands**
+//!   with a language label, a left accent bar, 2-col gutter, and
+//!   minimal syntax tinting (keywords + strings + comments) for a few
+//!   languages.
+//! - Inline code (`code`)
+//! - Bold (**text**) and italic (*text*)
+//! - Headings (# through ######)
+//! - Bulleted + numbered lists
+//! - Blockquotes (> …)
+//! - Links — rendered as `text` with the URL underneath, dim.
+//! - Paragraphs separated by blank lines.
+
+use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use ratatui::style::{Modifier, Style};
+use ratatui::text::{Line, Span};
+
+use super::theme::{Palette, Theme};
+
+/// Parse `md` and return a sequence of pre-styled `Line`s that can
+/// be dropped into a ratatui `Paragraph`.
+pub fn render(md: &str, theme: &Theme) -> Vec<Line<'static>> {
+    let mut out: Vec<Line<'static>> = Vec::with_capacity(md.lines().count() + 4);
+    // GFM extensions — without ENABLE_TABLES, pulldown-cmark emits
+    // raw text for pipe-syntax tables, producing jumbled output.
+    // Strikethrough + task lists are cheap wins on the same shape.
+    let mut opts = Options::empty();
+    opts.insert(Options::ENABLE_TABLES);
+    opts.insert(Options::ENABLE_STRIKETHROUGH);
+    opts.insert(Options::ENABLE_TASKLISTS);
+    let parser = Parser::new_ext(md, opts);
+
+    let mut current_spans: Vec<Span<'static>> = Vec::new();
+    let mut style_stack: Vec<Style> = vec![theme.ink(Palette::INK_0)];
+    let mut in_code_block = false;
+    let mut code_lang: Option<String> = None;
+    let mut code_buffer = String::new();
+    let mut list_depth: usize = 0;
+    let mut list_counters: Vec<Option<u64>> = Vec::new();
+    let mut in_blockquote: bool = false;
+    let mut pending_link_url: Option<String> = None;
+    let mut heading_level: Option<HeadingLevel> = None;
+    let mut table_buf = TableBuf::default();
+    let mut in_table: bool = false;
+    let mut in_cell: bool = false;
+
+    for ev in parser {
+        match ev {
+            Event::Start(Tag::Paragraph) => {
+                // R27 fix (gemini MED, markdown.rs:123): when a list
+                // item holds multiple paragraphs, the marker + indent
+                // are only pushed at `Start(Tag::Item)`. Subsequent
+                // paragraphs begin with `current_spans` empty (the
+                // previous End(Paragraph) flushed them) and therefore
+                // wrap flush-left, visually escaping the item.
+                // Compute the continuation indent from `list_depth` so
+                // follow-up paragraphs align under the marker column:
+                // `Start(Tag::Item)` pushes `"  ".repeat(depth-1)`
+                // then a 2-char marker; continuation = `"  ".repeat(depth)`.
+                if list_depth > 0 && current_spans.is_empty() {
+                    let indent = "  ".repeat(list_depth);
+                    current_spans.push(Span::raw(indent));
+                }
+            }
+            Event::End(TagEnd::Paragraph) => {
+                flush(&mut out, &mut current_spans);
+                // R27 fix (gemini MED, markdown.rs:58): the blank line
+                // between paragraphs inside a blockquote must carry
+                // the `│ ` bar; otherwise the left rail collapses and
+                // the blockquote visually splits into two unrelated
+                // paragraphs. Non-blockquote contexts keep the plain
+                // blank separator.
+                if in_blockquote {
+                    out.push(Line::from(Span::styled("│ ", theme.ink(Palette::ACCENT))));
+                } else {
+                    out.push(Line::from(""));
+                }
+            }
+            Event::Start(Tag::Heading { level, .. }) => {
+                flush(&mut out, &mut current_spans);
+                heading_level = Some(level);
+                let style = heading_style(level, theme);
+                style_stack.push(style);
+            }
+            Event::End(TagEnd::Heading(_)) => {
+                flush(&mut out, &mut current_spans);
+                style_stack.pop();
+                heading_level = None;
+                out.push(Line::from(""));
+            }
+            Event::Start(Tag::Emphasis) => {
+                let top = *style_stack.last().unwrap_or(&Style::default());
+                style_stack.push(top.add_modifier(Modifier::ITALIC));
+            }
+            Event::End(TagEnd::Emphasis) => {
+                style_stack.pop();
+            }
+            Event::Start(Tag::Strong) => {
+                let top = *style_stack.last().unwrap_or(&Style::default());
+                style_stack.push(top.add_modifier(Modifier::BOLD));
+            }
+            Event::End(TagEnd::Strong) => {
+                style_stack.pop();
+            }
+            Event::Start(Tag::Strikethrough) => {
+                let top = *style_stack.last().unwrap_or(&Style::default());
+                style_stack.push(top.add_modifier(Modifier::CROSSED_OUT));
+            }
+            Event::End(TagEnd::Strikethrough) => {
+                style_stack.pop();
+            }
+            Event::Start(Tag::BlockQuote(_)) => {
+                flush(&mut out, &mut current_spans);
+                in_blockquote = true;
+            }
+            Event::End(TagEnd::BlockQuote(_)) => {
+                flush(&mut out, &mut current_spans);
+                in_blockquote = false;
+            }
+            Event::Start(Tag::List(start)) => {
+                flush(&mut out, &mut current_spans);
+                list_depth = list_depth.saturating_add(1);
+                list_counters.push(start);
+            }
+            Event::End(TagEnd::List(_)) => {
+                flush(&mut out, &mut current_spans);
+                list_depth = list_depth.saturating_sub(1);
+                list_counters.pop();
+            }
+            Event::Start(Tag::Item) => {
+                flush(&mut out, &mut current_spans);
+                let indent = "  ".repeat(list_depth.saturating_sub(1));
+                let marker = match list_counters.last_mut() {
+                    Some(Some(n)) => {
+                        let s = format!("{n}. ");
+                        *n = n.saturating_add(1);
+                        s
+                    }
+                    _ => "• ".to_string(),
+                };
+                current_spans.push(Span::raw(indent));
+                current_spans.push(Span::styled(marker, theme.ink(Palette::ACCENT)));
+            }
+            Event::End(TagEnd::Item) => {
+                flush(&mut out, &mut current_spans);
+            }
+            Event::Start(Tag::CodeBlock(kind)) => {
+                flush(&mut out, &mut current_spans);
+                in_code_block = true;
+                code_buffer.clear();
+                code_lang = match kind {
+                    CodeBlockKind::Fenced(lang) => Some(lang.to_string()),
+                    CodeBlockKind::Indented => None,
+                };
+            }
+            Event::End(TagEnd::CodeBlock) => {
+                render_code_island(&mut out, theme, code_lang.as_deref(), &code_buffer);
+                code_buffer.clear();
+                code_lang = None;
+                in_code_block = false;
+                out.push(Line::from(""));
+            }
+            Event::Start(Tag::Link { dest_url, .. }) => {
+                pending_link_url = Some(dest_url.to_string());
+                let top = *style_stack.last().unwrap_or(&Style::default());
+                style_stack.push(top.fg(Palette::ACCENT).add_modifier(Modifier::UNDERLINED));
+            }
+            Event::End(TagEnd::Link) => {
+                style_stack.pop();
+                if let Some(url) = pending_link_url.take() {
+                    current_spans.push(Span::styled(format!(" ({url})"), theme.italic_dim()));
+                }
+            }
+            Event::Start(Tag::Table(_)) => {
+                flush(&mut out, &mut current_spans);
+                in_table = true;
+                table_buf = TableBuf::default();
+            }
+            Event::End(TagEnd::Table) => {
+                render_table(&mut out, &table_buf, theme);
+                out.push(Line::from(""));
+                in_table = false;
+            }
+            Event::Start(Tag::TableHead) => {
+                table_buf.in_header = true;
+            }
+            Event::End(TagEnd::TableHead) => {
+                table_buf.header = std::mem::take(&mut table_buf.current_row);
+                table_buf.in_header = false;
+            }
+            Event::Start(Tag::TableRow) => {
+                // Cells accumulate via TableCell end; nothing to do here.
+            }
+            Event::End(TagEnd::TableRow) => {
+                if !table_buf.in_header {
+                    let row = std::mem::take(&mut table_buf.current_row);
+                    table_buf.body.push(row);
+                }
+            }
+            Event::Start(Tag::TableCell) => {
+                in_cell = true;
+                table_buf.current_cell.clear();
+            }
+            Event::End(TagEnd::TableCell) => {
+                in_cell = false;
+                let cell = std::mem::take(&mut table_buf.current_cell);
+                table_buf.current_row.push(cell);
+            }
+            Event::Code(text) => {
+                if in_table && in_cell {
+                    table_buf.current_cell.push_str(&text);
+                } else {
+                    let top = *style_stack.last().unwrap_or(&Style::default());
+                    current_spans.push(Span::styled(
+                        text.to_string(),
+                        top.fg(Palette::ACCENT)
+                            .bg(Palette::CODE_BG)
+                            .add_modifier(Modifier::BOLD),
+                    ));
+                }
+            }
+            Event::Text(text) => {
+                if in_table && in_cell {
+                    table_buf.current_cell.push_str(&text);
+                } else if in_code_block {
+                    code_buffer.push_str(&text);
+                } else if in_blockquote {
+                    for line in text.lines() {
+                        out.push(Line::from(vec![
+                            Span::styled("│ ", theme.ink(Palette::ACCENT)),
+                            Span::styled(line.to_string(), theme.italic_dim()),
+                        ]));
+                    }
+                } else {
+                    let style = if let Some(level) = heading_level {
+                        heading_style(level, theme)
+                    } else {
+                        *style_stack.last().unwrap_or(&Style::default())
+                    };
+                    current_spans.push(Span::styled(text.to_string(), style));
+                }
+            }
+            Event::SoftBreak => {
+                current_spans.push(Span::raw(" "));
+            }
+            Event::HardBreak => {
+                flush(&mut out, &mut current_spans);
+            }
+            Event::Rule => {
+                flush(&mut out, &mut current_spans);
+                let w = 40usize;
+                out.push(Line::from(Span::styled(
+                    theme.glyph(Theme::HAIRLINE_CHAR).repeat(w),
+                    theme.hairline(),
+                )));
+                out.push(Line::from(""));
+            }
+            Event::Html(html) | Event::InlineHtml(html) => {
+                current_spans.push(Span::styled(html.to_string(), theme.dim()));
+            }
+            _ => {}
+        }
+    }
+    flush(&mut out, &mut current_spans);
+    // Drop a trailing blank line if present so the card's own
+    // spacing rules take over.
+    while out.last().map(is_blank_line).unwrap_or(false) {
+        out.pop();
+    }
+    out
+}
+
+/// Accumulator for a GFM table during parsing. Cells are buffered as
+/// plain strings; styling (header vs body) is applied at
+/// `render_table` time.
+#[derive(Default)]
+struct TableBuf {
+    header: Vec<String>,
+    body: Vec<Vec<String>>,
+    current_row: Vec<String>,
+    current_cell: String,
+    in_header: bool,
+}
+
+/// Render a parsed GFM table as whitespace-aligned PAPER-style prose.
+/// Intentionally no vertical dividers — the aesthetic relies on
+/// alignment + a single hairline under the header, matching the rest
+/// of the canvas typography.
+fn render_table(out: &mut Vec<Line<'static>>, t: &TableBuf, theme: &Theme) {
+    let col_count = t
+        .header
+        .len()
+        .max(t.body.iter().map(|r| r.len()).max().unwrap_or(0));
+    if col_count == 0 {
+        return;
+    }
+    const MAX_COL: usize = 48;
+    const GAP: usize = 2;
+    // Round-26: GAP is a compile-time constant (2), so the inter-cell
+    // spacer is a fixed &'static str. Using a literal lets every
+    // Span::styled borrow it as Cow::Borrowed, eliminating the
+    // `" ".repeat(GAP)` + per-spacer `gap.clone()` allocations that
+    // previously ran for every cell on every table render.
+    const GAP_STR: &str = "  ";
+
+    use unicode_width::UnicodeWidthStr;
+    let mut widths = vec![0usize; col_count];
+    for (i, cell) in t.header.iter().enumerate().take(col_count) {
+        widths[i] = widths[i].max(UnicodeWidthStr::width(cell.as_str()));
+    }
+    for row in &t.body {
+        for (i, cell) in row.iter().enumerate().take(col_count) {
+            widths[i] = widths[i].max(UnicodeWidthStr::width(cell.as_str()));
+        }
+    }
+    for w in &mut widths {
+        *w = (*w).min(MAX_COL);
+    }
+
+    let header_style = theme.bold().fg(Palette::ACCENT);
+    let body_style = theme.ink(Palette::INK_1);
+
+    let mut header_spans: Vec<Span<'static>> = vec![Span::raw("  ")];
+    for (i, width) in widths.iter().enumerate().take(col_count) {
+        // Round-25 fix: pad_to takes &str — no need to clone the
+        // header String. Earlier `t.header.get(i).cloned()` allocated
+        // a fresh owned String per cell on every render.
+        let cell = t.header.get(i).map(|s| s.as_str()).unwrap_or("");
+        header_spans.push(Span::styled(pad_to(cell, *width), header_style));
+        if i + 1 < col_count {
+            header_spans.push(Span::styled(GAP_STR, theme.dim()));
+        }
+    }
+    out.push(Line::from(header_spans));
+
+    let total_width: usize = widths.iter().sum::<usize>() + col_count.saturating_sub(1) * GAP;
+    out.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled(
+            theme.glyph(Theme::HAIRLINE_CHAR).repeat(total_width),
+            theme.hairline(),
+        ),
+    ]));
+
+    for row in &t.body {
+        let mut spans: Vec<Span<'static>> = vec![Span::raw("  ")];
+        for (i, width) in widths.iter().enumerate().take(col_count) {
+            let cell = row.get(i).map(|s| s.as_str()).unwrap_or("");
+            spans.push(Span::styled(pad_to(cell, *width), body_style));
+            if i + 1 < col_count {
+                spans.push(Span::styled(GAP_STR, theme.dim()));
+            }
+        }
+        out.push(Line::from(spans));
+    }
+}
+
+/// Pad or truncate a string to exactly `width` display columns. Uses
+/// `unicode-width` so CJK double-wide characters and wide emoji align
+/// correctly; ASCII / Latin pay no cost (cached single-char widths).
+/// Preserves content intact when it fits; appends `…` on truncation
+/// so the result never overruns `width`.
+fn pad_to(s: &str, width: usize) -> String {
+    // Round-24 fix: width=0 must produce an empty string. Earlier the
+    // `Greater` branch with target=width-1=0 took no chars then
+    // appended `…` (width=1), overrunning the column and breaking
+    // GFM table alignment when a column collapses to 0.
+    if width == 0 {
+        return String::new();
+    }
+    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+    let total_w = UnicodeWidthStr::width(s);
+    match total_w.cmp(&width) {
+        std::cmp::Ordering::Greater => {
+            // Truncate chars until we're within `width - 1`, then
+            // append ellipsis.
+            let target = width.saturating_sub(1);
+            let mut taken = String::with_capacity(s.len());
+            let mut acc = 0usize;
+            for c in s.chars() {
+                let cw = UnicodeWidthChar::width(c).unwrap_or(0);
+                if acc + cw > target {
+                    break;
+                }
+                taken.push(c);
+                acc += cw;
+            }
+            taken.push('…');
+            // Ellipsis is width=1; we already tracked the truncated
+            // body width as `acc`, so the total is acc + 1 — no need
+            // to walk the string again with `UnicodeWidthStr::width`.
+            let mut out = taken;
+            for _ in (acc + 1)..width {
+                out.push(' ');
+            }
+            out
+        }
+        std::cmp::Ordering::Less => {
+            let mut out = s.to_string();
+            for _ in 0..(width - total_w) {
+                out.push(' ');
+            }
+            out
+        }
+        std::cmp::Ordering::Equal => s.to_string(),
+    }
+}
+
+fn flush(out: &mut Vec<Line<'static>>, current: &mut Vec<Span<'static>>) {
+    if !current.is_empty() {
+        let taken = std::mem::take(current);
+        out.push(Line::from(taken));
+    }
+}
+
+fn is_blank_line(line: &Line<'static>) -> bool {
+    line.spans.iter().all(|s| s.content.trim().is_empty())
+}
+
+fn heading_style(level: HeadingLevel, _theme: &Theme) -> Style {
+    match level {
+        HeadingLevel::H1 => Style::default()
+            .fg(Palette::ACCENT)
+            .add_modifier(Modifier::BOLD),
+        HeadingLevel::H2 => Style::default().add_modifier(Modifier::BOLD),
+        HeadingLevel::H3 => Style::default().add_modifier(Modifier::BOLD),
+        _ => Style::default()
+            .fg(Palette::INK_1)
+            .add_modifier(Modifier::BOLD),
+    }
+}
+
+// --- Code islands ---
+
+fn render_code_island(out: &mut Vec<Line<'static>>, theme: &Theme, lang: Option<&str>, body: &str) {
+    // Header line: language chip in dim, above the bar.
+    let lang_label = lang.unwrap_or("").trim();
+    if !lang_label.is_empty() {
+        out.push(Line::from(vec![
+            Span::styled("  ", theme.dim()),
+            Span::styled(
+                lang_label.to_lowercase(),
+                theme.dim().add_modifier(Modifier::BOLD),
+            ),
+        ]));
+    }
+
+    let bar = theme.glyph(Theme::BAR_COMMITTED);
+    let bar_style = Style::default().fg(Palette::ACCENT);
+
+    for line in body.lines() {
+        let code_spans = tint_code(line, lang_label, theme);
+        let mut spans = vec![Span::styled(bar, bar_style), Span::raw("  ")];
+        spans.extend(code_spans);
+        out.push(Line::from(spans));
+    }
+}
+
+/// Tiny, deliberately-minimal syntax tinter. Token categories:
+/// keyword (accent), string (a secondary accent), comment (dim
+/// italic), everything else (ink-0). Recognises Rust, bash/shell,
+/// Python, JSON/TOML basics, JS/TS. Falls through to plain for
+/// unknown languages.
+fn tint_code(line: &str, lang: &str, theme: &Theme) -> Vec<Span<'static>> {
+    let lang_l = lang.to_lowercase();
+    let keywords: &[&str] = match lang_l.as_str() {
+        "rust" | "rs" => &[
+            "fn", "let", "mut", "pub", "use", "mod", "struct", "enum", "impl", "trait", "match",
+            "if", "else", "for", "while", "loop", "return", "async", "await", "self", "Self",
+            "const", "static", "as", "dyn", "where", "ref", "move", "unsafe", "crate", "super",
+            "type", "in", "break", "continue",
+        ],
+        "python" | "py" => &[
+            "def", "class", "return", "if", "elif", "else", "for", "while", "import", "from", "as",
+            "with", "try", "except", "raise", "pass", "yield", "lambda", "async", "await", "True",
+            "False", "None", "self",
+        ],
+        "bash" | "sh" | "shell" | "zsh" => &[
+            "if", "then", "else", "elif", "fi", "for", "in", "do", "done", "while", "case", "esac",
+            "function", "return", "export", "local", "echo", "read",
+        ],
+        "javascript" | "js" | "typescript" | "ts" | "tsx" | "jsx" => &[
+            "function",
+            "const",
+            "let",
+            "var",
+            "return",
+            "if",
+            "else",
+            "for",
+            "while",
+            "class",
+            "extends",
+            "new",
+            "this",
+            "async",
+            "await",
+            "import",
+            "export",
+            "from",
+            "as",
+            "default",
+            "type",
+            "interface",
+            "enum",
+        ],
+        "json" | "toml" => &["true", "false", "null"],
+        _ => &[],
+    };
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let bytes = line.as_bytes();
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        let b = bytes[i];
+
+        // String literal — checked BEFORE comments so `//` or `#`
+        // inside a string ("http://example.com" / "tag #foo")
+        // doesn't get misread as comment start. Round-20 fix:
+        // earlier order let comment win and broke highlighting on
+        // every URL string in JS/TS/Rust code.
+        // Double-quoted always; single-quoted in Python (str) +
+        // JS/TS (string) + Rust (char literal). Rust's char literal
+        // is one-codepoint-then-close; the same backslash-aware
+        // loop handles it because the close quote lands within a
+        // few bytes.
+        if b == b'"'
+            || (b == b'\''
+                && matches!(
+                    lang_l.as_str(),
+                    "python" | "py" | "javascript" | "js" | "typescript" | "ts" | "rust" | "rs"
+                ))
+        {
+            let quote = b;
+            let start = i;
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                    i += 2;
+                    continue;
+                }
+                if bytes[i] == quote {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            let literal: String = line.get(start..i).unwrap_or("").to_string();
+            spans.push(Span::styled(
+                literal,
+                Style::default()
+                    .fg(Palette::SYNTAX_STRING)
+                    .add_modifier(Modifier::ITALIC),
+            ));
+            continue;
+        }
+
+        // Comments — language-dependent sniff. Runs AFTER the string
+        // literal branch above so `"http://..."` or `"#tag"` inside a
+        // string literal isn't misread as a comment.
+        let is_comment_start = match lang_l.as_str() {
+            "rust" | "rs" | "javascript" | "js" | "typescript" | "ts" | "tsx" | "jsx" => {
+                i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'/'
+            }
+            "python" | "py" | "bash" | "sh" | "shell" | "zsh" | "toml" => b == b'#',
+            _ => false,
+        };
+        if is_comment_start {
+            // `get(i..)` returns Option so any future tokenizer
+            // change that lands `i` mid-codepoint degrades gracefully
+            // instead of panicking on slice.
+            let rest = line.get(i..).unwrap_or("");
+            spans.push(Span::styled(rest.to_string(), theme.italic_dim()));
+            return spans;
+        }
+
+        // Word — tokenise by simple ASCII-word boundary.
+        if b.is_ascii_alphabetic() || b == b'_' {
+            let start = i;
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                i += 1;
+            }
+            let word = line.get(start..i).unwrap_or("");
+            if keywords.contains(&word) {
+                spans.push(Span::styled(
+                    word.to_string(),
+                    Style::default()
+                        .fg(Palette::ACCENT)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            } else {
+                spans.push(Span::styled(word.to_string(), theme.ink(Palette::INK_1)));
+            }
+            continue;
+        }
+
+        // Number.
+        if b.is_ascii_digit() {
+            let start = i;
+            while i < bytes.len()
+                && (bytes[i].is_ascii_digit() || bytes[i] == b'.' || bytes[i] == b'_')
+            {
+                i += 1;
+            }
+            let number = line.get(start..i).unwrap_or("").to_string();
+            spans.push(Span::styled(
+                number,
+                Style::default().fg(Palette::SYNTAX_NUMBER),
+            ));
+            continue;
+        }
+
+        // Everything else — plain ink.
+        let start = i;
+        while i < bytes.len()
+            && !bytes[i].is_ascii_alphanumeric()
+            && bytes[i] != b'_'
+            && bytes[i] != b'"'
+            && bytes[i] != b'\''
+            && !(bytes[i] == b'#'
+                && matches!(
+                    lang_l.as_str(),
+                    "python" | "py" | "bash" | "sh" | "shell" | "zsh" | "toml"
+                ))
+            && !(bytes[i] == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/')
+        {
+            i += 1;
+        }
+        let chunk = line.get(start..i).unwrap_or("");
+        spans.push(Span::styled(chunk.to_string(), theme.ink(Palette::INK_1)));
+    }
+    spans
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plain_prose_renders_as_single_line() {
+        let theme = Theme { unicode: true };
+        let lines = render("hello world", &theme);
+        assert!(!lines.is_empty());
+        let text: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "hello world");
+    }
+
+    #[test]
+    fn fenced_code_block_produces_bar_prefixed_lines() {
+        let theme = Theme { unicode: true };
+        let md = "prose\n\n```rust\nfn foo() {}\n```\nafter";
+        let lines = render(md, &theme);
+        // expect: prose, blank, lang header, code line, blank, after
+        assert!(lines
+            .iter()
+            .any(|l| l.spans.iter().any(|s| s.content.contains("rust"))));
+        // The code line is tokenised by tint_code, so `fn`, `foo`, `()`
+        // land in distinct spans. We verify by reconstructing the line
+        // text and matching the full identifier.
+        let has_code_line = lines.iter().any(|l| {
+            let joined: String = l.spans.iter().map(|s| s.content.as_ref()).collect();
+            joined.contains("fn foo()")
+        });
+        assert!(
+            has_code_line,
+            "code line with `fn foo()` should be rendered"
+        );
+    }
+
+    #[test]
+    fn bold_and_italic_apply_modifiers() {
+        let theme = Theme { unicode: true };
+        let lines = render("**bold** *italic*", &theme);
+        let spans: Vec<&Span> = lines.iter().flat_map(|l| l.spans.iter()).collect();
+        assert!(spans
+            .iter()
+            .any(|s| s.style.add_modifier.contains(Modifier::BOLD)));
+        assert!(spans
+            .iter()
+            .any(|s| s.style.add_modifier.contains(Modifier::ITALIC)));
+    }
+
+    #[test]
+    fn inline_code_has_accent_background() {
+        let theme = Theme { unicode: true };
+        let lines = render("call `foo()` now", &theme);
+        let has_code_span = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .any(|s| s.content.contains("foo()") && s.style.bg.is_some());
+        assert!(has_code_span);
+    }
+
+    #[test]
+    fn heading_is_bolded() {
+        let theme = Theme { unicode: true };
+        let lines = render("# Title", &theme);
+        let has_bold = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .any(|s| s.content.contains("Title") && s.style.add_modifier.contains(Modifier::BOLD));
+        assert!(has_bold);
+    }
+
+    #[test]
+    fn bulleted_list_emits_bullet_glyph() {
+        let theme = Theme { unicode: true };
+        let lines = render("- one\n- two", &theme);
+        let has_bullet = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .any(|s| s.content.contains("•"));
+        assert!(has_bullet);
+    }
+
+    #[test]
+    fn pad_to_returns_empty_for_width_zero() {
+        // Round-24 bug: pad_to("hello", 0) returned "…" (1 char wide)
+        // instead of "" because the truncation branch produced
+        // ellipsis + 0 padding chars, overrunning the column. GFM
+        // tables collapsed columns broke alignment.
+        assert_eq!(pad_to("hello", 0), "");
+        assert_eq!(pad_to("", 0), "");
+        assert_eq!(pad_to("é", 0), ""); // multi-byte char also empty
+    }
+
+    #[test]
+    fn blockquote_blank_between_paragraphs_carries_bar() {
+        // R27 fix (gemini MED markdown.rs:58): a blank line between
+        // two paragraphs inside a blockquote must still render the
+        // `│ ` bar. Otherwise the left rail collapses between
+        // paragraphs and the blockquote visually fractures.
+        let theme = Theme { unicode: true };
+        let md = "> First paragraph.\n>\n> Second paragraph.\n";
+        let lines = render(md, &theme);
+        let has_bar_blank = lines
+            .iter()
+            .any(|l| l.spans.len() == 1 && l.spans[0].content.starts_with('│'));
+        assert!(
+            has_bar_blank,
+            "expected a blank line carrying the `│ ` bar between blockquote paragraphs; got rendered lines: {:?}",
+            lines
+                .iter()
+                .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn list_item_continuation_paragraph_keeps_indent() {
+        // R27 fix (gemini MED markdown.rs:123): a list item holding
+        // multiple paragraphs must indent every paragraph, not just
+        // the first. `Start(Tag::Item)` only emits the marker once,
+        // so follow-up paragraphs flush left without help.
+        let theme = Theme { unicode: true };
+        let md = "- First paragraph of item.\n\n  Second paragraph of same item.\n";
+        let lines = render(md, &theme);
+        // Locate the line containing "Second paragraph" — the first
+        // span on that line must be a non-empty whitespace indent.
+        let second = lines
+            .iter()
+            .find(|l| {
+                l.spans
+                    .iter()
+                    .any(|s| s.content.contains("Second paragraph"))
+            })
+            .expect("rendered output should contain the second paragraph");
+        let first_span = &second.spans[0];
+        assert!(
+            !first_span.content.is_empty()
+                && first_span.content.chars().all(|c| c == ' '),
+            "expected continuation paragraph to start with whitespace indent; got first span content {:?}",
+            first_span.content
+        );
+    }
+
+    #[test]
+    fn tint_code_does_not_misread_url_inside_string_as_comment() {
+        let theme = Theme { unicode: true };
+        // Round-20 fix: `"http://example.com"` would trigger the
+        // `//` comment branch and render the rest of the line as a
+        // dim italic comment, breaking the string highlight.
+        // Spans returned should include the FULL quoted literal.
+        let spans = tint_code(r#"let url = "http://example.com";"#, "rust", &theme);
+        let combined: String = spans
+            .iter()
+            .map(|s| s.content.as_ref().to_string())
+            .collect();
+        assert_eq!(combined, r#"let url = "http://example.com";"#);
+        // The double-quoted region must be one styled span (the
+        // string-literal branch consumes it whole).
+        assert!(
+            spans
+                .iter()
+                .any(|s| s.content.as_ref() == r#""http://example.com""#),
+            "string literal containing `//` must be one span, not split by comment branch"
+        );
+    }
+
+    #[test]
+    fn tint_code_does_not_misread_hash_inside_python_string_as_comment() {
+        let theme = Theme { unicode: true };
+        // Same shape for Python's `#` comment marker — `"tag #foo"`
+        // would otherwise consume the closing quote and `;` as a
+        // comment.
+        let spans = tint_code(r#"x = "tag #foo""#, "py", &theme);
+        let combined: String = spans
+            .iter()
+            .map(|s| s.content.as_ref().to_string())
+            .collect();
+        assert_eq!(combined, r#"x = "tag #foo""#);
+        assert!(spans.iter().any(|s| s.content.as_ref() == r#""tag #foo""#));
+    }
+
+    #[test]
+    fn tint_code_recognises_python_comment_via_py_alias() {
+        let theme = Theme { unicode: true };
+        // `.py` extension is the common one in fenced code blocks
+        // (```py); the comment-detection path knew about `py` but
+        // the everything-else loop's `#` guard didn't, so `#` got
+        // consumed as plain text and the rest of the line escaped
+        // comment styling.
+        let spans = tint_code("# inline comment", "py", &theme);
+        assert_eq!(spans.len(), 1, "comment should be one styled span");
+        assert!(spans[0].content.as_ref().contains("# inline comment"));
+    }
+
+    #[test]
+    fn tint_code_handles_mixed_ascii_and_multi_byte_content() {
+        let theme = Theme { unicode: true };
+        // Round 6: tokenizer is UTF-8 safe — ASCII-byte exit checks
+        // always land on char boundaries, so slicing never panics.
+        // ASCII tokens still get highlighting around multi-byte runs;
+        // multi-byte content falls through to plain ink. No char is
+        // dropped on round-trip.
+        let spans = tint_code("let café = 1;", "rust", &theme);
+        assert!(
+            spans.len() > 1,
+            "ASCII tokens still split out around multi-byte content"
+        );
+        let combined: String = spans
+            .iter()
+            .map(|s| s.content.as_ref().to_string())
+            .collect();
+        assert_eq!(combined, "let café = 1;", "no character is dropped");
+    }
+
+    #[test]
+    fn tint_code_recognises_single_quoted_strings_in_js_and_ts() {
+        let theme = Theme { unicode: true };
+        // Round 6: single-quote string literals now highlight in JS,
+        // TypeScript, and Rust (char literal) — previously only Python.
+        for lang in ["js", "ts", "javascript", "typescript", "rust"] {
+            let spans = tint_code("let x = 'hi';", lang, &theme);
+            let combined: String = spans
+                .iter()
+                .map(|s| s.content.as_ref().to_string())
+                .collect();
+            assert_eq!(combined, "let x = 'hi';", "{lang}: round-trip");
+            assert!(
+                spans.iter().any(|s| s.content.as_ref() == "'hi'"),
+                "{lang}: single-quoted span recognised as a literal"
+            );
+        }
+    }
+
+    #[test]
+    fn rust_keyword_gets_accent_color() {
+        let spans = tint_code("fn foo() {}", "rust", &Theme { unicode: true });
+        let has_accent_fn = spans
+            .iter()
+            .any(|s| s.content == "fn" && s.style.add_modifier.contains(Modifier::BOLD));
+        assert!(has_accent_fn);
+    }
+
+    #[test]
+    fn string_literal_tinted_in_rust_code() {
+        let spans = tint_code(r#"let s = "hello";"#, "rust", &Theme { unicode: true });
+        let has_string = spans
+            .iter()
+            .any(|s| s.content.contains("\"hello\"") && s.style.fg.is_some());
+        assert!(has_string);
+    }
+
+    #[test]
+    fn gfm_table_renders_header_separator_and_rows() {
+        let theme = Theme { unicode: true };
+        let md = "\
+| tool         | class       |
+|--------------|-------------|
+| repo_search  | observe     |
+| fs_write     | apply_local |
+";
+        let lines = render(md, &theme);
+        // Header cell text is present.
+        let has_header = lines
+            .iter()
+            .any(|l| l.spans.iter().any(|s| s.content.contains("tool")));
+        assert!(has_header, "expected header row with 'tool'");
+
+        // Body cell text is present.
+        let has_body = lines
+            .iter()
+            .any(|l| l.spans.iter().any(|s| s.content.contains("repo_search")));
+        assert!(has_body, "expected body row with 'repo_search'");
+
+        // Separator hairline uses '─' and spans multiple chars.
+        let has_hairline = lines
+            .iter()
+            .any(|l| l.spans.iter().any(|s| s.content.contains("──")));
+        assert!(has_hairline, "expected hairline separator under header");
+    }
+
+    #[test]
+    fn table_cells_get_padded_to_column_width() {
+        assert_eq!(pad_to("hi", 5), "hi   ");
+        assert_eq!(pad_to("exactly", 7), "exactly");
+        let truncated = pad_to("toolongforthecolumn", 8);
+        assert_eq!(truncated.chars().count(), 8);
+        assert!(truncated.ends_with('…'));
+    }
+
+    #[test]
+    fn strikethrough_renders_as_crossed_out_modifier() {
+        let theme = Theme { unicode: true };
+        let lines = render("~~gone~~", &theme);
+        let has_strike = lines.iter().flat_map(|l| l.spans.iter()).any(|s| {
+            s.content.contains("gone") && s.style.add_modifier.contains(Modifier::CROSSED_OUT)
+        });
+        assert!(
+            has_strike,
+            "~~text~~ should render with CROSSED_OUT modifier"
+        );
+    }
+
+    #[test]
+    fn empty_table_does_not_panic() {
+        let theme = Theme { unicode: true };
+        // A table with only a header, no body.
+        let lines = render("| a | b |\n|---|---|", &theme);
+        // Should produce at least the header + hairline, no panic.
+        assert!(lines.len() >= 2);
+    }
+}

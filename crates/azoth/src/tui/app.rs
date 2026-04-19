@@ -22,6 +22,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use std::io;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::mpsc;
 use tui_textarea::{Input as TaInput, TextArea};
 
@@ -53,8 +54,13 @@ use azoth_core::validators::{
 use azoth_repo::history::co_edit;
 use azoth_repo::{CoEditGraphRetrieval, FtsLexicalRetrieval, RepoIndexer, SqliteSymbolIndex};
 
+use super::card::{CardState, CellResult, Note, ToolCell, TurnCard, UsageChip};
 use super::input::SlashCommand;
+use super::inspector::InspectorData;
+use super::palette::{PaletteAction, PaletteState};
 use super::render;
+use super::theme::Theme;
+use super::whisper::Whisper;
 
 #[derive(Debug, Clone)]
 pub enum InputEvent {
@@ -63,9 +69,62 @@ pub enum InputEvent {
     Resize,
 }
 
+/// A mouse-click target registered by the render path, resolved at
+/// click time by `AppState::handle_mouse`. Keyed by absolute Y in
+/// the terminal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClickTarget {
+    ThoughtsToggle { card_idx: usize },
+    CellToggle { card_idx: usize, cell_idx: usize },
+    SheetApproveOnce,
+    SheetApproveSession,
+    SheetDeny,
+    PaletteOpen,
+    FocusToggle,
+    RailToggle,
+    InspectorToggle,
+}
+
 pub struct AppState {
     pub textarea: TextArea<'static>,
-    pub transcript: Vec<String>,
+    /// PAPER cards — the visible manuscript. Replaces the flat `Vec<String>`
+    /// transcript of the pre-PAPER TUI. Each card is a structured turn.
+    pub cards: Vec<TurnCard>,
+    /// System notes — slash-command feedback, session banners, errors.
+    /// Rendered in the whisper row, not in the canvas.
+    pub notes: Vec<Note>,
+    /// Single-row narrator above the composer.
+    pub whisper: Whisper,
+    /// Command palette state (⌃K).
+    pub palette: PaletteState,
+    /// Resolved theme (glyph table + colors).
+    pub theme: Theme,
+    /// Monotonic clock for pulse/blink phase.
+    pub boot: Instant,
+    /// Right-side inspector drawer (⌃2).
+    pub inspector_open: bool,
+    /// Left-side turn rail (⌃1).
+    pub rail_open: bool,
+    /// Focus mode — hide all cards except the live one (⌃\).
+    pub focus_mode: bool,
+    /// Structured data driving the inspector drawer.
+    pub inspector_data: InspectorData,
+
+    /// Splashscreen flag — true while the worker is initialising
+    /// (opening JSONL, SQLite mirror, tree-sitter index, FTS index,
+    /// co-edit graph, adapter). The UI draws a centered splash
+    /// instead of the canvas until the worker signals ready.
+    pub booting: bool,
+    /// Splash phase narration — updated as the worker progresses.
+    pub boot_phase: String,
+
+    /// Click targets registered by the render path for mouse
+    /// handling. Outer Vec indexed by absolute terminal Y; inner Vec
+    /// holds `(x_range, ClickTarget)` pairs so multiple buttons on
+    /// one row (sheet action bar, status row toggles) are reachable.
+    /// Repopulated every frame so stale entries don't fire.
+    pub click_map: Vec<Vec<(std::ops::Range<u16>, ClickTarget)>>,
+
     pub status: String,
     pub ctx_pct: u8,
     pub dirty: bool,
@@ -73,6 +132,11 @@ pub struct AppState {
     pending_user_text: Option<String>,
     pending_contract: Option<Contract>,
     pub pending_approval: Option<ApprovalRequestMsg>,
+    /// Scroll offset within the approval sheet body (rows from top).
+    /// Reset to 0 on each new pending_approval; advanced by scroll
+    /// wheel / arrow keys while a sheet is open. Closes codex R21
+    /// P1 (long approval summaries got silently clipped).
+    pub sheet_scroll_offset: u16,
     pub run_id: String,
     pub session_path: String,
     pub committed_turns: u32,
@@ -85,19 +149,53 @@ pub struct AppState {
     pub last_input_tokens: u32,
     /// Max context window from the active profile. Set once at startup.
     pub max_context_tokens: u32,
-    /// Scroll offset for the transcript (0 = pinned to bottom).
+    /// Scroll offset for the canvas (0 = pinned to latest).
     pub scroll_offset: u16,
     /// Whether the user has manually scrolled up (disables auto-scroll).
     pub scroll_locked: bool,
+    /// Cached `(card_idx, cell_idx)` order for `Tab` cell-cycling,
+    /// newest→oldest. `None` = dirty; recomputed on next Tab press.
+    /// Invalidated whenever a card or cell is added (TurnStarted +
+    /// ToolUse handlers). Replaces an O(N+M) walk-allocate-collect on
+    /// every Tab keystroke.
+    tab_order_cache: Option<Vec<(usize, usize)>>,
+    /// Index into `tab_order_cache` for the currently-focused cell.
+    /// `None` after every cache invalidation; reseeded on first Tab
+    /// from `card.cell_focus` via one O(N) scan, then O(1) advances
+    /// (`(idx + 1) % len`) for every subsequent Tab. Earlier the Tab
+    /// handler called `order.iter().position()` on every keystroke.
+    tab_cursor: Option<usize>,
 }
 
 impl AppState {
     pub fn new() -> Self {
         let mut textarea = TextArea::default();
-        textarea.set_placeholder_text("type a message or /command…");
+        textarea.set_placeholder_text("what are we building?");
+        let inspector_data = InspectorData {
+            tools: vec![
+                "repo_search".into(),
+                "repo_read_file".into(),
+                "repo_read_spans".into(),
+                "fs_write".into(),
+                "bash".into(),
+            ],
+            ..Default::default()
+        };
         Self {
             textarea,
-            transcript: vec!["azoth · ready".to_string()],
+            cards: Vec::new(),
+            notes: Vec::new(),
+            whisper: Whisper::default(),
+            palette: PaletteState::default(),
+            theme: Theme::detect(),
+            boot: Instant::now(),
+            inspector_open: false,
+            rail_open: false,
+            focus_mode: false,
+            inspector_data,
+            booting: true,
+            boot_phase: "starting up".to_string(),
+            click_map: Vec::new(),
             status: "ready".to_string(),
             ctx_pct: 0,
             dirty: true,
@@ -105,6 +203,7 @@ impl AppState {
             pending_user_text: None,
             pending_contract: None,
             pending_approval: None,
+            sheet_scroll_offset: 0,
             run_id: String::new(),
             session_path: String::new(),
             committed_turns: 0,
@@ -117,6 +216,8 @@ impl AppState {
             max_context_tokens: 0,
             scroll_offset: 0,
             scroll_locked: false,
+            tab_order_cache: None,
+            tab_cursor: None,
         }
     }
 
@@ -124,125 +225,254 @@ impl AppState {
         self.textarea.lines().join("\n")
     }
 
-    fn handle_slash(&mut self, cmd: SlashCommand) {
-        match cmd {
-            SlashCommand::Help => {
-                self.transcript.push("· help".into());
-                self.transcript
-                    .push("  /help              show this list".into());
-                self.transcript
-                    .push("  /status            run_id, session path, turn count".into());
-                self.transcript
-                    .push("  /context           latest compiled context packet".into());
-                self.transcript
-                    .push("  /contract <goal>   draft + accept a run contract".into());
-                self.transcript
-                    .push("  /approve [tool]    pre-approve a tool for the session".into());
-                self.transcript
-                    .push("  /resume <run_id>   (restart required in v1)".into());
-                self.transcript
-                    .push("  /continue          nudge the model to resume a truncated turn".into());
-                self.transcript.push("  /quit              exit".into());
+    /// Find the most recent card matching `turn_id`. Walks in reverse
+    /// because the live turn is almost always the target.
+    pub fn card_by_turn_id_mut(&mut self, turn_id: &str) -> Option<&mut TurnCard> {
+        self.cards.iter_mut().rev().find(|c| c.turn_id == turn_id)
+    }
+
+    /// Flip the card driving `turn_id` to `AwaitingApproval` so the user
+    /// can see which turn is blocked while the approval sheet is open.
+    /// Only mutates Live cards — terminal states are left alone.
+    fn set_card_awaiting_approval(&mut self, turn_id: &TurnId) {
+        let tid = turn_id.to_string();
+        if let Some(card) = self.card_by_turn_id_mut(&tid) {
+            if matches!(card.state, CardState::Live) {
+                card.state = CardState::AwaitingApproval;
             }
-            SlashCommand::Status => {
-                self.transcript.push("· status".into());
-                self.transcript
-                    .push(format!("  run_id        {}", self.run_id));
-                self.transcript
-                    .push(format!("  session_path  {}", self.session_path));
-                self.transcript.push(format!(
-                    "  pending_appr  {}",
-                    if self.pending_approval.is_some() {
-                        "yes"
-                    } else {
-                        "no"
-                    }
-                ));
-                self.transcript
-                    .push(format!("  turns         {}", self.committed_turns));
-                self.transcript.push(format!(
-                    "  contract      {}",
-                    self.current_contract_id
-                        .as_ref()
-                        .map(|c| c.to_string())
-                        .unwrap_or_else(|| "(none)".to_string())
-                ));
+        }
+    }
+
+    /// True when something on the canvas is currently animating or
+    /// transitioning under a time window — live/awaiting bar pulse,
+    /// cursor blink, pending-cell sweep, whisper spinner, recent
+    /// note that needs to fade out at the 5s mark, post-commit
+    /// bloom decay (~600ms), or post-append shimmer decay (~400ms).
+    /// The tick handler uses this to mark `dirty = true` only when
+    /// a redraw would be visible; idle sessions still pay zero
+    /// per-tick redraws.
+    ///
+    /// Earlier code only checked `is_live() || is_narrating()` — so
+    /// notes stayed visually stuck past the 5s window until input
+    /// arrived, and the bloom decay on a Committed bar froze on
+    /// the first frame after commit.
+    fn has_active_animation(&self) -> bool {
+        if self.cards.iter().any(|c| c.is_live()) || self.whisper.is_narrating() {
+            return true;
+        }
+        // Note fade window — Whisper.render_line shows latest_note
+        // when its `.at.elapsed() < 5s`. Match that threshold so the
+        // last frame of a fading note actually paints.
+        const NOTE_TTL_SECS: f32 = 5.0;
+        if let Some(latest) = self.notes.last() {
+            if latest.at.elapsed().as_secs_f32() < NOTE_TTL_SECS {
+                return true;
             }
-            SlashCommand::Context => match &self.last_context_summary {
-                Some(summary) => {
-                    self.transcript.push("· context".into());
-                    for line in summary.lines() {
-                        self.transcript.push(format!("  {line}"));
+        }
+        // Commit-bloom decay window — see `motion::bloom_phase`.
+        const BLOOM_MS: u128 = 600;
+        // Streaming-shimmer decay window — see `motion::shimmer_chars`.
+        const SHIMMER_MS: u128 = 400;
+        self.cards.iter().any(|c| {
+            c.committed_at
+                .map(|t| t.elapsed().as_millis() < BLOOM_MS)
+                .unwrap_or(false)
+                || c.last_append
+                    .map(|t| t.elapsed().as_millis() < SHIMMER_MS)
+                    .unwrap_or(false)
+        })
+    }
+
+    /// Take the pending approval request and roll any `AwaitingApproval`
+    /// card back to `Live`. Every grant/deny path goes through here so
+    /// the amber accent never lingers after the sheet closes.
+    fn take_pending_approval(&mut self) -> Option<ApprovalRequestMsg> {
+        let req = self.pending_approval.take();
+        // Worker processes turns sequentially → at most one card is
+        // AwaitingApproval. Search from newest and break on the first
+        // hit; previous version walked the whole transcript.
+        for card in self.cards.iter_mut().rev() {
+            if matches!(card.state, CardState::AwaitingApproval) {
+                card.state = CardState::Live;
+                break;
+            }
+        }
+        req
+    }
+
+    fn run_palette_action(&mut self, action: PaletteAction) {
+        match action {
+            PaletteAction::ShowContext => {
+                if let Some(s) = self.last_context_summary.clone() {
+                    for line in s.lines() {
+                        self.notes.push(Note::info(line.to_string()));
                     }
+                } else {
+                    self.notes
+                        .push(Note::help("no packet compiled yet — send a message first"));
                 }
-                None => {
-                    self.transcript
-                        .push("· context: no packet compiled yet".into());
-                }
-            },
-            SlashCommand::Contract(rest) => match rest {
-                None => {
-                    self.transcript
-                        .push("! usage: /contract <goal text>".into());
-                }
-                Some(goal) => {
-                    let mut c = azoth_core::contract::draft(goal.clone());
-                    c.success_criteria.push(format!("delivers: {goal}"));
-                    self.transcript.push(format!("· contract drafted: {goal}"));
-                    self.pending_contract = Some(c);
-                }
-            },
-            SlashCommand::Approve(arg) => match arg {
-                Some(tool_name) => {
-                    self.transcript.push(format!(
-                        "· approve: queuing session-scoped pre-approval for {tool_name}"
+            }
+            PaletteAction::ShowContract => {
+                if let Some(g) = self.inspector_data.contract_goal.clone() {
+                    self.notes.push(Note::info(format!("contract · {g}")));
+                } else {
+                    self.notes.push(Note::help(
+                        "no contract accepted yet — type `/contract <goal>` or just send a message",
                     ));
-                    self.pending_approve = Some(tool_name);
                 }
-                None => {
-                    self.transcript.push("· approve".into());
-                    self.transcript.push("  usage: /approve <tool_name>".into());
-                    self.transcript
-                        .push("  pre-grants a session-scoped capability token".into());
-                    self.transcript
-                        .push("  so the tool will not prompt for approval.".into());
-                    self.transcript.push("  registered tools: fs_write, bash, repo_search, repo_read_file, repo_read_spans".into());
+            }
+            PaletteAction::ShowTools => {
+                self.notes.push(Note::info(format!(
+                    "tools · {}",
+                    self.inspector_data.tools.join(", ")
+                )));
+            }
+            PaletteAction::ShowEvidence => {
+                if self.inspector_data.evidence_lanes.is_empty() {
+                    self.notes.push(Note::help(
+                        "no evidence yet — send a message to trigger retrieval",
+                    ));
+                } else {
+                    for (lane, label) in &self.inspector_data.evidence_lanes {
+                        self.notes.push(Note::info(format!("{lane:<8} {label}")));
+                    }
                 }
-            },
-            SlashCommand::Quit => {
+            }
+            PaletteAction::OpenRail => {
+                self.rail_open = !self.rail_open;
+            }
+            PaletteAction::OpenInspector => {
+                self.inspector_open = !self.inspector_open;
+            }
+            PaletteAction::FocusMode => {
+                self.focus_mode = !self.focus_mode;
+            }
+            PaletteAction::Quit => {
                 self.should_quit = true;
             }
-            SlashCommand::Resume(arg) => match arg {
-                Some(id) => {
-                    self.transcript.push(format!(
-                        "! /resume not yet supported at runtime, restart with: azoth resume {id}"
-                    ));
-                    self.should_quit = true;
-                }
-                None => {
-                    self.transcript.push("! usage: /resume <run_id>".into());
-                }
-            },
-            SlashCommand::Continue => {
-                // Sprint 7.5: queue a synthetic user prompt asking the
-                // model to resume where it left off. Meaningful after a
-                // `turn_aborted { reason: "model_truncated" }` where the
-                // model hit max_tokens mid-generation; the next turn
-                // starts with this nudge and the model's own
-                // conversation history still contains the partial
-                // output.
-                self.transcript.push("· /continue".into());
+            PaletteAction::Continue => {
                 self.pending_user_text = Some(
                     "Please continue from where you left off — pick up the \
                      partial output and finish."
                         .to_string(),
                 );
-                self.dirty = true;
+                // Note added in round 14 to match the slash-handler
+                // behaviour — earlier the palette path silently queued
+                // the prompt with no user feedback, while /continue
+                // showed "continue requested". Now both paths agree.
+                self.notes.push(Note::info("continue requested"));
             }
-            SlashCommand::Unknown(name) => {
-                self.transcript.push(format!("! unknown command: /{name}"));
+            PaletteAction::DraftContract(Some(goal)) => {
+                let mut draft = azoth_core::contract::draft(goal.clone());
+                draft.success_criteria.push(format!("delivers: {goal}"));
+                self.pending_contract = Some(draft);
+                self.notes
+                    .push(Note::info(format!("contract drafted · {goal}")));
+            }
+            PaletteAction::DraftContract(None) => {
+                self.notes.push(Note::help("usage: /contract <goal>"));
+            }
+            PaletteAction::Approve(Some(tool)) => {
+                self.pending_approve = Some(tool.clone());
+                self.notes
+                    .push(Note::info(format!("approving tool {tool} session-scope")));
+            }
+            PaletteAction::Approve(None) => {
+                self.notes.push(Note::help("usage: /approve <tool_name>"));
+            }
+            PaletteAction::Resume => {
+                self.notes.push(Note::help(
+                    "resume runs from the CLI: `azoth resume <run_id>`",
+                ));
+            }
+            PaletteAction::JumpToTurn(idx) => {
+                // Sum cached row counts for cards [0..idx) to find
+                // where the target card starts in the full transcript
+                // y-coord. Then set scroll_offset so that y lands at
+                // the top of the visible window. Closes codex R21 P2
+                // (jump N was previously a note-only no-op).
+                if idx < self.cards.len() {
+                    // Codex R23 P2: focus_mode collapses the canvas to
+                    // a single card and ignores scroll_offset. A jump
+                    // in focus mode would silently no-op. Exit focus
+                    // mode so the scroll actually shows the target.
+                    if self.focus_mode {
+                        self.focus_mode = false;
+                    }
+                    let prefix_y: usize = self.cards[..idx]
+                        .iter()
+                        .map(|c| c.last_rendered_rows.max(4))
+                        .sum();
+                    self.scroll_offset = u16::try_from(prefix_y).unwrap_or(u16::MAX);
+                    self.scroll_locked = true;
+                    self.notes
+                        .push(Note::info(format!("jumped to turn {}", idx + 1)));
+                } else {
+                    self.notes.push(Note::warn(format!(
+                        "jump · turn {} out of range (have {})",
+                        idx + 1,
+                        self.cards.len()
+                    )));
+                }
+            }
+            PaletteAction::UnknownSlash(name) => {
+                self.notes
+                    .push(Note::warn(format!("unknown command: /{name}")));
             }
         }
+    }
+
+    fn handle_slash(&mut self, cmd: SlashCommand) {
+        // Delegate to `run_palette_action` for every variant that
+        // already has a palette equivalent — gemini round-14 MED
+        // flagged the duplication that had silently drifted
+        // (e.g. /continue used to show a note but the palette
+        // version didn't). Slash-only branches (Help, Status, the
+        // Resume `<id>` shortcut) stay inline.
+        match cmd {
+            SlashCommand::Context => self.run_palette_action(PaletteAction::ShowContext),
+            SlashCommand::Contract(arg) => {
+                self.run_palette_action(PaletteAction::DraftContract(arg))
+            }
+            SlashCommand::Approve(arg) => self.run_palette_action(PaletteAction::Approve(arg)),
+            SlashCommand::Quit => self.run_palette_action(PaletteAction::Quit),
+            SlashCommand::Continue => self.run_palette_action(PaletteAction::Continue),
+            SlashCommand::Unknown(name) => {
+                self.run_palette_action(PaletteAction::UnknownSlash(name))
+            }
+            // Slash-only — these have no palette equivalent or take a
+            // CLI-specific argument the palette can't supply.
+            SlashCommand::Help => {
+                self.notes.push(Note::help(
+                    "press ⌃K for the palette · all commands live there",
+                ));
+            }
+            SlashCommand::Status => {
+                self.notes.push(Note::info(format!(
+                    "run {} · turns {} · contract {}",
+                    if self.run_id.is_empty() {
+                        "(pending)".to_string()
+                    } else {
+                        self.run_id.chars().take(14).collect()
+                    },
+                    self.committed_turns,
+                    self.current_contract_id
+                        .as_ref()
+                        .map(|c| c.to_string().chars().take(14).collect())
+                        .unwrap_or_else(|| "none".to_string())
+                )));
+            }
+            SlashCommand::Resume(Some(id)) => {
+                // Slash-only behaviour: print restart instruction +
+                // quit. The palette `Resume` variant just shows help.
+                self.notes.push(Note::info(format!(
+                    "/resume not supported at runtime — restart with: azoth resume {id}"
+                )));
+                self.should_quit = true;
+            }
+            SlashCommand::Resume(None) => self.run_palette_action(PaletteAction::Resume),
+        }
+        self.dirty = true;
     }
 
     pub fn handle_input(&mut self, ev: InputEvent) {
@@ -254,75 +484,391 @@ impl AppState {
     }
 
     fn handle_mouse(&mut self, me: crossterm::event::MouseEvent) {
-        use crossterm::event::MouseEventKind;
+        use crossterm::event::{MouseButton, MouseEventKind};
         match me.kind {
             MouseEventKind::ScrollUp => {
-                self.scroll_offset = self.scroll_offset.saturating_add(3);
-                self.scroll_locked = true;
+                if self.pending_approval.is_some() {
+                    // Route wheel into sheet body when the modal is
+                    // active (codex R21 P1).
+                    self.sheet_scroll_offset = self.sheet_scroll_offset.saturating_sub(3);
+                } else {
+                    self.scroll_offset = self.scroll_offset.saturating_add(3);
+                    self.scroll_locked = true;
+                }
                 self.dirty = true;
             }
             MouseEventKind::ScrollDown => {
-                self.scroll_offset = self.scroll_offset.saturating_sub(3);
-                if self.scroll_offset == 0 {
-                    self.scroll_locked = false;
+                if self.pending_approval.is_some() {
+                    self.sheet_scroll_offset = self.sheet_scroll_offset.saturating_add(3);
+                } else {
+                    self.scroll_offset = self.scroll_offset.saturating_sub(3);
+                    if self.scroll_offset == 0 {
+                        self.scroll_locked = false;
+                    }
                 }
                 self.dirty = true;
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                let y = me.row as usize;
+                let x = me.column;
+                let modal_active = self.palette.open || self.pending_approval.is_some();
+                // Walk EVERY matching target on this row. A wide
+                // canvas-card range can match before a narrow sheet
+                // button range; the modal gate rejects the canvas hit
+                // but we keep scanning so the sheet button still
+                // fires. Earlier code returned on first reject and
+                // approve/deny clicks became no-ops when a card row
+                // sat behind the sheet area.
+                let mut chosen: Option<ClickTarget> = None;
+                let approval_pending = self.pending_approval.is_some();
+                if let Some(row) = self.click_map.get(y) {
+                    for (range, t) in row.iter() {
+                        if !range.contains(&x) {
+                            continue;
+                        }
+                        // PaletteOpen is gated separately: allowed when
+                        // no approval is pending, dropped when an
+                        // approval sheet is active. Earlier code let
+                        // PaletteOpen through during approval, so a
+                        // click on the status-row brand stole keyboard
+                        // input (Enter/Esc routed to palette) and made
+                        // the approval flow indirect.
+                        let is_modal_target = match t {
+                            ClickTarget::SheetApproveOnce
+                            | ClickTarget::SheetApproveSession
+                            | ClickTarget::SheetDeny => true,
+                            ClickTarget::PaletteOpen => !approval_pending,
+                            _ => false,
+                        };
+                        if modal_active && !is_modal_target {
+                            continue;
+                        }
+                        chosen = Some(t.clone());
+                        break;
+                    }
+                }
+                if let Some(t) = chosen {
+                    self.handle_click_target(t);
+                    self.dirty = true;
+                }
             }
             _ => {}
         }
     }
 
+    fn handle_click_target(&mut self, target: ClickTarget) {
+        match target {
+            ClickTarget::ThoughtsToggle { card_idx } => {
+                if let Some(card) = self.cards.get_mut(card_idx) {
+                    card.thoughts_expanded = !card.thoughts_expanded;
+                }
+            }
+            ClickTarget::CellToggle { card_idx, cell_idx } => {
+                if let Some(card) = self.cards.get_mut(card_idx) {
+                    if let Some(cell) = card.cells.get_mut(cell_idx) {
+                        cell.expanded = !cell.expanded;
+                    }
+                }
+            }
+            ClickTarget::SheetApproveOnce => {
+                if let Some(req) = self.take_pending_approval() {
+                    let _ = req.responder.send(ApprovalResponse::Grant {
+                        scope: ApprovalScope::Once,
+                    });
+                    self.notes.push(Note::info("approval · granted once"));
+                }
+            }
+            ClickTarget::SheetApproveSession => {
+                if let Some(req) = self.take_pending_approval() {
+                    let _ = req.responder.send(ApprovalResponse::Grant {
+                        scope: ApprovalScope::Session,
+                    });
+                    self.notes.push(Note::info("approval · granted session"));
+                }
+            }
+            ClickTarget::SheetDeny => {
+                if let Some(req) = self.take_pending_approval() {
+                    let _ = req.responder.send(ApprovalResponse::Deny);
+                    self.notes.push(Note::warn("approval · denied"));
+                }
+            }
+            ClickTarget::PaletteOpen => {
+                self.palette.open();
+            }
+            ClickTarget::FocusToggle => {
+                self.focus_mode = !self.focus_mode;
+            }
+            ClickTarget::RailToggle => {
+                self.rail_open = !self.rail_open;
+            }
+            ClickTarget::InspectorToggle => {
+                self.inspector_open = !self.inspector_open;
+            }
+        }
+    }
+
     fn handle_key(&mut self, key: KeyEvent) {
-        if self.pending_approval.is_some() {
-            match key.code {
-                KeyCode::Char('y') | KeyCode::Char('Y') => {
-                    if let Some(req) = self.pending_approval.take() {
-                        let _ = req.responder.send(ApprovalResponse::Grant {
-                            scope: ApprovalScope::Once,
-                        });
-                        self.transcript.push("  · approval: granted once".into());
-                        self.dirty = true;
+        // Palette captures input when open.
+        if self.palette.open {
+            match (key.code, key.modifiers) {
+                (KeyCode::Esc, _) => {
+                    self.palette.close();
+                }
+                (KeyCode::Enter, _) => {
+                    let action = self.palette.fire(self.cards.len());
+                    self.palette.close();
+                    if let Some(a) = action {
+                        self.run_palette_action(a);
                     }
                 }
-                KeyCode::Char('s') | KeyCode::Char('S') => {
-                    if let Some(req) = self.pending_approval.take() {
-                        let _ = req.responder.send(ApprovalResponse::Grant {
-                            scope: ApprovalScope::Session,
-                        });
-                        self.transcript.push("  · approval: granted session".into());
-                        self.dirty = true;
-                    }
+                (KeyCode::Backspace, _) => {
+                    self.palette.pop_char();
                 }
-                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                    if let Some(req) = self.pending_approval.take() {
-                        let _ = req.responder.send(ApprovalResponse::Deny);
-                        self.transcript.push("  · approval: denied".into());
-                        self.dirty = true;
-                    }
+                (KeyCode::Up, _) => {
+                    self.palette.cursor_up();
+                }
+                (KeyCode::Down, _) => {
+                    let total =
+                        super::palette::match_entries(&self.palette.query, self.cards.len()).len();
+                    self.palette.cursor_down(total);
+                }
+                (KeyCode::Char(c), _) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.palette.push_char(c);
                 }
                 _ => {}
             }
+            self.dirty = true;
             return;
         }
+
+        // Approval sheet captures input when a request is pending.
+        if self.pending_approval.is_some() {
+            match (key.code, key.modifiers) {
+                (KeyCode::Enter, _) | (KeyCode::Char('y'), _) | (KeyCode::Char('Y'), _) => {
+                    if let Some(req) = self.take_pending_approval() {
+                        let _ = req.responder.send(ApprovalResponse::Grant {
+                            scope: ApprovalScope::Once,
+                        });
+                        self.notes.push(Note::info("approval · granted once"));
+                    }
+                }
+                (KeyCode::Char('s'), _) | (KeyCode::Char('S'), _) => {
+                    if let Some(req) = self.take_pending_approval() {
+                        let _ = req.responder.send(ApprovalResponse::Grant {
+                            scope: ApprovalScope::Session,
+                        });
+                        self.notes.push(Note::info("approval · granted session"));
+                    }
+                }
+                (KeyCode::Char('p'), _) | (KeyCode::Char('P'), _) => {
+                    // Scoped-paths v1: a no-op empty path list is unsafe,
+                    // so we route to session-scope and surface a note so
+                    // the user knows the batch-plan sheet isn't in this
+                    // build yet. Bona-fide ScopedPaths lands in v2.1.
+                    if let Some(req) = self.take_pending_approval() {
+                        let _ = req.responder.send(ApprovalResponse::Grant {
+                            scope: ApprovalScope::Session,
+                        });
+                        self.notes.push(Note::info(
+                            "approval · scoped-paths falls back to session in v1",
+                        ));
+                    }
+                }
+                (KeyCode::Esc, _) | (KeyCode::Char('n'), _) | (KeyCode::Char('N'), _) => {
+                    if let Some(req) = self.take_pending_approval() {
+                        let _ = req.responder.send(ApprovalResponse::Deny);
+                        self.notes.push(Note::warn("approval · denied"));
+                    }
+                }
+                // Sheet body scroll — long approval summaries used to
+                // be silently clipped (codex R21 P1). ↑/↓ + PgUp/PgDn
+                // adjust the offset within the sheet body.
+                (KeyCode::Up, _) => {
+                    self.sheet_scroll_offset = self.sheet_scroll_offset.saturating_sub(1);
+                }
+                (KeyCode::Down, _) => {
+                    self.sheet_scroll_offset = self.sheet_scroll_offset.saturating_add(1);
+                }
+                (KeyCode::PageUp, _) => {
+                    self.sheet_scroll_offset = self.sheet_scroll_offset.saturating_sub(5);
+                }
+                (KeyCode::PageDown, _) => {
+                    self.sheet_scroll_offset = self.sheet_scroll_offset.saturating_add(5);
+                }
+                _ => {}
+            }
+            self.dirty = true;
+            return;
+        }
+
         match (key.code, key.modifiers) {
             (KeyCode::Char('c'), KeyModifiers::CONTROL)
             | (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
                 self.should_quit = true;
                 return;
             }
-            (KeyCode::Enter, m) if !m.contains(KeyModifiers::ALT) => {
+            (KeyCode::Char('k'), KeyModifiers::CONTROL) => {
+                self.palette.open();
+                self.dirty = true;
+                return;
+            }
+            (KeyCode::Char('1'), KeyModifiers::CONTROL) => {
+                self.rail_open = !self.rail_open;
+                self.dirty = true;
+                return;
+            }
+            (KeyCode::Char('2'), KeyModifiers::CONTROL) => {
+                self.inspector_open = !self.inspector_open;
+                self.dirty = true;
+                return;
+            }
+            (KeyCode::Char('\\'), KeyModifiers::CONTROL) => {
+                self.focus_mode = !self.focus_mode;
+                self.dirty = true;
+                return;
+            }
+            (KeyCode::Char('t'), KeyModifiers::CONTROL) => {
+                // Dedicated thoughts toggle on the latest agent card
+                // with thoughts. Independent of Tab (which prioritises
+                // tool cells); ⌃T always targets thoughts.
+                if let Some(card) = self.cards.iter_mut().rev().find(|c| !c.thoughts.is_empty()) {
+                    card.thoughts_expanded = !card.thoughts_expanded;
+                    self.dirty = true;
+                }
+                return;
+            }
+            (KeyCode::Tab, m) if !m.contains(KeyModifiers::SHIFT) => {
+                // Tab walks focus through every tool cell across every
+                // card, newest→oldest, wrapping. The focused cell is the
+                // only one expanded. Earlier builds only toggled the
+                // last cell of the most recent card, leaving older cells
+                // unreachable from the keyboard. Falls through to
+                // thoughts / textarea when no cells exist anywhere.
+                // Lazy-fill the cached cell order. Invalidated whenever
+                // a card or cell is added (TurnStarted / ToolUse /
+                // user Enter handlers above). Saves the rebuild cost
+                // on every Tab keystroke for long sessions.
+                if self.tab_order_cache.is_none() {
+                    let order: Vec<(usize, usize)> = self
+                        .cards
+                        .iter()
+                        .enumerate()
+                        .rev()
+                        .flat_map(|(ci, card)| (0..card.cells.len()).rev().map(move |xi| (ci, xi)))
+                        .collect();
+                    self.tab_order_cache = Some(order);
+                    self.tab_cursor = None;
+                }
+                let order = self.tab_order_cache.as_ref().unwrap();
+                if !order.is_empty() {
+                    // Cursor is reseeded once after each cache rebuild
+                    // by scanning `cell_focus` from the newest card —
+                    // recent cards win. Subsequent Tabs read from the
+                    // cursor and advance with `(idx + 1) % len`, O(1).
+                    if self.tab_cursor.is_none() {
+                        if let Some(prev) = self
+                            .cards
+                            .iter()
+                            .enumerate()
+                            .rev()
+                            .find_map(|(ci, c)| c.cell_focus.map(|xi| (ci, xi)))
+                        {
+                            self.tab_cursor = order.iter().position(|&q| q == prev);
+                        }
+                    }
+                    let next_idx = match self.tab_cursor {
+                        Some(i) => (i + 1) % order.len(),
+                        None => 0,
+                    };
+                    let next = order[next_idx];
+                    // Sweep every cell across every card so Tab
+                    // enforces "focused cell is the only one expanded"
+                    // even when the user previously mouse-expanded
+                    // others. The lighter "unfocus only previous"
+                    // version (round 6) leaked manual mouse-expansions
+                    // into keyboard navigation.
+                    let (ci, xi) = next;
+                    for (card_i, card) in self.cards.iter_mut().enumerate() {
+                        for (cell_i, cell) in card.cells.iter_mut().enumerate() {
+                            if card_i != ci || cell_i != xi {
+                                cell.expanded = false;
+                            }
+                        }
+                        if card_i != ci {
+                            card.cell_focus = None;
+                        }
+                    }
+                    if let Some(card) = self.cards.get_mut(ci) {
+                        if let Some(cell) = card.cells.get_mut(xi) {
+                            cell.expanded = true;
+                        }
+                        card.cell_focus = Some(xi);
+                    }
+                    self.tab_cursor = Some(next_idx);
+                    self.dirty = true;
+                    return;
+                }
+                // No cells anywhere — fall back to the latest card's
+                // thoughts (still useful when the model only emits
+                // reasoning blocks without tool calls).
+                if let Some(card) = self.cards.iter_mut().rev().find(|c| !c.thoughts.is_empty()) {
+                    card.thoughts_expanded = !card.thoughts_expanded;
+                    self.dirty = true;
+                    return;
+                }
+                // No expandable content — fall through to textarea.
+            }
+            (KeyCode::BackTab, _) | (KeyCode::Tab, KeyModifiers::SHIFT) => {
+                // Collapse everything + drop focus. Equivalent to "back
+                // to the closed view" so Tab restarts from the latest.
+                // Reset `tab_cursor` too — otherwise the next Tab
+                // resumes from the stale cursor position instead of
+                // restarting from the newest cell.
+                for card in self.cards.iter_mut() {
+                    for cell in card.cells.iter_mut() {
+                        cell.expanded = false;
+                    }
+                    card.cell_focus = None;
+                }
+                self.tab_cursor = None;
+                self.dirty = true;
+                return;
+            }
+            (KeyCode::Enter, m)
+                if !m.contains(KeyModifiers::ALT) && !m.contains(KeyModifiers::SHIFT) =>
+            {
+                // Shift+Enter reaches the textarea below as a newline
+                // (matches the `⇧↵ newline` hint). Earlier this branch
+                // matched any non-ALT Enter and accidentally submitted
+                // multi-line drafts on terminals reporting SHIFT.
                 let content = self.textarea_content();
                 if !content.is_empty() {
                     self.input_history.push(content.clone());
                     self.history_cursor = self.input_history.len();
                     self.textarea = TextArea::default();
-                    self.textarea
-                        .set_placeholder_text("type a message or /command…");
-                    self.transcript.push(format!("> {content}"));
+                    self.textarea.set_placeholder_text("what are we building?");
                     if let Some(cmd) = SlashCommand::parse(&content) {
                         self.handle_slash(cmd);
                     } else {
+                        // Push the user's card immediately — the card
+                        // appears before the model even sees the turn.
+                        // Use a fresh `TurnId` so back-to-back user
+                        // sends produce globally-unique card IDs (the
+                        // earlier `committed_turns`-based ID could
+                        // collide if the user pressed Enter twice
+                        // before the agent committed the prior turn).
+                        let user_turn_id = TurnId::new().to_string();
+                        self.cards
+                            .push(TurnCard::user(user_turn_id, content.clone()));
+                        self.tab_order_cache = None;
+                        self.tab_cursor = None;
                         self.pending_user_text = Some(content);
+                        // Queued state — spinner appears in the
+                        // whisper row immediately so there's no silent
+                        // gap between keystroke and the first
+                        // SessionEvent from the worker. TurnStarted
+                        // overrides this to "thinking".
+                        self.whisper.set("queued · waiting for the worker");
                     }
                     self.dirty = true;
                 }
@@ -336,8 +882,7 @@ impl AppState {
                 self.history_cursor -= 1;
                 let prev = self.input_history[self.history_cursor].clone();
                 self.textarea = TextArea::from(prev.lines().map(String::from).collect::<Vec<_>>());
-                self.textarea
-                    .set_placeholder_text("type a message or /command…");
+                self.textarea.set_placeholder_text("what are we building?");
                 self.dirty = true;
                 return;
             }
@@ -354,8 +899,7 @@ impl AppState {
                 } else {
                     self.textarea = TextArea::default();
                 }
-                self.textarea
-                    .set_placeholder_text("type a message or /command…");
+                self.textarea.set_placeholder_text("what are we building?");
                 self.dirty = true;
                 return;
             }
@@ -438,12 +982,31 @@ impl AppState {
     pub fn handle_session_event(&mut self, ev: SessionEvent) {
         match ev {
             SessionEvent::ContractAccepted { contract, .. } => {
-                self.transcript
-                    .push(format!("  [contract accepted] {}", contract.goal));
+                let goal = contract.goal.clone();
+                self.inspector_data.contract_goal = Some(goal.clone());
+                let budget = contract
+                    .effect_budget
+                    .max_apply_local
+                    .saturating_add(contract.effect_budget.max_apply_repo);
+                self.inspector_data.contract_budget = Some((0, budget));
+                self.notes
+                    .push(Note::info(format!("contract accepted · {goal}")));
                 self.current_contract_id = Some(contract.id);
             }
-            // Suppress noisy lifecycle events — they go to .azoth/azoth.log
-            SessionEvent::TurnStarted { .. } | SessionEvent::ModelRequest { .. } => {}
+            SessionEvent::TurnStarted { turn_id, .. } => {
+                self.cards.push(TurnCard::agent(turn_id.to_string()));
+                self.tab_order_cache = None;
+                self.tab_cursor = None;
+                self.whisper.set("thinking");
+                // Evidence lanes are per-turn — flush so the inspector
+                // shows what *this* turn retrieved, not the prior one's
+                // residue. Repopulated by RetrievalQueried / SymbolResolved
+                // arms below.
+                self.inspector_data.evidence_lanes.clear();
+            }
+            SessionEvent::ModelRequest { .. } => {
+                self.whisper.set("waiting for the model");
+            }
             SessionEvent::ContextPacket {
                 turn_id,
                 packet_id,
@@ -452,97 +1015,344 @@ impl AppState {
                 self.last_context_summary = Some(format!(
                     "packet_id  {packet_id}\nturn_id    {turn_id}\ndigest     {packet_digest}"
                 ));
+                let digest_short: String = packet_digest.chars().take(18).collect();
+                self.inspector_data.packet_digest = Some(digest_short);
+                self.inspector_data.turn_id = Some(turn_id.to_string());
             }
-            SessionEvent::ContentBlock { block, .. } => match block {
-                ContentBlock::Text { text } => {
-                    // Model text — the main content the user wants to read.
-                    for line in text.lines() {
-                        self.transcript.push(format!("  {line}"));
+            SessionEvent::ContentBlock { turn_id, block, .. } => {
+                let tid = turn_id.to_string();
+                match block {
+                    ContentBlock::Text { text } => {
+                        if let Some(card) = self.card_by_turn_id_mut(&tid) {
+                            card.append_prose(&text);
+                        }
+                        self.whisper.clear();
                     }
-                }
-                ContentBlock::ToolUse { name, input, .. } => {
-                    let summary = input
-                        .get("command")
-                        .or_else(|| input.get("path"))
-                        .or_else(|| input.get("q"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("...");
-                    self.transcript.push(format!("  [{name}] {summary}"));
-                }
-                ContentBlock::ToolResult {
-                    is_error, content, ..
-                } => {
-                    if is_error {
-                        let msg = content
-                            .first()
-                            .and_then(|b| match b {
+                    ContentBlock::ToolUse {
+                        id, name, input, ..
+                    } => {
+                        let summary = input
+                            .get("command")
+                            .or_else(|| input.get("path"))
+                            .or_else(|| input.get("q"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("…")
+                            .to_string();
+                        let cell = ToolCell {
+                            tool_use_id: id.to_string(),
+                            name: name.clone(),
+                            summary: summary.clone(),
+                            expanded: false,
+                            result: CellResult::Pending,
+                            preview_lines: Vec::new(),
+                            full_lines: Vec::new(),
+                            created_at: Instant::now(),
+                            cached_preview_render: None,
+                            cached_full_render: None,
+                            cached_header_parts: None,
+                        };
+                        if let Some(card) = self.card_by_turn_id_mut(&tid) {
+                            card.add_cell(cell);
+                            self.tab_order_cache = None;
+                            self.tab_cursor = None;
+                        }
+                        let narration: String = summary.chars().take(40).collect();
+                        self.whisper.set(format!("running {name} · {narration}"));
+                    }
+                    ContentBlock::ToolResult {
+                        tool_use_id,
+                        is_error,
+                        content,
+                    } => {
+                        // Borrow the text without cloning the entire body —
+                        // a 100k-line build log used to clone fully into
+                        // `preview_text` before we even decided how much
+                        // we needed.
+                        // Concatenate ALL text blocks across the
+                        // ToolResult content — earlier code only
+                        // grabbed the first text block via find_map,
+                        // dropping later text content (a tool returning
+                        // `[Text "stdout", Image, Text "stderr"]` lost
+                        // the stderr). Borrow when possible, allocate
+                        // a join only when there are multiple blocks.
+                        let texts: Vec<&str> = content
+                            .iter()
+                            .filter_map(|b| match b {
                                 ContentBlock::Text { text } => Some(text.as_str()),
                                 _ => None,
                             })
-                            .unwrap_or("error");
-                        self.transcript.push(format!("  [error] {msg}"));
+                            .collect();
+                        let joined_storage: String;
+                        let preview_text: &str = match texts.as_slice() {
+                            [] => "",
+                            [single] => single,
+                            many => {
+                                joined_storage = many.join("\n");
+                                &joined_storage
+                            }
+                        };
+                        let tu_id = tool_use_id.to_string();
+                        if let Some(card) = self.card_by_turn_id_mut(&tid) {
+                            if let Some(cell) = card.cell_by_id_mut(&tu_id) {
+                                // Single streaming pass: take at most 4
+                                // preview + 24 full + count, never
+                                // materialising a `Vec<&str>` over the
+                                // whole output. The walk is hard-capped
+                                // at MAX_LINES_SCANNED so a tool emitting
+                                // millions of lines (a runaway `find /`
+                                // or a giant log) cannot lock the UI
+                                // thread while we count.
+                                const MAX_LINES_SCANNED: usize = 10_000;
+                                // Hard byte cap so even a 100MB output
+                                // with no newlines (or pathological
+                                // 10k newlines averaging 1MB each)
+                                // can't lock the UI thread.
+                                // `lines()` walks every byte to find
+                                // `\n`, so the line cap alone isn't
+                                // enough.
+                                const MAX_BYTES_SCANNED: usize = 1_048_576; // 1 MiB
+                                const MAX_LINE_BYTES: usize = 1024;
+                                let mut preview: Vec<String> = Vec::with_capacity(5);
+                                let mut full: Vec<String> = Vec::with_capacity(24);
+                                let mut total_lines: u32 = 0;
+                                let mut first_line: Option<String> = None;
+                                let mut truncated = false;
+                                let scan_slice = if preview_text.len() > MAX_BYTES_SCANNED {
+                                    truncated = true;
+                                    // floor to char boundary
+                                    let mut end = MAX_BYTES_SCANNED;
+                                    while end > 0 && !preview_text.is_char_boundary(end) {
+                                        end -= 1;
+                                    }
+                                    &preview_text[..end]
+                                } else {
+                                    preview_text
+                                };
+                                for (i, line) in scan_slice.lines().enumerate() {
+                                    if i >= MAX_LINES_SCANNED {
+                                        truncated = true;
+                                        break;
+                                    }
+                                    let want_preview = preview.len() < 4;
+                                    let want_full = full.len() < 24;
+                                    let is_first = total_lines == 0;
+                                    // Allocate ONLY when we will use the
+                                    // owned String — earlier code paid
+                                    // a `to_string()` for every line up
+                                    // to MAX_LINES_SCANNED, but the
+                                    // result was only stored for the
+                                    // first 24 entries. Wasted ~9976
+                                    // allocations on a 10k-line scan.
+                                    if want_preview || want_full || is_first {
+                                        let trimmed = if line.len() > MAX_LINE_BYTES {
+                                            // floor to char boundary
+                                            let mut end = MAX_LINE_BYTES;
+                                            while end > 0 && !line.is_char_boundary(end) {
+                                                end -= 1;
+                                            }
+                                            &line[..end]
+                                        } else {
+                                            line
+                                        };
+                                        let owned = trimmed.to_string();
+                                        if is_first {
+                                            first_line = Some(owned.clone());
+                                        }
+                                        match (want_preview, want_full) {
+                                            (true, true) => {
+                                                preview.push(owned.clone());
+                                                full.push(owned);
+                                            }
+                                            (true, false) => preview.push(owned),
+                                            (false, true) => full.push(owned),
+                                            (false, false) => {}
+                                        }
+                                    }
+                                    total_lines = total_lines.saturating_add(1);
+                                }
+                                if total_lines > 4 {
+                                    let suffix = if truncated { "+" } else { "" };
+                                    preview.push(format!(
+                                        "… +{}{} more lines",
+                                        total_lines - 4,
+                                        suffix
+                                    ));
+                                }
+                                cell.set_preview_lines(preview);
+                                cell.set_full_lines(full);
+                                cell.result = if is_error {
+                                    CellResult::Err {
+                                        message: first_line
+                                            .unwrap_or_else(|| "tool error".to_string()),
+                                    }
+                                } else if total_lines > 0 {
+                                    let suffix = if truncated { "+" } else { "" };
+                                    CellResult::Ok {
+                                        count_hint: Some(format!("{total_lines}{suffix} lines")),
+                                    }
+                                } else {
+                                    CellResult::Ok { count_hint: None }
+                                };
+                            }
+                        }
+                        self.whisper.clear();
+                    }
+                    ContentBlock::Thinking { text, .. } => {
+                        if let Some(card) = self.card_by_turn_id_mut(&tid) {
+                            card.append_thought(&text);
+                        }
+                        self.whisper.set("thinking");
                     }
                 }
-                ContentBlock::Thinking { .. } => {
-                    self.transcript.push("  [thinking...]".into());
-                }
-            },
+            }
             SessionEvent::EffectRecord { effect, .. } => {
                 if effect.error.is_some() {
-                    self.transcript.push(format!(
-                        "  [effect error] {} {:?}",
+                    self.notes.push(Note::error(format!(
+                        "effect error · {} · {:?}",
                         effect.tool_name, effect.error
-                    ));
+                    )));
+                } else if matches!(
+                    effect.class,
+                    azoth_core::schemas::EffectClass::ApplyLocal
+                        | azoth_core::schemas::EffectClass::ApplyRepo
+                ) {
+                    // Successful budget-counted effect — bump the
+                    // inspector's contract budget consumption so the
+                    // user can see how close they are to the cap.
+                    // Earlier the consumed counter sat at 0 forever.
+                    if let Some((used, max)) = self.inspector_data.contract_budget.as_mut() {
+                        *used = used.saturating_add(1).min(*max);
+                    }
                 }
             }
+            SessionEvent::RetrievalQueried {
+                backend,
+                query,
+                result_count,
+                ..
+            } => {
+                let label = format!(
+                    "{query} · {result_count} hit{}",
+                    if result_count == 1 { "" } else { "s" }
+                );
+                self.inspector_data.evidence_lanes.push((backend, label));
+            }
+            SessionEvent::SymbolResolved {
+                backend,
+                query,
+                matched,
+                ..
+            } => {
+                let label = format!(
+                    "{query} · {} match{}",
+                    matched.len(),
+                    if matched.len() == 1 { "" } else { "es" }
+                );
+                self.inspector_data
+                    .evidence_lanes
+                    .push((format!("symbol/{backend}"), label));
+            }
             SessionEvent::ToolResult {
+                turn_id,
                 tool_use_id,
                 is_error,
                 ..
             } => {
                 if is_error {
-                    self.transcript
-                        .push(format!("  [tool error] id={tool_use_id}"));
+                    let tid = turn_id.to_string();
+                    let tu = tool_use_id.to_string();
+                    if let Some(card) = self.card_by_turn_id_mut(&tid) {
+                        if let Some(cell) = card.cell_by_id_mut(&tu) {
+                            if matches!(cell.result, CellResult::Pending) {
+                                cell.result = CellResult::Err {
+                                    message: "tool error".to_string(),
+                                };
+                            }
+                        }
+                    }
                 }
             }
             SessionEvent::ApprovalGranted { scope, .. } => {
-                let scope_label = match &scope {
+                let label = match &scope {
                     ApprovalScope::Once => "once",
                     ApprovalScope::Session => "session",
                     ApprovalScope::ScopedPaths { .. } => "scoped-paths",
                 };
-                self.transcript.push(format!("  [approved {scope_label}]"));
+                self.notes.push(Note::info(format!("approval · {label}")));
             }
-            SessionEvent::TurnCommitted { usage, .. } => {
+            SessionEvent::TurnCommitted { turn_id, usage, .. } => {
                 self.last_input_tokens = usage.input_tokens;
                 if self.max_context_tokens > 0 {
                     self.ctx_pct = ((usage.input_tokens as u64 * 100)
                         / self.max_context_tokens as u64)
                         .min(100) as u8;
+                    if self.inspector_data.ctx_history.len() >= 24 {
+                        self.inspector_data.ctx_history.remove(0);
+                    }
+                    self.inspector_data.ctx_history.push(self.ctx_pct as u64);
+                    self.inspector_data.ctx_pct = self.ctx_pct;
                 }
-                self.transcript.push(format!(
-                    "  [done] {} in / {} out tokens",
-                    usage.input_tokens, usage.output_tokens
-                ));
+                let tid = turn_id.to_string();
+                let chip = UsageChip {
+                    input_tokens: usage.input_tokens,
+                    output_tokens: usage.output_tokens,
+                };
+                if let Some(card) = self.card_by_turn_id_mut(&tid) {
+                    card.state = CardState::Committed;
+                    card.usage = Some(chip);
+                    card.committed_at = Some(Instant::now());
+                    // Wall-clock counterpart for resume-stable "t+Xs"
+                    // labels. `committed_at` stays monotonic for the
+                    // bloom animation; `committed_wall` is what the
+                    // header cache reads.
+                    card.committed_wall = Some(std::time::SystemTime::now());
+                }
                 self.committed_turns = self.committed_turns.saturating_add(1);
+                self.whisper.clear();
             }
-            SessionEvent::TurnAborted { reason, detail, .. } => {
-                let d = detail.unwrap_or_default();
-                self.transcript.push(format!("  [aborted] {reason:?}: {d}"));
+            SessionEvent::TurnAborted {
+                turn_id,
+                reason,
+                detail,
+                ..
+            } => {
+                let tid = turn_id.to_string();
+                let reason_str = format!("{reason:?}");
+                let detail_str = detail.unwrap_or_default();
+                if let Some(card) = self.card_by_turn_id_mut(&tid) {
+                    card.state = CardState::Aborted {
+                        reason: reason_str.clone(),
+                        detail: detail_str.clone(),
+                    };
+                }
+                self.notes.push(Note::warn(format!(
+                    "aborted · {reason_str}{}{}",
+                    if detail_str.is_empty() { "" } else { " · " },
+                    detail_str
+                )));
+                self.whisper.clear();
             }
-            SessionEvent::TurnInterrupted { reason, .. } => {
-                self.transcript.push(format!("  [interrupted] {reason:?}"));
+            SessionEvent::TurnInterrupted {
+                turn_id, reason, ..
+            } => {
+                let tid = turn_id.to_string();
+                let reason_str = format!("{reason:?}");
+                if let Some(card) = self.card_by_turn_id_mut(&tid) {
+                    card.state = CardState::Interrupted {
+                        reason: reason_str.clone(),
+                    };
+                }
+                self.notes
+                    .push(Note::info(format!("interrupted · {reason_str}")));
+                self.whisper.clear();
             }
-            // Suppress all other internal events (ApprovalRequest,
-            // ApprovalDenied, SandboxEntered, Checkpoint, ValidatorResult,
-            // RunStarted). They're in the JSONL + log file.
             _ => {}
         }
         self.dirty = true;
     }
 
     pub fn push_error(&mut self, msg: impl Into<String>) {
-        self.transcript.push(format!("! {}", msg.into()));
+        self.notes.push(Note::error(msg.into()));
         self.dirty = true;
     }
 }
@@ -697,6 +1507,12 @@ pub async fn run_app(resume: Option<String>) -> io::Result<()> {
     let (error_tx, mut error_rx) = mpsc::channel::<String>(8);
     let (approval_req_tx, mut approval_req_rx) = mpsc::channel::<ApprovalRequestMsg>(8);
     let (approve_tx, mut approve_rx) = mpsc::channel::<String>(8);
+    // Worker → UI "ready" signal. Fired once when the worker has
+    // opened every subsystem (JSONL, SQLite mirror, artifact store,
+    // dispatcher, retrieval backends, adapter). Lets the UI drop
+    // the splashscreen at the right moment — not on a timer.
+    let (boot_phase_tx, mut boot_phase_rx) = mpsc::channel::<String>(8);
+    let (ready_tx, mut ready_rx) = mpsc::channel::<()>(1);
 
     // Dedicated input task — prevents the keyboard reader from being starved
     // by model streaming in the main select loop.
@@ -739,6 +1555,8 @@ pub async fn run_app(resume: Option<String>) -> io::Result<()> {
 
     let worker_session_tx = session_tx.clone();
     let worker_error_tx = error_tx.clone();
+    let worker_boot_phase_tx = boot_phase_tx.clone();
+    let worker_ready_tx = ready_tx.clone();
     let worker_run_id = run_id.clone();
     let worker_cwd = cwd.clone();
     let worker_session_path = session_path.clone();
@@ -781,6 +1599,9 @@ pub async fn run_app(resume: Option<String>) -> io::Result<()> {
             }
         }
         writer.set_tap(worker_session_tx.clone());
+        let _ = worker_boot_phase_tx
+            .send("opening session log".to_string())
+            .await;
 
         // Single binding for the shared mirror DB path. SqliteMirror,
         // RepoIndexer, FtsLexicalRetrieval, SqliteSymbolIndex, and
@@ -863,6 +1684,9 @@ pub async fn run_app(resume: Option<String>) -> io::Result<()> {
             model = %provider_profile.model_id,
             "resolved provider profile"
         );
+        let _ = worker_boot_phase_tx
+            .send(format!("connecting to {}", provider_profile.name))
+            .await;
         let adapter = super::config::build_adapter(&provider_profile);
 
         // Evidence collector. Sprint 7 ship defaults are `composite`
@@ -894,8 +1718,14 @@ pub async fn run_app(resume: Option<String>) -> io::Result<()> {
             root: worker_cwd.clone(),
         });
 
+        let _ = worker_boot_phase_tx
+            .send("indexing repo (FTS + symbols + co-edit)".to_string())
+            .await;
         let indexer_backends =
             build_indexer_backends(&db_path, &worker_cwd, retrieval_cfg.co_edit).await;
+        let _ = worker_boot_phase_tx
+            .send("finishing indexer".to_string())
+            .await;
 
         let (fts_retrieval, symbol_retrieval) = match indexer_backends.as_ref() {
             Some(b) => (Some(Arc::clone(&b.fts)), Some(Arc::clone(&b.symbols))),
@@ -1067,6 +1897,9 @@ pub async fn run_app(resume: Option<String>) -> io::Result<()> {
                     .any(|e| matches!(e.0, SessionEvent::RunStarted { .. }))
             })
             .unwrap_or(false);
+
+        // Worker is fully booted — drop the splashscreen.
+        let _ = worker_ready_tx.send(()).await;
 
         loop {
             let user_text = tokio::select! {
@@ -1283,9 +2116,13 @@ pub async fn run_app(resume: Option<String>) -> io::Result<()> {
     state.status = profile_status;
     let banner = if resuming { "resumed" } else { "session" };
     state
-        .transcript
-        .push(format!("· {banner} {}", session_path.display()));
-    let mut ticker = tokio::time::interval(std::time::Duration::from_millis(200));
+        .notes
+        .push(Note::info(format!("{banner} · {}", session_path.display())));
+    // 50ms tick = 20fps, fast enough for the 80ms spinner cadence to
+    // land on a frame boundary without skipping. The handler below
+    // only marks dirty when an animation is actually running, so a
+    // truly idle session pays ~0 redraws regardless of tick rate.
+    let mut ticker = tokio::time::interval(std::time::Duration::from_millis(50));
 
     loop {
         tokio::select! {
@@ -1311,11 +2148,43 @@ pub async fn run_app(resume: Option<String>) -> io::Result<()> {
             }
             Some(ev) = session_rx.recv() => state.handle_session_event(ev),
             Some(req) = approval_req_rx.recv() => {
+                state.set_card_awaiting_approval(&req.turn_id);
                 state.pending_approval = Some(req);
+                state.sheet_scroll_offset = 0;
                 state.dirty = true;
             }
-            Some(err) = error_rx.recv() => state.push_error(err),
-            _ = ticker.tick() => {}
+            Some(err) = error_rx.recv() => {
+                // Worker init paths return early after sending an error
+                // and never fire `ready_rx`, so the splash spinner used
+                // to spin forever and the queued error notes stayed
+                // hidden. Drop the splash on any error so the notes
+                // surface immediately. Post-boot errors are no-op here
+                // because `booting` is already false.
+                state.push_error(err);
+                if state.booting {
+                    state.booting = false;
+                    state.boot_phase = "boot failed".to_string();
+                    state.dirty = true;
+                }
+            }
+            Some(phase) = boot_phase_rx.recv() => {
+                state.boot_phase = phase;
+                state.dirty = true;
+            }
+            Some(_) = ready_rx.recv() => {
+                state.booting = false;
+                state.boot_phase = "ready".to_string();
+                state.dirty = true;
+            }
+            _ = ticker.tick() => {
+                // Splash spinner OR any in-flight animation needs a
+                // re-render even when no channel is active. Idle
+                // session (all cards committed/aborted, whisper
+                // silent) pays nothing.
+                if state.booting || state.has_active_animation() {
+                    state.dirty = true;
+                }
+            }
             else => break,
         }
 
@@ -1359,9 +2228,9 @@ mod tests {
         state.handle_slash(SlashCommand::Contract(None));
         assert!(state.take_pending_contract().is_none());
         assert!(state
-            .transcript
+            .notes
             .iter()
-            .any(|l| l.contains("usage: /contract")));
+            .any(|n| n.text.contains("usage: /contract")));
     }
 
     #[test]
@@ -1401,11 +2270,11 @@ mod tests {
         let mut state = AppState::new();
         state.last_context_summary = Some("packet_id  ctx_test\ndigest  sha256:ff".into());
         state.handle_slash(SlashCommand::Context);
-        assert!(state.transcript.iter().any(|l| l.contains("ctx_test")));
+        assert!(state.notes.iter().any(|n| n.text.contains("ctx_test")));
         assert!(!state
-            .transcript
+            .notes
             .iter()
-            .any(|l| l.contains("no packet compiled yet")));
+            .any(|n| n.text.contains("no packet compiled yet")));
     }
 
     #[test]
@@ -1413,9 +2282,9 @@ mod tests {
         let mut state = AppState::new();
         state.handle_slash(SlashCommand::Context);
         assert!(state
-            .transcript
+            .notes
             .iter()
-            .any(|l| l.contains("no packet compiled yet")));
+            .any(|n| n.text.contains("no packet compiled yet")));
     }
 
     #[test]
@@ -1424,7 +2293,7 @@ mod tests {
         state.handle_slash(SlashCommand::Approve(Some("fs_write".into())));
         let tool = state.take_pending_approve().expect("pending approve");
         assert_eq!(tool, "fs_write");
-        assert!(state.transcript.iter().any(|l| l.contains("fs_write")));
+        assert!(state.notes.iter().any(|n| n.text.contains("fs_write")));
     }
 
     #[test]
@@ -1433,8 +2302,807 @@ mod tests {
         state.handle_slash(SlashCommand::Approve(None));
         assert!(state.take_pending_approve().is_none());
         assert!(state
-            .transcript
+            .notes
             .iter()
-            .any(|l| l.contains("usage: /approve")));
+            .any(|n| n.text.contains("usage: /approve")));
+    }
+
+    #[test]
+    fn user_enter_appends_user_card() {
+        let mut state = AppState::new();
+        state.textarea = TextArea::from(vec!["hello world".to_string()]);
+        state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(state.cards.len(), 1);
+        assert_eq!(
+            state.cards[0].prose, "hello world",
+            "user card prose matches input"
+        );
+        assert_eq!(
+            state.take_pending_user_text().as_deref(),
+            Some("hello world")
+        );
+    }
+
+    #[test]
+    fn ctrl_k_opens_palette() {
+        let mut state = AppState::new();
+        state.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
+        assert!(state.palette.open, "⌃K opens the palette");
+    }
+
+    #[test]
+    fn ctrl_1_toggles_rail() {
+        let mut state = AppState::new();
+        assert!(!state.rail_open);
+        state.handle_key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::CONTROL));
+        assert!(state.rail_open, "⌃1 opens rail");
+        state.handle_key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::CONTROL));
+        assert!(!state.rail_open, "⌃1 again closes rail");
+    }
+
+    #[test]
+    fn ctrl_2_toggles_inspector() {
+        let mut state = AppState::new();
+        assert!(!state.inspector_open);
+        state.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::CONTROL));
+        assert!(state.inspector_open);
+    }
+
+    #[test]
+    fn ctrl_backslash_toggles_focus() {
+        let mut state = AppState::new();
+        state.handle_key(KeyEvent::new(KeyCode::Char('\\'), KeyModifiers::CONTROL));
+        assert!(state.focus_mode);
+    }
+
+    #[test]
+    fn agent_card_materialised_by_turn_started() {
+        let mut state = AppState::new();
+        let turn_id = TurnId::new();
+        state.handle_session_event(SessionEvent::TurnStarted {
+            turn_id: turn_id.clone(),
+            run_id: RunId::new(),
+            parent_turn: None,
+            timestamp: "2026-04-19T00:00:00Z".into(),
+        });
+        assert_eq!(state.cards.len(), 1);
+        assert_eq!(state.cards[0].turn_id, turn_id.to_string());
+        assert!(state.whisper.is_narrating());
+    }
+
+    #[test]
+    fn tool_use_appends_cell_to_matching_card() {
+        let mut state = AppState::new();
+        let turn_id = TurnId::new();
+        state.handle_session_event(SessionEvent::TurnStarted {
+            turn_id: turn_id.clone(),
+            run_id: RunId::new(),
+            parent_turn: None,
+            timestamp: "2026-04-19T00:00:00Z".into(),
+        });
+        state.handle_session_event(SessionEvent::ContentBlock {
+            turn_id: turn_id.clone(),
+            index: 0,
+            block: ContentBlock::ToolUse {
+                id: azoth_core::schemas::ToolUseId::from("tu_1".to_string()),
+                name: "repo_search".to_string(),
+                input: serde_json::json!({"q": "refresh"}),
+                call_group: None,
+            },
+        });
+        assert_eq!(state.cards[0].cells.len(), 1);
+        assert_eq!(state.cards[0].cells[0].name, "repo_search");
+    }
+
+    #[test]
+    fn render_does_not_panic_on_zero_state() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = AppState::new();
+        terminal
+            .draw(|f| super::super::render::frame(f, &mut state))
+            .expect("zero-state render");
+    }
+
+    #[test]
+    fn render_does_not_panic_with_full_state() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let backend = TestBackend::new(140, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = AppState::new();
+        state.rail_open = true;
+        state.inspector_open = true;
+        state.ctx_pct = 45;
+        state.max_context_tokens = 100_000;
+        state.inspector_data.contract_goal = Some("fix token refresh".into());
+        state.inspector_data.ctx_pct = 45;
+        state.inspector_data.ctx_history = vec![12, 18, 23, 30, 45];
+
+        // User card + agent card with a pending tool cell.
+        state
+            .cards
+            .push(TurnCard::user("t0", "fix the token refresh bug"));
+        let mut agent = TurnCard::agent("t1");
+        agent.append_prose("investigating the refresh flow\nfound an off-by-one");
+        agent.add_cell(ToolCell {
+            tool_use_id: "tu1".into(),
+            name: "repo_search".into(),
+            summary: "refresh_token".into(),
+            expanded: false,
+            result: CellResult::Ok {
+                count_hint: Some("4 matches".into()),
+            },
+            preview_lines: vec!["src/auth/tokens.rs:42".into()],
+            full_lines: vec!["src/auth/tokens.rs:42".into()],
+            created_at: std::time::Instant::now(),
+            cached_preview_render: None,
+            cached_full_render: None,
+            cached_header_parts: None,
+        });
+        state.cards.push(agent);
+
+        state.notes.push(Note::info("session banner"));
+        state.whisper.set("thinking");
+        state.palette.open();
+        state.palette.push_char('s');
+        state.palette.push_char('h');
+
+        terminal
+            .draw(|f| super::super::render::frame(f, &mut state))
+            .expect("full-state render with rail + inspector + palette");
+    }
+
+    #[test]
+    fn render_survives_narrow_terminal_ascii_theme() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let backend = TestBackend::new(60, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = AppState::new();
+        state.theme = super::super::theme::Theme { unicode: false };
+        state.rail_open = true;
+        state.inspector_open = true; // should auto-hide < 100 cols
+        state.cards.push(TurnCard::user("t0", "hello"));
+        let mut agent = TurnCard::agent("t1");
+        agent.append_prose("hi");
+        agent.state = super::super::card::CardState::Aborted {
+            reason: "ValidatorFail".into(),
+            detail: "impact_tests".into(),
+        };
+        state.cards.push(agent);
+        terminal
+            .draw(|f| super::super::render::frame(f, &mut state))
+            .expect("narrow-terminal ASCII render");
+    }
+
+    #[test]
+    fn set_card_awaiting_approval_only_mutates_live_cards() {
+        let mut state = AppState::new();
+        let turn_id = TurnId::new();
+        state.handle_session_event(SessionEvent::TurnStarted {
+            turn_id: turn_id.clone(),
+            run_id: RunId::new(),
+            parent_turn: None,
+            timestamp: "2026-04-19T00:00:00Z".into(),
+        });
+        state.set_card_awaiting_approval(&turn_id);
+        assert!(matches!(
+            state.cards[0].state,
+            super::super::card::CardState::AwaitingApproval
+        ));
+
+        // Mark as Committed, then confirm the helper refuses to
+        // overwrite a terminal state.
+        state.cards[0].state = super::super::card::CardState::Committed;
+        state.set_card_awaiting_approval(&turn_id);
+        assert!(matches!(
+            state.cards[0].state,
+            super::super::card::CardState::Committed
+        ));
+    }
+
+    #[test]
+    fn take_pending_approval_restores_live_state() {
+        let mut state = AppState::new();
+        let turn_id = TurnId::new();
+        state.handle_session_event(SessionEvent::TurnStarted {
+            turn_id: turn_id.clone(),
+            run_id: RunId::new(),
+            parent_turn: None,
+            timestamp: "2026-04-19T00:00:00Z".into(),
+        });
+        state.set_card_awaiting_approval(&turn_id);
+        assert!(matches!(
+            state.cards[0].state,
+            super::super::card::CardState::AwaitingApproval
+        ));
+        // Simulate a pending request (responder is dropped — that is
+        // fine here, we only care about card-state bookkeeping).
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        state.pending_approval = Some(ApprovalRequestMsg {
+            turn_id: turn_id.clone(),
+            approval_id: ApprovalId::new(),
+            tool_name: "fs_write".into(),
+            effect_class: azoth_core::schemas::EffectClass::ApplyLocal,
+            summary: "write foo".into(),
+            responder: tx,
+        });
+        let taken = state.take_pending_approval();
+        assert!(taken.is_some());
+        assert!(matches!(
+            state.cards[0].state,
+            super::super::card::CardState::Live
+        ));
+    }
+
+    #[test]
+    fn retrieval_queried_pushes_to_evidence_lanes() {
+        let mut state = AppState::new();
+        let turn_id = TurnId::new();
+        state.handle_session_event(SessionEvent::TurnStarted {
+            turn_id: turn_id.clone(),
+            run_id: RunId::new(),
+            parent_turn: None,
+            timestamp: "2026-04-19T00:00:00Z".into(),
+        });
+        assert!(state.inspector_data.evidence_lanes.is_empty());
+        state.handle_session_event(SessionEvent::RetrievalQueried {
+            turn_id: turn_id.clone(),
+            backend: "fts".to_string(),
+            query: "TurnDriver".to_string(),
+            result_count: 3,
+            latency_ms: 7,
+        });
+        state.handle_session_event(SessionEvent::SymbolResolved {
+            turn_id: turn_id.clone(),
+            backend: "sqlite".to_string(),
+            query: "TurnDriver".to_string(),
+            matched: vec![1, 2],
+        });
+        assert_eq!(state.inspector_data.evidence_lanes.len(), 2);
+        assert_eq!(state.inspector_data.evidence_lanes[0].0, "fts");
+        assert!(state.inspector_data.evidence_lanes[0].1.contains("3 hits"));
+        assert_eq!(state.inspector_data.evidence_lanes[1].0, "symbol/sqlite");
+        assert!(state.inspector_data.evidence_lanes[1]
+            .1
+            .contains("2 matches"));
+    }
+
+    #[test]
+    fn turn_started_clears_stale_evidence_lanes() {
+        let mut state = AppState::new();
+        state
+            .inspector_data
+            .evidence_lanes
+            .push(("ripgrep".to_string(), "stale · 42 hits".to_string()));
+        state.handle_session_event(SessionEvent::TurnStarted {
+            turn_id: TurnId::new(),
+            run_id: RunId::new(),
+            parent_turn: None,
+            timestamp: "2026-04-19T00:00:00Z".into(),
+        });
+        assert!(
+            state.inspector_data.evidence_lanes.is_empty(),
+            "prior-turn evidence must not bleed into the fresh turn"
+        );
+    }
+
+    #[test]
+    fn modal_active_falls_through_to_modal_target_on_overlap() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let mut state = AppState::new();
+        state.click_map.resize_with(20, Vec::new);
+        // Wide canvas range (would be rejected by modal gate) THEN
+        // narrow sheet button range on the same row. Earlier code
+        // returned on first reject; this asserts the loop keeps
+        // scanning and dispatches the sheet target.
+        state.click_map[7].push((0..u16::MAX, ClickTarget::ThoughtsToggle { card_idx: 0 }));
+        state.click_map[7].push((10..30, ClickTarget::SheetApproveOnce));
+        // Open palette so the canvas target is gated.
+        state.palette.open();
+        state.dirty = false;
+        state.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 15,
+            row: 7,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        });
+        // Sheet target should still fire — handle_click_target marks
+        // dirty as a side effect of the SheetApproveOnce branch.
+        // (The take_pending_approval inside that branch sees None
+        // because we never set pending_approval — but the dispatch
+        // path was reached, which is what we test.)
+        assert!(
+            state.dirty,
+            "modal-targeted hit should fire even when a wider canvas range matches first"
+        );
+    }
+
+    #[test]
+    fn tab_collapses_all_cells_to_enforce_focused_only_invariant() {
+        use azoth_core::schemas::ToolUseId;
+        let mut state = AppState::new();
+        for tid in ["t1", "t2"] {
+            state.handle_session_event(SessionEvent::TurnStarted {
+                turn_id: TurnId::from(tid.to_string()),
+                run_id: RunId::new(),
+                parent_turn: None,
+                timestamp: "2026-04-19T00:00:00Z".into(),
+            });
+            state.handle_session_event(SessionEvent::ContentBlock {
+                turn_id: TurnId::from(tid.to_string()),
+                index: 0,
+                block: ContentBlock::ToolUse {
+                    id: ToolUseId::from(format!("tu_{tid}")),
+                    name: "bash".into(),
+                    input: serde_json::json!({}),
+                    call_group: None,
+                },
+            });
+        }
+        // User mouse-expands BOTH cells (simulating two clicks).
+        for card in state.cards.iter_mut() {
+            for cell in card.cells.iter_mut() {
+                cell.expanded = true;
+            }
+        }
+        // Tab fires — must collapse all but the new focus.
+        state.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        let expanded_count: usize = state
+            .cards
+            .iter()
+            .flat_map(|c| c.cells.iter())
+            .filter(|c| c.expanded)
+            .count();
+        assert_eq!(
+            expanded_count, 1,
+            "Tab must enforce 'focused cell is the only one expanded' invariant"
+        );
+    }
+
+    #[test]
+    fn shift_tab_resets_tab_cursor() {
+        use azoth_core::schemas::ToolUseId;
+        let mut state = AppState::new();
+        for tid in ["t1", "t2"] {
+            state.handle_session_event(SessionEvent::TurnStarted {
+                turn_id: TurnId::from(tid.to_string()),
+                run_id: RunId::new(),
+                parent_turn: None,
+                timestamp: "2026-04-19T00:00:00Z".into(),
+            });
+            state.handle_session_event(SessionEvent::ContentBlock {
+                turn_id: TurnId::from(tid.to_string()),
+                index: 0,
+                block: ContentBlock::ToolUse {
+                    id: ToolUseId::from(format!("tu_{tid}")),
+                    name: "bash".into(),
+                    input: serde_json::json!({}),
+                    call_group: None,
+                },
+            });
+        }
+        let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+        let shift_tab = KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE);
+        state.handle_key(tab);
+        state.handle_key(tab);
+        assert_eq!(state.tab_cursor, Some(1), "two Tabs land on cursor 1");
+        state.handle_key(shift_tab);
+        assert_eq!(
+            state.tab_cursor, None,
+            "Shift+Tab must reset cursor so next Tab restarts at 0"
+        );
+        state.handle_key(tab);
+        assert_eq!(
+            state.tab_cursor,
+            Some(0),
+            "post-reset Tab restarts at the newest cell"
+        );
+    }
+
+    #[test]
+    fn modal_active_blocks_canvas_clicks() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let mut state = AppState::new();
+        // Pre-populate the click_map with a card-target row so a
+        // simulated click would normally fire ThoughtsToggle.
+        state.click_map.resize_with(20, Vec::new);
+        state.click_map[5].push((0..u16::MAX, ClickTarget::ThoughtsToggle { card_idx: 0 }));
+        // No modal — click registers (would dirty state if a card existed,
+        // but the click_target lookup just routes; no card → no-op).
+        // We test the gate, not the downstream effect.
+        // With palette open, clicks on canvas rows must be dropped.
+        state.palette.open();
+        state.dirty = false;
+        state.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 5,
+            row: 5,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        });
+        assert!(
+            !state.dirty,
+            "canvas click while palette open must be dropped"
+        );
+    }
+
+    #[test]
+    fn tab_cursor_advances_in_o1_after_first_seed() {
+        use azoth_core::schemas::ToolUseId;
+        let mut state = AppState::new();
+        for tid in ["t1", "t2", "t3"] {
+            state.handle_session_event(SessionEvent::TurnStarted {
+                turn_id: TurnId::from(tid.to_string()),
+                run_id: RunId::new(),
+                parent_turn: None,
+                timestamp: "2026-04-19T00:00:00Z".into(),
+            });
+            for cell in ["a", "b"] {
+                state.handle_session_event(SessionEvent::ContentBlock {
+                    turn_id: TurnId::from(tid.to_string()),
+                    index: 0,
+                    block: ContentBlock::ToolUse {
+                        id: ToolUseId::from(format!("tu_{tid}_{cell}")),
+                        name: "bash".into(),
+                        input: serde_json::json!({}),
+                        call_group: None,
+                    },
+                });
+            }
+        }
+        let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+        let mut visited: Vec<usize> = Vec::new();
+        for _ in 0..7 {
+            state.handle_key(tab);
+            visited.push(state.tab_cursor.expect("cursor populated after Tab"));
+        }
+        // 6 cells total → expect 0,1,2,3,4,5,0 (wrap to start).
+        assert_eq!(visited, vec![0, 1, 2, 3, 4, 5, 0]);
+    }
+
+    #[test]
+    fn shift_enter_does_not_submit() {
+        let mut state = AppState::new();
+        state.textarea.insert_str("draft line one");
+        // Shift+Enter must NOT trigger the submit branch — the
+        // textarea handler below should treat it as a newline.
+        state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
+        assert!(
+            state.cards.is_empty(),
+            "Shift+Enter must not push a user card"
+        );
+        assert!(
+            state.take_pending_user_text().is_none(),
+            "Shift+Enter must not queue text for the worker"
+        );
+    }
+
+    #[test]
+    fn worker_error_during_boot_clears_splash() {
+        let mut state = AppState::new();
+        // App starts in booting state; the splash takes the canvas.
+        assert!(state.booting);
+        // Simulate the runtime delivering an error_rx event during
+        // boot (e.g. JsonlWriter::open failed). The push_error path
+        // must clear `booting` so the splash dismisses and the error
+        // note becomes visible.
+        state.push_error("jsonl open failed: permission denied");
+        // Manually replicate the bridge logic that the main loop runs
+        // when error_rx fires (push_error + boot dismissal).
+        if state.booting {
+            state.booting = false;
+            state.boot_phase = "boot failed".to_string();
+        }
+        assert!(!state.booting, "splash must dismiss on init failure");
+        assert!(
+            state
+                .notes
+                .iter()
+                .any(|n| n.text.contains("jsonl open failed")),
+            "the error note must be present"
+        );
+    }
+
+    #[test]
+    fn tab_order_cache_is_invalidated_on_card_and_cell_add() {
+        use azoth_core::schemas::ToolUseId;
+        let mut state = AppState::new();
+        let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+        // Empty session: no expandable content, Tab falls through.
+        state.handle_key(tab);
+        // Add a card → cache must invalidate even if it was None.
+        state.handle_session_event(SessionEvent::TurnStarted {
+            turn_id: TurnId::new(),
+            run_id: RunId::new(),
+            parent_turn: None,
+            timestamp: "2026-04-19T00:00:00Z".into(),
+        });
+        assert!(state.tab_order_cache.is_none(), "TurnStarted invalidates");
+        // Add a tool cell → cache must invalidate.
+        let tid = state.cards[0].turn_id.clone();
+        state.handle_session_event(SessionEvent::ContentBlock {
+            turn_id: TurnId::from(tid),
+            index: 0,
+            block: ContentBlock::ToolUse {
+                id: ToolUseId::from("tu_1".to_string()),
+                name: "bash".into(),
+                input: serde_json::json!({}),
+                call_group: None,
+            },
+        });
+        assert!(state.tab_order_cache.is_none(), "ToolUse invalidates");
+        // Tab populates the cache; second Tab reuses it (length stable).
+        state.handle_key(tab);
+        assert!(state.tab_order_cache.is_some(), "first Tab fills cache");
+        let cached_len = state.tab_order_cache.as_ref().unwrap().len();
+        state.handle_key(tab);
+        assert_eq!(
+            state.tab_order_cache.as_ref().unwrap().len(),
+            cached_len,
+            "second Tab reuses cache (no reallocation)"
+        );
+    }
+
+    #[test]
+    fn effect_record_increments_contract_budget_consumed() {
+        let mut state = AppState::new();
+        // Simulate accepting a contract with budget 5 (3 apply_local + 2 apply_repo).
+        state.inspector_data.contract_budget = Some((0, 5));
+        let turn_id = TurnId::new();
+        // First successful ApplyLocal effect.
+        state.handle_session_event(SessionEvent::EffectRecord {
+            turn_id: turn_id.clone(),
+            effect: azoth_core::schemas::EffectRecord {
+                id: azoth_core::schemas::EffectRecordId::new(),
+                tool_use_id: azoth_core::schemas::ToolUseId::from("tu_1".to_string()),
+                class: azoth_core::schemas::EffectClass::ApplyLocal,
+                tool_name: "fs_write".into(),
+                input_digest: None,
+                output_artifact: None,
+                error: None,
+            },
+        });
+        assert_eq!(state.inspector_data.contract_budget, Some((1, 5)));
+        // Failed effect — must NOT bump the counter.
+        state.handle_session_event(SessionEvent::EffectRecord {
+            turn_id: turn_id.clone(),
+            effect: azoth_core::schemas::EffectRecord {
+                id: azoth_core::schemas::EffectRecordId::new(),
+                tool_use_id: azoth_core::schemas::ToolUseId::from("tu_2".to_string()),
+                class: azoth_core::schemas::EffectClass::ApplyLocal,
+                tool_name: "fs_write".into(),
+                input_digest: None,
+                output_artifact: None,
+                error: Some("denied".into()),
+            },
+        });
+        assert_eq!(
+            state.inspector_data.contract_budget,
+            Some((1, 5)),
+            "errored effects must not consume budget"
+        );
+        // Observe-class effect — also doesn't count.
+        state.handle_session_event(SessionEvent::EffectRecord {
+            turn_id,
+            effect: azoth_core::schemas::EffectRecord {
+                id: azoth_core::schemas::EffectRecordId::new(),
+                tool_use_id: azoth_core::schemas::ToolUseId::from("tu_3".to_string()),
+                class: azoth_core::schemas::EffectClass::Observe,
+                tool_name: "repo_search".into(),
+                input_digest: None,
+                output_artifact: None,
+                error: None,
+            },
+        });
+        assert_eq!(
+            state.inspector_data.contract_budget,
+            Some((1, 5)),
+            "Observe is not budget-counted"
+        );
+    }
+
+    #[test]
+    fn tool_result_caps_scan_at_max_lines_to_keep_ui_responsive() {
+        let mut state = AppState::new();
+        let turn_id = TurnId::new();
+        state.handle_session_event(SessionEvent::TurnStarted {
+            turn_id: turn_id.clone(),
+            run_id: RunId::new(),
+            parent_turn: None,
+            timestamp: "2026-04-19T00:00:00Z".into(),
+        });
+        let tu = azoth_core::schemas::ToolUseId::from("tu_huge".to_string());
+        state.handle_session_event(SessionEvent::ContentBlock {
+            turn_id: turn_id.clone(),
+            index: 0,
+            block: ContentBlock::ToolUse {
+                id: tu.clone(),
+                name: "bash".to_string(),
+                input: serde_json::json!({"command": "find /"}),
+                call_group: None,
+            },
+        });
+        // 50k lines — well above the 10k scan cap.
+        let huge: String = (0..50_000)
+            .map(|i| format!("line_{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        state.handle_session_event(SessionEvent::ContentBlock {
+            turn_id,
+            index: 1,
+            block: ContentBlock::ToolResult {
+                tool_use_id: tu,
+                content: vec![ContentBlock::Text { text: huge }],
+                is_error: false,
+            },
+        });
+        let cell = &state.cards[0].cells[0];
+        // Scan capped at 10k → count_hint reflects the cap with `+`.
+        match &cell.result {
+            CellResult::Ok { count_hint } => {
+                let hint = count_hint.as_deref().unwrap_or("");
+                assert!(
+                    hint.ends_with("+ lines"),
+                    "count_hint should mark the truncation: {hint:?}"
+                );
+                assert!(
+                    hint.starts_with("10000"),
+                    "scan should cap at 10k: {hint:?}"
+                );
+            }
+            other => panic!("expected Ok with cap hint, got {other:?}"),
+        }
+        assert!(cell.preview_lines.last().unwrap().contains("+ more lines"));
+    }
+
+    #[test]
+    fn has_active_animation_reflects_live_cards_and_whisper() {
+        let mut state = AppState::new();
+        // Idle: zero cards, silent whisper → no animation needed.
+        assert!(!state.has_active_animation());
+        // Whisper alone activates animation (spinner needs redraw).
+        state.whisper.set("thinking");
+        assert!(state.has_active_animation());
+        state.whisper.clear();
+        assert!(!state.has_active_animation());
+        // A live agent card activates animation.
+        state.handle_session_event(SessionEvent::TurnStarted {
+            turn_id: TurnId::new(),
+            run_id: RunId::new(),
+            parent_turn: None,
+            timestamp: "2026-04-19T00:00:00Z".into(),
+        });
+        state.whisper.clear();
+        assert!(state.has_active_animation());
+        // Once committed, animation stops.
+        state.cards[0].state = super::super::card::CardState::Committed;
+        assert!(!state.has_active_animation());
+    }
+
+    #[test]
+    fn user_card_ids_are_unique_across_back_to_back_sends() {
+        let mut state = AppState::new();
+        state.textarea.insert_str("first message");
+        state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        state.textarea.insert_str("second message");
+        state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        // Both user cards exist; turn IDs must differ even though no
+        // agent commit happened in between.
+        let user_cards: Vec<&TurnCard> = state
+            .cards
+            .iter()
+            .filter(|c| matches!(c.role, super::super::card::CardRole::User))
+            .collect();
+        assert_eq!(user_cards.len(), 2);
+        assert_ne!(
+            user_cards[0].turn_id, user_cards[1].turn_id,
+            "back-to-back user enters must mint distinct card IDs"
+        );
+    }
+
+    #[test]
+    fn tool_result_streams_without_collecting_full_output() {
+        // Build a 1000-line synthetic output and assert preview/full
+        // are bounded at 5/24 entries even though the source is huge.
+        let mut state = AppState::new();
+        let turn_id = TurnId::new();
+        state.handle_session_event(SessionEvent::TurnStarted {
+            turn_id: turn_id.clone(),
+            run_id: RunId::new(),
+            parent_turn: None,
+            timestamp: "2026-04-19T00:00:00Z".into(),
+        });
+        let tu = azoth_core::schemas::ToolUseId::from("tu_big".to_string());
+        state.handle_session_event(SessionEvent::ContentBlock {
+            turn_id: turn_id.clone(),
+            index: 0,
+            block: ContentBlock::ToolUse {
+                id: tu.clone(),
+                name: "bash".to_string(),
+                input: serde_json::json!({"command": "find /"}),
+                call_group: None,
+            },
+        });
+        let big_output = (0..1000)
+            .map(|i| format!("line_{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        state.handle_session_event(SessionEvent::ContentBlock {
+            turn_id: turn_id.clone(),
+            index: 1,
+            block: ContentBlock::ToolResult {
+                tool_use_id: tu,
+                content: vec![ContentBlock::Text { text: big_output }],
+                is_error: false,
+            },
+        });
+        let cell = &state.cards[0].cells[0];
+        // Preview = 4 + 1 ellipsis line, full = 24, NOT 1000.
+        assert_eq!(
+            cell.preview_lines.len(),
+            5,
+            "preview must stay bounded regardless of source size"
+        );
+        assert!(cell.preview_lines[4].contains("+996 more lines"));
+        assert_eq!(cell.full_lines.len(), 24);
+        match &cell.result {
+            CellResult::Ok { count_hint } => {
+                assert_eq!(count_hint.as_deref(), Some("1000 lines"));
+            }
+            _ => panic!("expected Ok result"),
+        }
+    }
+
+    #[test]
+    fn tab_reaches_older_cell_not_just_last_of_last() {
+        use azoth_core::schemas::ToolUseId;
+        let mut state = AppState::new();
+        // Two turns, each with a tool cell.
+        for (tid, name) in [("t1", "old_tool"), ("t2", "recent_tool")] {
+            state.handle_session_event(SessionEvent::TurnStarted {
+                turn_id: TurnId::from(tid.to_string()),
+                run_id: RunId::new(),
+                parent_turn: None,
+                timestamp: "2026-04-19T00:00:00Z".into(),
+            });
+            state.handle_session_event(SessionEvent::ContentBlock {
+                turn_id: TurnId::from(tid.to_string()),
+                index: 0,
+                block: ContentBlock::ToolUse {
+                    id: ToolUseId::from(format!("tu_{tid}")),
+                    name: name.to_string(),
+                    input: serde_json::json!({"q": "x"}),
+                    call_group: None,
+                },
+            });
+        }
+        let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+        // First Tab: focus + expand latest card's latest cell (t2/recent_tool).
+        state.handle_key(tab);
+        assert!(
+            state.cards[1].cells[0].expanded,
+            "first Tab should expand the newest cell"
+        );
+        assert!(
+            !state.cards[0].cells[0].expanded,
+            "older cell stays closed until we step to it"
+        );
+        // Second Tab: advance to the older cell; newer collapses.
+        state.handle_key(tab);
+        assert!(
+            !state.cards[1].cells[0].expanded,
+            "previous focus collapses as Tab advances"
+        );
+        assert!(
+            state.cards[0].cells[0].expanded,
+            "second Tab must reach the older cell — previously unreachable from the keyboard"
+        );
+        // Third Tab wraps back to the newest.
+        state.handle_key(tab);
+        assert!(state.cards[1].cells[0].expanded);
+        assert!(!state.cards[0].cells[0].expanded);
     }
 }

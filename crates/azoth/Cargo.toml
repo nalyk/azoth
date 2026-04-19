@@ -35,6 +35,14 @@ sha2 = { workspace = true }
 ratatui = { workspace = true, optional = true }
 crossterm = { workspace = true, optional = true }
 tui-textarea = { workspace = true, optional = true }
+# PAPER: render model prose as real typography (fenced code islands,
+# inline bold/italic/code, headings, bullets). Pure parser — no
+# network, no filesystem, stable API, ~15k LOC compiled.
+pulldown-cmark = { version = "0.12", default-features = false }
+# PAPER: correct column width for GFM tables under CJK / emoji /
+# combining characters. Without this, `chars().count()` misaligns
+# table columns by one or more cells on any non-Latin content.
+unicode-width = "0.2"
 
 [dev-dependencies]
 tempfile = { workspace = true }
