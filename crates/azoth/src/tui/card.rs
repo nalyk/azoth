@@ -310,7 +310,26 @@ impl TurnCard {
     }
 
     pub fn append_thought(&mut self, text: &str) {
-        for line in text.split('\n') {
+        // Streaming reasoning chunks arrive without trailing newlines,
+        // so the first chunk of each new logical line gets joined
+        // onto the last existing entry. Earlier code split + push
+        // unconditionally, which fragmented "Hello," + " world!" into
+        // two separate Vec entries (visible as two lines) instead of
+        // one. Mirrors the round-5 prose `push_str` semantics — the
+        // render path depends on `self.thoughts.len()` so we keep
+        // the Vec<String> shape, just join the chunks correctly.
+        if self.thoughts.is_empty() {
+            self.thoughts.push(String::new());
+        }
+        let mut parts = text.split('\n');
+        if let Some(first) = parts.next() {
+            if let Some(last) = self.thoughts.last_mut() {
+                last.push_str(first);
+            } else {
+                self.thoughts.push(first.to_string());
+            }
+        }
+        for line in parts {
             self.thoughts.push(line.to_string());
         }
     }
@@ -830,6 +849,33 @@ mod tests {
         c.append_prose("hello ");
         c.append_prose("world\nsecond");
         assert_eq!(c.prose, "hello world\nsecond");
+    }
+
+    #[test]
+    fn append_thought_joins_streaming_chunks_into_one_line() {
+        let mut c = TurnCard::agent("t-thought");
+        // Three streaming chunks of one logical line. Earlier
+        // implementation would push them as 3 separate Vec entries,
+        // visible to the user as 3 fragmented "lines".
+        c.append_thought("Let me think about ");
+        c.append_thought("the auth flow ");
+        c.append_thought("specifically.");
+        assert_eq!(
+            c.thoughts,
+            vec!["Let me think about the auth flow specifically.".to_string()],
+            "streaming chunks must coalesce into a single line"
+        );
+        // Newline in a chunk creates a new line and continues
+        // accumulating into it.
+        c.append_thought("\nNext: token refresh ");
+        c.append_thought("logic.");
+        assert_eq!(
+            c.thoughts,
+            vec![
+                "Let me think about the auth flow specifically.".to_string(),
+                "Next: token refresh logic.".to_string(),
+            ]
+        );
     }
 
     #[test]

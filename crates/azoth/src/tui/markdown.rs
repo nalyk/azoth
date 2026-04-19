@@ -581,7 +581,7 @@ fn tint_code(line: &str, lang: &str, theme: &Theme) -> Vec<Span<'static>> {
             && !(bytes[i] == b'#'
                 && matches!(
                     lang_l.as_str(),
-                    "python" | "bash" | "sh" | "shell" | "zsh" | "toml"
+                    "python" | "py" | "bash" | "sh" | "shell" | "zsh" | "toml"
                 ))
             && !(bytes[i] == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/')
         {
@@ -672,6 +672,19 @@ mod tests {
             .flat_map(|l| l.spans.iter())
             .any(|s| s.content.contains("•"));
         assert!(has_bullet);
+    }
+
+    #[test]
+    fn tint_code_recognises_python_comment_via_py_alias() {
+        let theme = Theme { unicode: true };
+        // `.py` extension is the common one in fenced code blocks
+        // (```py); the comment-detection path knew about `py` but
+        // the everything-else loop's `#` guard didn't, so `#` got
+        // consumed as plain text and the rest of the line escaped
+        // comment styling.
+        let spans = tint_code("# inline comment", "py", &theme);
+        assert_eq!(spans.len(), 1, "comment should be one styled span");
+        assert!(spans[0].content.as_ref().contains("# inline comment"));
     }
 
     #[test]
