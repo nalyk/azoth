@@ -415,6 +415,31 @@ fn stage_overlay_back(
             // on first CI run with fuse-overlayfs on PATH (GHA
             // ubuntu-22.04); dev (WSL2) probe-skipped it until
             // `sudo apt install fuse-overlayfs`.
+            //
+            // Round 3 (codex P2 on 19a6eb4): absolute link
+            // targets are refused outright. bash's `cwd` under
+            // Tier B is the ephemeral `ws.merged` mount, so
+            // `ln -s "$PWD/foo.txt" link` produces an absolute
+            // target under `/tmp/.tmpXXX/merged/...` — valid
+            // while the overlay is mounted (inside merged_canon)
+            // but a forever-dangling symlink once stage-back
+            // unmounts. Other absolute shapes (`/etc/passwd`)
+            // are already host escapes refused by the merged
+            // boundary. A sandboxed model has no coherent reason
+            // to emit absolute symlinks; forcing relative-only
+            // avoids both the ephemeral-merged dangling class
+            // AND preserves repo-local intent.
+            if link_target.is_absolute() {
+                tracing::warn!(
+                    rel = %rel.display(),
+                    target = %link_target.display(),
+                    "stage-back refused: absolute symlink target (sandbox mount is \
+                     ephemeral and host paths are out of scope; use a path relative \
+                     to the symlink's directory)"
+                );
+                continue;
+            }
+
             let merged_path = ws.merged.join(rel);
             let merged_parent = merged_path.parent().ok_or_else(|| {
                 ToolError::Failed(format!(
@@ -422,11 +447,7 @@ fn stage_overlay_back(
                     rel.display()
                 ))
             })?;
-            let target_abs = if link_target.is_absolute() {
-                link_target.clone()
-            } else {
-                merged_parent.join(&link_target)
-            };
+            let target_abs = merged_parent.join(&link_target);
             match std::fs::canonicalize(&target_abs) {
                 Ok(resolved) if resolved.starts_with(&merged_canon) => {}
                 Ok(resolved) => {
@@ -1442,6 +1463,84 @@ mod tests {
             staged_names.contains(&"link"),
             "link must appear in staged_files; got {staged_names:?}"
         );
+    }
+
+    /// 2026-04-20 PR #17 round 3 (codex P2 on 19a6eb4): bash
+    /// under Tier B has `cwd = ws.merged` (an ephemeral
+    /// fuse-overlayfs mount under a tempdir), so `$PWD`
+    /// expansion produces an absolute target inside merged.
+    /// The round-2 fix would have accepted such a symlink
+    /// (canonical target starts_with merged_canon → true),
+    /// leaving a symlink in the real repo whose target
+    /// vaporises the moment stage-back unmounts the overlay.
+    /// Round-3 refuses all absolute symlink targets outright —
+    /// absolute-into-merged dangles, absolute-to-host is a
+    /// boundary escape, absolute-to-repo_root is brittle and
+    /// requires the model to know the host path. Relative is
+    /// the only coherent semantic for a sandboxed model.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn bash_tier_b_refuses_absolute_symlink_target_to_merged_mount() {
+        use crate::sandbox::tier_b::probe_fuse_overlayfs;
+        if sandbox_skip() {
+            return;
+        }
+        if !probe_fuse_overlayfs() {
+            eprintln!("skip: fuse-overlayfs not on PATH");
+            return;
+        }
+        std::env::set_var("AZOTH_SANDBOX", "tier_b");
+
+        let dir = tempdir().unwrap();
+        let root = tokio::fs::canonicalize(dir.path()).await.unwrap();
+        let ctx = ctx_for(root.clone());
+
+        let mut disp = ToolDispatcher::new();
+        disp.register(BashTool);
+        // `$PWD` under Tier B expands to `ws.merged`, so
+        // `ln -s "$PWD/foo.txt" link` writes an absolute
+        // target like `/tmp/.tmpXXX/merged/foo.txt` into the
+        // upper layer.
+        let raw = Tainted::new(
+            Origin::ModelOutput,
+            json!({ "command": "echo payload > foo.txt && ln -s \"$PWD/foo.txt\" link" }),
+        );
+        let out = dispatch_tool(&disp, "bash", raw, &ctx).await.unwrap();
+        std::env::remove_var("AZOTH_SANDBOX");
+
+        assert_eq!(out["exit_code"], 0, "bash echo+ln succeeded");
+
+        // foo.txt is a legitimate regular file — staged.
+        let foo_meta =
+            std::fs::symlink_metadata(root.join("foo.txt")).expect("foo.txt must be staged back");
+        assert!(
+            foo_meta.file_type().is_file(),
+            "foo.txt must be a regular file; got {:?}",
+            foo_meta.file_type()
+        );
+
+        // link had an absolute target under the ephemeral
+        // merged mount — refused. Must not appear in the real
+        // repo at all (not as a dangling symlink pointing at a
+        // now-unmounted tempdir, not as a regular file, not at
+        // all).
+        let link_path = root.join("link");
+        let link_meta = std::fs::symlink_metadata(&link_path);
+        assert!(
+            link_meta.is_err(),
+            "absolute-target symlink was staged back: {} metadata={:?}",
+            link_path.display(),
+            link_meta
+        );
+
+        // And the stage-back result must not claim to have
+        // staged link.
+        if let Some(staged) = out.get("staged_files").and_then(|v| v.as_array()) {
+            assert!(
+                !staged.iter().any(|v| v == "link"),
+                "refused absolute-target symlink must not appear in staged_files; got {staged:?}"
+            );
+        }
     }
 
     /// Codex round-7 P1 regression guard: `mkfifo pipe` under
