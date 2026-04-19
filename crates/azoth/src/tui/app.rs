@@ -392,6 +392,13 @@ impl AppState {
                 // the top of the visible window. Closes codex R21 P2
                 // (jump N was previously a note-only no-op).
                 if idx < self.cards.len() {
+                    // Codex R23 P2: focus_mode collapses the canvas to
+                    // a single card and ignores scroll_offset. A jump
+                    // in focus mode would silently no-op. Exit focus
+                    // mode so the scroll actually shows the target.
+                    if self.focus_mode {
+                        self.focus_mode = false;
+                    }
                     let prefix_y: usize = self.cards[..idx]
                         .iter()
                         .map(|c| c.last_rendered_rows.max(4))
