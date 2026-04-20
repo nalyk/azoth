@@ -598,8 +598,22 @@ impl JsonlReader {
                     // of what the model actually emitted before
                     // stalling. Saturating cast to u32: a single turn
                     // emitting >4.2B tokens is outside any realistic
-                    // budget, clamping is safer than panicking.
-                    let output_tokens = u32::try_from(*hb_tokens).unwrap_or(u32::MAX);
+                    // budget, clamping is safer than panicking. When
+                    // the clamp actually triggers we log it so operators
+                    // know the recovered session's token accounting is
+                    // no longer precise — silent clamping is a known
+                    // silent-failure antipattern and explicitly out of
+                    // step with the durable-evidence invariant (#5).
+                    let output_tokens = u32::try_from(*hb_tokens).unwrap_or_else(|_| {
+                        tracing::warn!(
+                            turn_id = %turn_id.0,
+                            original_tokens_out = *hb_tokens,
+                            clamped_to = u32::MAX,
+                            "heartbeat tokens_out exceeded u32::MAX during crash \
+                             recovery; clamping — recovered Stalled record is imprecise"
+                        );
+                        u32::MAX
+                    });
                     SessionEvent::TurnAborted {
                         turn_id: turn_id.clone(),
                         reason: AbortReason::Stalled,

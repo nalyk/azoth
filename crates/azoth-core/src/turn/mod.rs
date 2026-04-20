@@ -140,6 +140,19 @@ pub struct TurnDriver<'a> {
     pub diff_source: Option<&'a dyn DiffSource>,
 }
 
+/// Fold per-invoke streamed usage deltas into a base `Usage` snapshot,
+/// returning a new `Usage`. Every mid-invoke abort branch — UserCancel,
+/// TimeExceeded, AdapterError — persists its usage *before* `invoke_fut`
+/// completes, so `response.usage` never lands; these streaming counters
+/// are the only token record for the in-flight call. Saturating-add keeps
+/// accounting bounded under pathological adapter output without panicking.
+fn usage_with_stream(base: &Usage, streamed_in: u32, streamed_out: u32) -> Usage {
+    let mut u = base.clone();
+    u.input_tokens = u.input_tokens.saturating_add(streamed_in);
+    u.output_tokens = u.output_tokens.saturating_add(streamed_out);
+    u
+}
+
 impl<'a> TurnDriver<'a> {
     /// Append a `TurnAborted` marker with the given reason and detail.
     fn record_abort(
@@ -318,7 +331,17 @@ impl<'a> TurnDriver<'a> {
             .contract
             .and_then(|c| c.scope.max_wall_secs)
             .unwrap_or(0);
-        let turn_started_instant = self.ctx.clock.now_instant();
+        // CP-2: `tokio::time::Instant` snapshot for the wall-deadline
+        // arithmetic. The deadline itself is `tokio::time::Instant::now() +
+        // budget`, and `tokio::time::sleep_until` fires on the tokio clock —
+        // so the `spent=Ns` reporting inside the TimeExceeded abort must race
+        // the same clock, otherwise paused-time tests and VirtualClock
+        // forensic replays (where ctx.clock diverges from tokio's timer)
+        // report misleading elapsed values. Invariant #8 stays intact:
+        // `ctx.clock` drives every persisted wall-clock timestamp and every
+        // non-deadline `now_instant()` use site — `turn_started_tokio` is
+        // only consulted by the deadline-spent arithmetic below.
+        let turn_started_tokio = tokio::time::Instant::now();
 
         // Heartbeat throttle. First tick is swallowed by `interval`
         // (fires immediately), so the first heartbeat we actually
@@ -411,6 +434,11 @@ impl<'a> TurnDriver<'a> {
             // both paths end up summing to the provider-reported total).
             let mut stream_blocks_seen: u32 = 0;
             let mut stream_tools_seen: u32 = 0;
+            // `MessageDelta.usage_delta` carries BOTH input and output tokens.
+            // Round 2 only tracked output because that's all the heartbeat
+            // surfaces; mid-invoke aborts need both so the persisted partial
+            // usage matches what the provider billed for the in-flight call.
+            let mut stream_input_tokens: u32 = 0;
             let mut stream_output_tokens: u32 = 0;
 
             // CP-2 wall-clock deadline future. Pinned once per model-invoke
@@ -437,16 +465,19 @@ impl<'a> TurnDriver<'a> {
                     // CP-2 reminder: new branches below MUST NOT precede
                     // this one; reordering reintroduces MED-3.
                     _ = self.ctx.cancellation.wait_cancelled() => {
-                        // Fold streamed output tokens into the persisted
-                        // partial usage. `total_usage` is only accumulated
-                        // post-invoke, so any mid-stream cancellation would
-                        // otherwise drop every delta already received for
-                        // the in-flight call — understating token accounting
-                        // for exactly the turn that was cut short.
-                        let mut usage_at_abort = total_usage.clone();
-                        usage_at_abort.output_tokens = usage_at_abort
-                            .output_tokens
-                            .saturating_add(stream_output_tokens);
+                        // Fold streamed deltas into the persisted partial
+                        // usage. `total_usage` is only accumulated post-invoke,
+                        // so any mid-stream cancellation would otherwise drop
+                        // every delta already received for the in-flight call —
+                        // understating token accounting for exactly the turn
+                        // that was cut short. Helper is shared with the
+                        // TimeExceeded and AdapterError siblings so all three
+                        // stay in lockstep if the fold logic changes.
+                        let usage_at_abort = usage_with_stream(
+                            &total_usage,
+                            stream_input_tokens,
+                            stream_output_tokens,
+                        );
                         self.writer.append(&SessionEvent::TurnInterrupted {
                             turn_id: turn_id.clone(),
                             reason: AbortReason::UserCancel,
@@ -466,18 +497,16 @@ impl<'a> TurnDriver<'a> {
                     // can't burn past the deadline via its own poll
                     // ordering.
                     _ = &mut wall_deadline_fut, if has_deadline => {
-                        let spent = self.ctx.clock
-                            .now_instant()
-                            .saturating_duration_since(turn_started_instant)
-                            .as_secs();
-                        // Same mid-stream-usage fix as the UserCancel
-                        // branch above — fold stream_output_tokens so the
-                        // persisted abort usage reflects tokens already
-                        // billed to us before the deadline fired.
-                        let mut usage_at_abort = total_usage.clone();
-                        usage_at_abort.output_tokens = usage_at_abort
-                            .output_tokens
-                            .saturating_add(stream_output_tokens);
+                        // `spent` races the same clock as the deadline so the
+                        // two numbers agree under `start_paused` tests and
+                        // VirtualClock replay — see `turn_started_tokio`
+                        // rationale above.
+                        let spent = turn_started_tokio.elapsed().as_secs();
+                        let usage_at_abort = usage_with_stream(
+                            &total_usage,
+                            stream_input_tokens,
+                            stream_output_tokens,
+                        );
                         self.record_abort(
                             &turn_id,
                             AbortReason::TimeExceeded,
@@ -503,6 +532,8 @@ impl<'a> TurnDriver<'a> {
                                 stream_blocks_seen = stream_blocks_seen.saturating_add(1);
                             }
                             StreamEvent::MessageDelta { usage_delta, .. } => {
+                                stream_input_tokens = stream_input_tokens
+                                    .saturating_add(usage_delta.input_tokens);
                                 stream_output_tokens = stream_output_tokens
                                     .saturating_add(usage_delta.output_tokens);
                             }
@@ -542,10 +573,8 @@ impl<'a> TurnDriver<'a> {
                     // unset, so the only token record for work already
                     // billed to us is the streamed deltas we accumulated
                     // in this invoke iteration.
-                    let mut usage_at_abort = total_usage.clone();
-                    usage_at_abort.output_tokens = usage_at_abort
-                        .output_tokens
-                        .saturating_add(stream_output_tokens);
+                    let usage_at_abort =
+                        usage_with_stream(&total_usage, stream_input_tokens, stream_output_tokens);
                     self.record_abort(
                         &turn_id,
                         AbortReason::AdapterError,

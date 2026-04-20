@@ -27,13 +27,15 @@ use azoth_core::turn::TurnDriver;
 use tempfile::tempdir;
 use tokio::sync::mpsc;
 
-/// Emits `streamed_tokens` output tokens via `MessageDelta` *before*
-/// blocking forever (virtual time in the tests below). The streaming
-/// happens synchronously in-call so the driver's drain arm consumes the
-/// deltas before any deadline or cancellation is evaluated.
+/// Emits a `MessageDelta` carrying `streamed_in` input tokens and
+/// `streamed_out` output tokens *before* blocking forever (virtual time in
+/// the tests below). The streaming happens synchronously in-call so the
+/// driver's drain arm consumes the delta before any deadline or
+/// cancellation is evaluated.
 struct StreamingStallAdapter {
     profile: ProviderProfile,
-    streamed_tokens: u32,
+    streamed_in: u32,
+    streamed_out: u32,
 }
 
 #[async_trait]
@@ -47,13 +49,14 @@ impl ProviderAdapter for StreamingStallAdapter {
         _req: ModelTurnRequest,
         sink: mpsc::Sender<StreamEvent>,
     ) -> Result<ModelTurnResponse, AdapterError> {
-        // Push a single MessageDelta carrying the streamed token count.
-        // The driver's drain arm accumulates this into `stream_output_tokens`.
+        // Push a single MessageDelta carrying the streamed token deltas.
+        // The driver's drain arm accumulates both into `stream_input_tokens`
+        // / `stream_output_tokens`.
         sink.send(StreamEvent::MessageDelta {
             stop_reason: None,
             usage_delta: UsageDelta {
-                input_tokens: 0,
-                output_tokens: self.streamed_tokens,
+                input_tokens: self.streamed_in,
+                output_tokens: self.streamed_out,
             },
         })
         .await
@@ -96,7 +99,11 @@ async fn time_exceeded_abort_preserves_streamed_output_tokens() {
     let dispatcher = ToolDispatcher::new();
     let adapter = StreamingStallAdapter {
         profile: ProviderProfile::anthropic_default("claude-sonnet-4-6"),
-        streamed_tokens: 42,
+        // Both fields exercised — adapters that stream `input_tokens` mid-call
+        // (Anthropic's `message_delta.usage` in some contexts) previously had
+        // that delta silently dropped on mid-invoke abort.
+        streamed_in: 11,
+        streamed_out: 42,
     };
     let run_id = RunId::from("run_wall_stream".to_string());
     let turn_id = TurnId::from("t_wall_stream_1".to_string());
@@ -136,6 +143,10 @@ async fn time_exceeded_abort_preserves_streamed_output_tokens() {
             .unwrap();
         assert!(outcome.final_assistant.is_none());
         assert_eq!(
+            outcome.usage.input_tokens, 11,
+            "TurnOutcome.usage must reflect streamed input tokens on time-exceeded abort"
+        );
+        assert_eq!(
             outcome.usage.output_tokens, 42,
             "TurnOutcome.usage must reflect streamed output tokens on time-exceeded abort"
         );
@@ -155,6 +166,10 @@ async fn time_exceeded_abort_preserves_streamed_output_tokens() {
             _ => None,
         })
         .expect("expected TurnAborted { TimeExceeded } in forensic projection");
+    assert_eq!(
+        aborted.input_tokens, 11,
+        "persisted TurnAborted.usage must carry the streamed input tokens"
+    );
     assert_eq!(
         aborted.output_tokens, 42,
         "persisted TurnAborted.usage must carry the streamed output tokens"
@@ -181,7 +196,8 @@ async fn user_cancel_interrupt_preserves_streamed_output_tokens() {
     let dispatcher = ToolDispatcher::new();
     let adapter = StreamingStallAdapter {
         profile: ProviderProfile::anthropic_default("claude-sonnet-4-6"),
-        streamed_tokens: 17,
+        streamed_in: 5,
+        streamed_out: 17,
     };
     let run_id = RunId::from("run_cancel_stream".to_string());
     let turn_id = TurnId::from("t_cancel_stream_1".to_string());
@@ -235,6 +251,10 @@ async fn user_cancel_interrupt_preserves_streamed_output_tokens() {
         cancel_task.await.unwrap();
         assert!(outcome.final_assistant.is_none());
         assert_eq!(
+            outcome.usage.input_tokens, 5,
+            "TurnOutcome.usage must reflect streamed input tokens on user-cancel"
+        );
+        assert_eq!(
             outcome.usage.output_tokens, 17,
             "TurnOutcome.usage must reflect streamed output tokens on user-cancel"
         );
@@ -254,6 +274,10 @@ async fn user_cancel_interrupt_preserves_streamed_output_tokens() {
             _ => None,
         })
         .expect("expected TurnInterrupted { UserCancel } in forensic projection");
+    assert_eq!(
+        interrupt.input_tokens, 5,
+        "persisted TurnInterrupted.partial_usage must carry the streamed input tokens"
+    );
     assert_eq!(
         interrupt.output_tokens, 17,
         "persisted TurnInterrupted.partial_usage must carry the streamed output tokens"
