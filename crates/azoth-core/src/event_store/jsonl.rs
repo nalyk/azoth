@@ -16,7 +16,7 @@
 
 use crate::event_store::sqlite::SqliteMirror;
 use crate::schemas::{
-    AbortReason, EffectClass, EffectCounter, Message, Role, SessionEvent, TurnId,
+    AbortReason, EffectClass, EffectCounter, Message, Role, SessionEvent, TurnId, Usage,
 };
 use serde::Serialize;
 use std::collections::HashMap;
@@ -321,9 +321,28 @@ impl JsonlReader {
     }
 
     /// Crash recovery: scan for turns with no terminal marker and append a
-    /// synthetic `turn_interrupted { reason: "crash" }` record for each. Idempotent.
+    /// synthetic terminal record for each. Idempotent.
+    ///
+    /// Chronon CP-2 refinement: a dangling turn that emitted at least one
+    /// heartbeat is reclassified as `TurnAborted { reason: Stalled }` —
+    /// carrying the last-known heartbeat timestamp as `at`. A dangling
+    /// turn with no heartbeat stays `TurnInterrupted { reason: Crash }`:
+    /// the runtime literally has no temporal evidence of when the turn
+    /// last made progress.
     pub fn recover_dangling_turns(&self) -> Result<Vec<TurnId>, ProjectionError> {
         let scan = self.scan()?;
+        // Index the last seen heartbeat per turn. Walk events forward so
+        // the final assignment is the most recent heartbeat — same shape
+        // as the outcomes map.
+        let mut last_heartbeat: HashMap<TurnId, String> = HashMap::new();
+        for ev in &scan.events {
+            if let SessionEvent::TurnHeartbeat { turn_id, at, .. } = ev {
+                if !at.is_empty() {
+                    last_heartbeat.insert(turn_id.clone(), at.clone());
+                }
+            }
+        }
+
         let mut dangling: Vec<TurnId> = Vec::new();
         for ev in &scan.events {
             if let SessionEvent::TurnStarted { turn_id, .. } = ev {
@@ -340,16 +359,28 @@ impl JsonlReader {
         // Ensure we start on a fresh line.
         file.seek(SeekFrom::End(0))?;
         for turn_id in &dangling {
-            let synthetic = SessionEvent::TurnInterrupted {
-                turn_id: turn_id.clone(),
-                reason: AbortReason::Crash,
-                partial_usage: Default::default(),
-                // Chronon CP-1: honest `None` here — crash recovery
-                // runs at resume, long after the fact. Emitting
-                // "now" would be misleading; CP-2 stall detection
-                // will populate `at` from the last heartbeat when
-                // available.
-                at: None,
+            let synthetic = match last_heartbeat.get(turn_id) {
+                Some(hb_at) => {
+                    // Heartbeat evidence exists → reclassify as Stalled.
+                    // The `at` field carries the last heartbeat, not
+                    // "now" — operators need to see when progress
+                    // actually stopped, not when resume noticed.
+                    SessionEvent::TurnAborted {
+                        turn_id: turn_id.clone(),
+                        reason: AbortReason::Stalled,
+                        detail: Some(format!("last heartbeat at {hb_at}")),
+                        usage: Usage::default(),
+                        at: Some(hb_at.clone()),
+                    }
+                }
+                None => SessionEvent::TurnInterrupted {
+                    turn_id: turn_id.clone(),
+                    reason: AbortReason::Crash,
+                    partial_usage: Default::default(),
+                    // Honest `None`: no heartbeat, no idea when the crash
+                    // happened. Emitting "now" would be misleading.
+                    at: None,
+                },
             };
             let line = serialize_line(&synthetic)?;
             file.write_all(line.as_bytes())?;

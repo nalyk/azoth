@@ -312,6 +312,14 @@ fn write_event_line<W: std::io::Write>(
                 sampled_at
             }
         ),
+        SessionEvent::TurnHeartbeat { at, progress, .. } => writeln!(
+            out,
+            "{prefix}{turn} heartbeat        blocks={} tools={} tokens_out={} at={}",
+            progress.content_blocks,
+            progress.tool_calls,
+            progress.tokens_out,
+            if at.is_empty() { "-" } else { at }
+        ),
     }
 }
 

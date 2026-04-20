@@ -27,6 +27,9 @@ pub fn draft(goal: impl Into<String>) -> Contract {
             include_paths: vec![".".into()],
             exclude_paths: Vec::new(),
             max_turns: Some(32),
+            // CP-2: wall-clock budget opt-in; draft contracts leave it
+            // unset so default behaviour stays identical to pre-CP-2.
+            max_wall_secs: None,
         },
         effect_budget: EffectBudget {
             max_apply_local: 20,

@@ -303,6 +303,32 @@ impl<'a> TurnDriver<'a> {
 
         let mut total_usage = Usage::default();
 
+        // CP-2: wall-clock deadline. tokio's timer uses its own
+        // monotonic clock; that's correct here — the deadline race
+        // survives DST/NTP jumps that would confuse a SystemTime-based
+        // deadline. Forensic replay under VirtualClock should gate
+        // this out via `ExecutionMode::Replay` (landing in CP-5); for
+        // now, live mode only.
+        let deadline: Option<tokio::time::Instant> = self
+            .contract
+            .and_then(|c| c.scope.max_wall_secs)
+            .map(|secs| tokio::time::Instant::now() + std::time::Duration::from_secs(secs));
+        let budget_secs = self
+            .contract
+            .and_then(|c| c.scope.max_wall_secs)
+            .unwrap_or(0);
+        let turn_started_instant = self.ctx.clock.now_instant();
+
+        // Heartbeat throttle. First tick is swallowed by `interval`
+        // (fires immediately), so the first heartbeat we actually
+        // emit is at T+2s — keeps fast turns heartbeat-free.
+        let mut heartbeat_interval = tokio::time::interval(std::time::Duration::from_secs(2));
+        heartbeat_interval.tick().await; // swallow immediate first tick
+        heartbeat_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut last_heartbeat_progress = crate::schemas::HeartbeatProgress::default();
+        let mut content_blocks_so_far: u32 = 0;
+        let mut tool_calls_so_far: u32 = 0;
+
         loop {
             if self.ctx.cancelled() {
                 self.writer.append(&SessionEvent::TurnInterrupted {
@@ -371,6 +397,8 @@ impl<'a> TurnDriver<'a> {
                     // Cancellation first so a mid-stream Ctrl+C is never
                     // starved by a flood of deltas — matches the TUI's
                     // top-level `biased` select discipline (MED-3 fix).
+                    // CP-2 reminder: new branches below MUST NOT precede
+                    // this one; reordering reintroduces MED-3.
                     _ = self.ctx.cancellation.wait_cancelled() => {
                         self.writer.append(&SessionEvent::TurnInterrupted {
                             turn_id: turn_id.clone(),
@@ -384,8 +412,53 @@ impl<'a> TurnDriver<'a> {
                         telemetry::emit_turn_interrupted(&self.run_id.0, &turn_id.0, "user_cancel");
                         return Ok(TurnOutcome::aborted(total_usage));
                     }
+                    // CP-2 wall-clock budget enforcement. Only armed when
+                    // the active contract declares `scope.max_wall_secs`.
+                    // Sits after cancellation so Ctrl+C still wins; sits
+                    // before the invoke future so an overrunning adapter
+                    // can't burn past the deadline via its own poll
+                    // ordering.
+                    _ = async {
+                        match deadline {
+                            Some(d) => tokio::time::sleep_until(d).await,
+                            None => std::future::pending::<()>().await,
+                        }
+                    }, if deadline.is_some() => {
+                        let spent = self.ctx.clock
+                            .now_instant()
+                            .saturating_duration_since(turn_started_instant)
+                            .as_secs();
+                        self.record_abort(
+                            &turn_id,
+                            AbortReason::TimeExceeded,
+                            Some(format!(
+                                "wall-clock budget {budget_secs}s exhausted (spent={spent}s)"
+                            )),
+                            total_usage.clone(),
+                        )?;
+                        return Ok(TurnOutcome::aborted(total_usage));
+                    }
                     res = &mut invoke_fut => break res,
                     Some(_ev) = rx.recv() => { /* drain, continue */ }
+                    // CP-2 heartbeat. Fires only when there is real
+                    // progress since the last heartbeat — no-op throttle
+                    // keeps fast turns silent. Placed last so the real
+                    // adapter stream still wins tick scheduling.
+                    _ = heartbeat_interval.tick() => {
+                        let progress = crate::schemas::HeartbeatProgress {
+                            content_blocks: content_blocks_so_far,
+                            tool_calls: tool_calls_so_far,
+                            tokens_out: total_usage.output_tokens as u64,
+                        };
+                        if progress != last_heartbeat_progress {
+                            self.writer.append(&SessionEvent::TurnHeartbeat {
+                                turn_id: turn_id.clone(),
+                                at: self.ctx.now_iso(),
+                                progress: progress.clone(),
+                            })?;
+                            last_heartbeat_progress = progress;
+                        }
+                    }
                 }
             };
 
@@ -418,6 +491,12 @@ impl<'a> TurnDriver<'a> {
                     index: idx,
                     block: block.clone(),
                 })?;
+                // CP-2 heartbeat progress counters. Update as blocks
+                // land so the next heartbeat tick sees the delta.
+                content_blocks_so_far = content_blocks_so_far.saturating_add(1);
+                if matches!(block, ContentBlock::ToolUse { .. }) {
+                    tool_calls_so_far = tool_calls_so_far.saturating_add(1);
+                }
             }
 
             messages.push(Message {

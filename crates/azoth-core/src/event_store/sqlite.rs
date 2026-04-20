@@ -362,6 +362,8 @@ fn abort_reason_label(r: AbortReason) -> &'static str {
         AbortReason::ModelTruncated => "aborted_model_truncated",
         AbortReason::ContextOverflow => "aborted_context_overflow",
         AbortReason::SandboxDenied => "aborted_sandbox_denied",
+        AbortReason::TimeExceeded => "aborted_time_exceeded",
+        AbortReason::Stalled => "aborted_stalled",
     }
 }
 
