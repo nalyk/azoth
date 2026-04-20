@@ -129,7 +129,7 @@ checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 
 [[package]]
 name = "azoth"
-version = "2.0.1"
+version = "2.5.0-dev"
 dependencies = [
  "async-trait",
  "azoth-core",
@@ -155,7 +155,7 @@ dependencies = [
 
 [[package]]
 name = "azoth-core"
-version = "2.0.1"
+version = "2.5.0-dev"
 dependencies = [
  "async-trait",
  "bytes",
@@ -187,7 +187,7 @@ dependencies = [
 
 [[package]]
 name = "azoth-repo"
-version = "2.0.1"
+version = "2.5.0-dev"
 dependencies = [
  "async-trait",
  "azoth-core",
