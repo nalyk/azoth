@@ -84,6 +84,17 @@ pub struct TurnDriver<'a> {
     /// The caller owns this counter and increments it after a successful
     /// `drive_turn`; the driver compares it against `contract.scope.max_turns`.
     pub turns_completed: u32,
+    /// Optional run-start anchor on the **tokio** timer, captured once at
+    /// the beginning of the session and reused across every `drive_turn`
+    /// call. When `Some`, `scope.max_wall_secs` is enforced as an
+    /// absolute deadline (`anchor + budget`) so a 60s session budget
+    /// caps the entire run — not just each turn in isolation. When
+    /// `None`, the deadline resets per turn (legacy behaviour kept
+    /// intact for unit tests that only exercise one turn). Production
+    /// paths MUST pass `Some(tokio::time::Instant::now())` captured
+    /// once before the worker loop, otherwise `max_wall_secs` silently
+    /// degrades to a per-turn cap.
+    pub run_started_tokio: Option<tokio::time::Instant>,
     /// Optional `ContextKernel` used to compile a per-turn `ContextPacket`.
     /// When both `contract` and `kernel` are `Some`, the driver invokes
     /// `kernel.compile` once at the start of every `drive_turn` and shadows
@@ -317,31 +328,39 @@ impl<'a> TurnDriver<'a> {
 
         let mut total_usage = Usage::default();
 
-        // CP-2: wall-clock deadline. tokio's timer uses its own
-        // monotonic clock; that's correct here — the deadline race
-        // survives DST/NTP jumps that would confuse a SystemTime-based
-        // deadline. Forensic replay under VirtualClock should gate
-        // this out via `ExecutionMode::Replay` (landing in CP-5); for
-        // now, live mode only.
-        let deadline: Option<tokio::time::Instant> = self
-            .contract
-            .and_then(|c| c.scope.max_wall_secs)
-            .map(|secs| tokio::time::Instant::now() + std::time::Duration::from_secs(secs));
+        // CP-2: wall-clock deadline. Tokio's timer uses its own monotonic
+        // clock; the deadline race survives DST/NTP jumps that would
+        // confuse a SystemTime-based deadline. Forensic replay under
+        // VirtualClock should gate this out via `ExecutionMode::Replay`
+        // (landing in CP-5); for now, live mode only.
+        //
+        // Scope: `scope.max_wall_secs` is documented as the budget for
+        // the **entire session** (contract.rs Scope::max_wall_secs). A
+        // prior version recomputed the deadline from `Instant::now()` at
+        // the start of every `drive_turn`, which meant a 60s session
+        // budget could be evaded by running N turns of 55s each. Fix:
+        // when the caller threads a run-start anchor via
+        // `self.run_started_tokio`, the deadline is absolute
+        // (`anchor + budget`), so each turn's remaining budget tightens
+        // with the run's age. When `None`, fall back to per-turn
+        // semantics so single-turn unit tests keep their byte shape.
         let budget_secs = self
             .contract
             .and_then(|c| c.scope.max_wall_secs)
             .unwrap_or(0);
-        // CP-2: `tokio::time::Instant` snapshot for the wall-deadline
-        // arithmetic. The deadline itself is `tokio::time::Instant::now() +
-        // budget`, and `tokio::time::sleep_until` fires on the tokio clock —
-        // so the `spent=Ns` reporting inside the TimeExceeded abort must race
-        // the same clock, otherwise paused-time tests and VirtualClock
-        // forensic replays (where ctx.clock diverges from tokio's timer)
-        // report misleading elapsed values. Invariant #8 stays intact:
-        // `ctx.clock` drives every persisted wall-clock timestamp and every
-        // non-deadline `now_instant()` use site — `turn_started_tokio` is
-        // only consulted by the deadline-spent arithmetic below.
+        // `turn_started_tokio` is the per-turn monotonic anchor. It
+        // doubles as the deadline base when no run anchor is supplied
+        // (legacy per-turn enforcement), and it always drives the
+        // *turn*-scoped elapsed reporting below. Invariant #8 stays
+        // intact: `ctx.clock` drives every persisted wall-clock
+        // timestamp and every non-deadline `now_instant()` site — the
+        // tokio snapshots only feed deadline arithmetic.
         let turn_started_tokio = tokio::time::Instant::now();
+        let deadline_anchor = self.run_started_tokio.unwrap_or(turn_started_tokio);
+        let deadline: Option<tokio::time::Instant> = self
+            .contract
+            .and_then(|c| c.scope.max_wall_secs)
+            .map(|secs| deadline_anchor + std::time::Duration::from_secs(secs));
 
         // Heartbeat throttle. First tick is swallowed by `interval`
         // (fires immediately), so the first heartbeat we actually
@@ -349,7 +368,20 @@ impl<'a> TurnDriver<'a> {
         let mut heartbeat_interval = tokio::time::interval(std::time::Duration::from_secs(2));
         heartbeat_interval.tick().await; // swallow immediate first tick
         heartbeat_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        let mut last_heartbeat_progress = crate::schemas::HeartbeatProgress::default();
+        // PR #18 round 5 (gemini MED): start as `None` so the very first
+        // heartbeat tick of the turn always emits, even when no progress
+        // has been observed. Pre-fix the initial value was
+        // `HeartbeatProgress::default()` — equal to the progress
+        // computed on the first tick of a deadlocked first invoke
+        // (zeros all the way down), so the equality gate suppressed the
+        // emit and a turn that hung on its very first invoke produced
+        // *zero* heartbeats — exactly the deadlock signal the heartbeat
+        // exists to surface. With `Option`, the first emit is
+        // unconditional (the prior value is `None`, never equal to
+        // `Some(progress)`), and subsequent emits stay gated on
+        // delta-change. Fast turns that complete before the 2s tick
+        // still emit nothing because the tick branch never runs.
+        let mut last_heartbeat_progress: Option<crate::schemas::HeartbeatProgress> = None;
         let mut content_blocks_so_far: u32 = 0;
         let mut tool_calls_so_far: u32 = 0;
 
@@ -497,11 +529,30 @@ impl<'a> TurnDriver<'a> {
                     // can't burn past the deadline via its own poll
                     // ordering.
                     _ = &mut wall_deadline_fut, if has_deadline => {
-                        // `spent` races the same clock as the deadline so the
-                        // two numbers agree under `start_paused` tests and
-                        // VirtualClock replay — see `turn_started_tokio`
-                        // rationale above.
-                        let spent = turn_started_tokio.elapsed().as_secs();
+                        // Both `run_spent` and `turn_spent` race the same
+                        // clock as the deadline so the numbers agree under
+                        // `start_paused` tests and VirtualClock replay —
+                        // see `turn_started_tokio` rationale above. The
+                        // budget is session-wide, so `run_spent` (anchor
+                        // = `run_started_tokio`, falling back to turn
+                        // anchor when single-turn) is the headline number;
+                        // `turn_spent` is appended when it differs (i.e.
+                        // a multi-turn run aborted on a later turn) so an
+                        // operator can see how much of the deadline this
+                        // particular turn consumed vs. how much was
+                        // already burned by prior turns.
+                        let run_spent = deadline_anchor.elapsed().as_secs();
+                        let turn_spent = turn_started_tokio.elapsed().as_secs();
+                        let detail = if turn_spent == run_spent {
+                            format!(
+                                "wall-clock budget {budget_secs}s exhausted (spent={run_spent}s)"
+                            )
+                        } else {
+                            format!(
+                                "wall-clock budget {budget_secs}s exhausted \
+                                 (run_spent={run_spent}s, this_turn={turn_spent}s)"
+                            )
+                        };
                         let usage_at_abort = usage_with_stream(
                             &total_usage,
                             stream_input_tokens,
@@ -510,9 +561,7 @@ impl<'a> TurnDriver<'a> {
                         self.record_abort(
                             &turn_id,
                             AbortReason::TimeExceeded,
-                            Some(format!(
-                                "wall-clock budget {budget_secs}s exhausted (spent={spent}s)"
-                            )),
+                            Some(detail),
                             usage_at_abort.clone(),
                         )?;
                         return Ok(TurnOutcome::aborted(usage_at_abort));
@@ -540,10 +589,25 @@ impl<'a> TurnDriver<'a> {
                             _ => {}
                         }
                     }
-                    // CP-2 heartbeat. Fires only when there is real
-                    // progress since the last heartbeat — no-op throttle
-                    // keeps fast turns silent. Placed last so the real
-                    // adapter stream still wins tick scheduling.
+                    // CP-2 heartbeat. Placed last so the real adapter
+                    // stream still wins tick scheduling. Fires when
+                    // progress has changed since the last heartbeat OR
+                    // on the very first tick of the turn (initial
+                    // `last_heartbeat_progress = None` — guarantees a
+                    // liveness emit even when the first invoke
+                    // deadlocks before producing anything; see init
+                    // rationale above).
+                    //
+                    // Known structural limitation (deferred — separate
+                    // PR): the tick branch only polls *during model
+                    // invokes*. Long-running tool execution between
+                    // invokes (Bash, web fetch, sandboxed builds)
+                    // pauses the heartbeat because the inner
+                    // `select!` is exited while the outer loop walks
+                    // the tool dispatch. A correct fix moves heartbeat
+                    // ticking to the outer loop and races it against
+                    // the dispatch future — substantial enough to want
+                    // its own PR. Tracked for v2.5.
                     _ = heartbeat_interval.tick() => {
                         let progress = crate::schemas::HeartbeatProgress {
                             content_blocks: content_blocks_so_far
@@ -553,13 +617,13 @@ impl<'a> TurnDriver<'a> {
                             tokens_out: (total_usage.output_tokens as u64)
                                 .saturating_add(stream_output_tokens as u64),
                         };
-                        if progress != last_heartbeat_progress {
+                        if last_heartbeat_progress.as_ref() != Some(&progress) {
                             self.writer.append(&SessionEvent::TurnHeartbeat {
                                 turn_id: turn_id.clone(),
                                 at: self.ctx.now_iso(),
                                 progress: progress.clone(),
                             })?;
-                            last_heartbeat_progress = progress;
+                            last_heartbeat_progress = Some(progress);
                         }
                     }
                 }

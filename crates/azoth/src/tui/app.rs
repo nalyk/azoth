@@ -1940,6 +1940,17 @@ pub async fn run_app(resume: Option<String>, as_of: Option<String>) -> io::Resul
         // Worker is fully booted — drop the splashscreen.
         let _ = worker_ready_tx.send(()).await;
 
+        // Chronon CP-2 / PR #18 round 5 — anchor for the contract's
+        // session-wide `scope.max_wall_secs`. Captured once on the
+        // tokio timer so every TurnDriver below races the *same*
+        // absolute deadline (`anchor + budget`), instead of each
+        // turn re-arming a fresh full-budget deadline. Resumed
+        // sessions reset this anchor to "now" — recovering the prior
+        // process's wall-spend would require a per-turn elapsed
+        // field on `TurnCommitted` that the schema doesn't carry, so
+        // a `--resume`d run effectively gets a fresh wall budget.
+        let run_started_tokio = tokio::time::Instant::now();
+
         loop {
             let user_text = tokio::select! {
                 biased;
@@ -2101,6 +2112,7 @@ pub async fn run_app(resume: Option<String>, as_of: Option<String>) -> io::Resul
                 approval_bridge: approval_req_tx.clone(),
                 contract: active_contract.as_ref(),
                 turns_completed,
+                run_started_tokio: Some(run_started_tokio),
                 kernel: Some(&kernel),
                 validators,
                 effects_consumed: &mut effects_consumed,
