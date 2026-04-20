@@ -208,12 +208,104 @@ impl JsonlReader {
         Ok(Scan { events, outcomes })
     }
 
+    /// Chronon CP-5 internal: the time-bounded sibling of `scan`.
+    ///
+    /// Two passes over the raw scan:
+    ///
+    /// 1. Compute an effective terminal timestamp per turn: `terminal.at`
+    ///    if present, else the turn's `TurnStarted.timestamp` as a
+    ///    charitable fallback for pre-CP-1 turns and crash-recovery
+    ///    synthetics. A turn with no terminal marker at all drops out.
+    ///
+    /// 2. Keep only events that either belong to a visible turn, or that
+    ///    are non-turn (`RunStarted` / `ContractAccepted`) with their own
+    ///    `timestamp` ≤ `as_of`.
+    ///
+    /// Outcomes are filtered to the visible set so downstream
+    /// `is_replayable` and consumers can't accidentally treat a dropped
+    /// turn as committed.
+    fn scan_as_of(&self, as_of: &str) -> Result<Scan, ProjectionError> {
+        let raw = self.scan()?;
+
+        // First pass: per-turn effective terminal `at`.
+        let mut turn_started_at: HashMap<TurnId, String> = HashMap::new();
+        let mut terminal_at: HashMap<TurnId, Option<String>> = HashMap::new();
+        for ev in &raw.events {
+            match ev {
+                SessionEvent::TurnStarted {
+                    turn_id, timestamp, ..
+                } => {
+                    turn_started_at
+                        .entry(turn_id.clone())
+                        .or_insert_with(|| timestamp.clone());
+                }
+                SessionEvent::TurnCommitted { turn_id, at, .. }
+                | SessionEvent::TurnAborted { turn_id, at, .. }
+                | SessionEvent::TurnInterrupted { turn_id, at, .. } => {
+                    terminal_at.insert(turn_id.clone(), at.clone());
+                }
+                _ => {}
+            }
+        }
+
+        // Determine visible turns: turns with a terminal marker whose
+        // effective `at` (own `at`, else `TurnStarted.timestamp`) is
+        // ≤ as_of.
+        let mut visible: std::collections::HashSet<TurnId> = std::collections::HashSet::new();
+        for (turn_id, maybe_at) in &terminal_at {
+            let effective = maybe_at
+                .as_deref()
+                .or_else(|| turn_started_at.get(turn_id).map(String::as_str));
+            if let Some(ts) = effective {
+                if ts <= as_of {
+                    visible.insert(turn_id.clone());
+                }
+            }
+        }
+
+        // Second pass: filter.
+        let events: Vec<SessionEvent> = raw
+            .events
+            .into_iter()
+            .filter(|ev| match ev {
+                SessionEvent::RunStarted { timestamp, .. }
+                | SessionEvent::ContractAccepted { timestamp, .. } => timestamp.as_str() <= as_of,
+                _ => match ev.turn_id() {
+                    Some(t) => visible.contains(t),
+                    None => true,
+                },
+            })
+            .collect();
+
+        let outcomes: HashMap<TurnId, TurnOutcomeKind> = raw
+            .outcomes
+            .into_iter()
+            .filter(|(t, _)| visible.contains(t))
+            .collect();
+
+        Ok(Scan { events, outcomes })
+    }
+
     /// Replayable projection: only lines from turns whose terminal marker is
     /// `turn_committed`. Turns with any other outcome (aborted, interrupted,
     /// dangling) are dropped whole — making orphaned `tool_result` blocks
     /// structurally impossible on replay (CRIT-1).
     pub fn replayable(&self) -> Result<Vec<ReplayableEvent>, ProjectionError> {
         let scan = self.scan()?;
+        Ok(scan
+            .events
+            .into_iter()
+            .filter(|ev| is_replayable(ev, &scan.outcomes))
+            .map(ReplayableEvent)
+            .collect())
+    }
+
+    /// Chronon CP-5: bounded `replayable`. Same committed-only semantics,
+    /// but the visible set is also gated on each turn's effective `at`
+    /// being ≤ `as_of` (see [`scan_as_of`](Self::scan_as_of) for the
+    /// visibility rule).
+    pub fn replayable_as_of(&self, as_of: &str) -> Result<Vec<ReplayableEvent>, ProjectionError> {
+        let scan = self.scan_as_of(as_of)?;
         Ok(scan
             .events
             .into_iter()
@@ -236,6 +328,56 @@ impl JsonlReader {
                 }
             })
             .collect())
+    }
+
+    /// Chronon CP-5: forensic projection bounded by wall-clock `as_of`.
+    ///
+    /// A turn's events are included iff its terminal marker's `at` is
+    /// ≤ `as_of`. For terminal markers without `at` (pre-CP-1 sessions
+    /// or crash-recovery synthetics) the turn's `TurnStarted.timestamp`
+    /// is the fallback — an honest approximation since such turns
+    /// carry no precise end time. Turns without any terminal marker are
+    /// always excluded: as of `as_of` they were mid-flight, so no
+    /// `TurnCommitted` / `TurnAborted` / `TurnInterrupted` had landed
+    /// yet (CRIT-1 atomicity, extended to the time axis).
+    ///
+    /// Non-turn events (`RunStarted`, `ContractAccepted`) gate on their
+    /// own `timestamp` field; `TurnStarted` rides along with its turn's
+    /// visibility decision.
+    ///
+    /// Timestamps compare lexicographically, which is equivalent to
+    /// chronological comparison for RFC3339 strings with a fixed `Z`
+    /// offset — the format every `Clock` impl in `execution::clock`
+    /// produces.
+    ///
+    /// The returned events carry the `non_replayable` tag under the
+    /// same semantics as `forensic()` (committed-only = replayable).
+    pub fn forensic_as_of(&self, as_of: &str) -> Result<Vec<ForensicEvent>, ProjectionError> {
+        let scan = self.scan_as_of(as_of)?;
+        Ok(scan
+            .events
+            .into_iter()
+            .map(|ev| {
+                let non_replayable = !is_replayable(&ev, &scan.outcomes);
+                ForensicEvent {
+                    event: ev,
+                    non_replayable,
+                }
+            })
+            .collect())
+    }
+
+    /// Bounded variant of [`last_accepted_contract`](Self::last_accepted_contract):
+    /// returns the most recent contract accepted at or before `as_of`.
+    pub fn last_accepted_contract_as_of(
+        &self,
+        as_of: &str,
+    ) -> Result<Option<crate::schemas::Contract>, ProjectionError> {
+        let scan = self.scan_as_of(as_of)?;
+        Ok(scan.events.into_iter().rev().find_map(|ev| match ev {
+            SessionEvent::ContractAccepted { contract, .. } => Some(contract),
+            _ => None,
+        }))
     }
 
     /// The most recently accepted contract, rehydrated from the last
@@ -263,9 +405,31 @@ impl JsonlReader {
     /// not drift from the runtime path.
     pub fn committed_run_progress(&self) -> Result<(EffectCounter, u32), ProjectionError> {
         let replay = self.replayable()?;
+        Self::fold_progress(replay.into_iter().map(|ReplayableEvent(ev)| ev))
+    }
+
+    /// Chronon CP-5: bounded `committed_run_progress`. Counts effects and
+    /// committed turns only over turns whose terminal marker is
+    /// `TurnCommitted` AND whose effective `at` is ≤ `as_of`.
+    pub fn committed_run_progress_as_of(
+        &self,
+        as_of: &str,
+    ) -> Result<(EffectCounter, u32), ProjectionError> {
+        let scan = self.scan_as_of(as_of)?;
+        // Only the committed-outcome subset counts toward resume budgets.
+        let committed_only = scan.events.into_iter().filter(|ev| match ev.turn_id() {
+            None => true,
+            Some(t) => matches!(scan.outcomes.get(t), Some(TurnOutcomeKind::Committed)),
+        });
+        Self::fold_progress(committed_only)
+    }
+
+    fn fold_progress<I: IntoIterator<Item = SessionEvent>>(
+        events: I,
+    ) -> Result<(EffectCounter, u32), ProjectionError> {
         let mut effects = EffectCounter::default();
         let mut turns_completed: u32 = 0;
-        for ReplayableEvent(ev) in &replay {
+        for ev in events {
             match ev {
                 SessionEvent::EffectRecord { effect, .. } => match effect.class {
                     EffectClass::ApplyLocal => {
@@ -299,8 +463,27 @@ impl JsonlReader {
     /// same sequence and is what keeps `/resume` from hitting total amnesia.
     pub fn rebuild_history(&self) -> Result<Vec<Message>, ProjectionError> {
         let replay = self.replayable()?;
+        Ok(Self::fold_history(
+            replay.into_iter().map(|ReplayableEvent(ev)| ev),
+        ))
+    }
+
+    /// Chronon CP-5: bounded `rebuild_history`. Rehydrates the cross-turn
+    /// `Vec<Message>` from the as-of-committed subset, so resume under
+    /// `--as-of` feeds the model exactly the history that was in memory
+    /// at `as_of`.
+    pub fn rebuild_history_as_of(&self, as_of: &str) -> Result<Vec<Message>, ProjectionError> {
+        let scan = self.scan_as_of(as_of)?;
+        let committed_only = scan.events.into_iter().filter(|ev| match ev.turn_id() {
+            None => true,
+            Some(t) => matches!(scan.outcomes.get(t), Some(TurnOutcomeKind::Committed)),
+        });
+        Ok(Self::fold_history(committed_only))
+    }
+
+    fn fold_history<I: IntoIterator<Item = SessionEvent>>(events: I) -> Vec<Message> {
         let mut history: Vec<Message> = Vec::new();
-        for ReplayableEvent(ev) in replay {
+        for ev in events {
             if let SessionEvent::TurnCommitted {
                 user_input: Some(user),
                 final_assistant: Some(assistant),
@@ -317,7 +500,7 @@ impl JsonlReader {
                 });
             }
         }
-        Ok(history)
+        history
     }
 
     /// Crash recovery: scan for turns with no terminal marker and append a

@@ -1,5 +1,23 @@
 //! Turn rail — an 8-column left drawer showing every turn as a
 //! single-line miniature. Toggled via `⌃1`.
+//!
+//! ## Chronon CP-5 deferral — as-of slider
+//!
+//! The Chronon plan (`~/.claude/plans/i-need-you-to-humming-hoare.md`
+//! §CP-5) specifies a rail-level *as-of slider* for scrubbing backward
+//! through committed turns, debounced 100ms, prefetching the nearest
+//! checkpoint for O(1) snap-points. That interaction surface needs a
+//! dedicated UX round — input grammar (Shift+PgUp / mouse drag / slash
+//! command) and the slider-vs-selected-turn affordance still have to be
+//! designed — and shipping it half-built would dilute the five solid
+//! sub-sprints already in the CP-5 commit.
+//!
+//! The load-bearing CP-5 surface (bounded hydration via
+//! `JsonlReader::{forensic_as_of, replayable_as_of, rebuild_history_as_of,
+//! last_accepted_contract_as_of, committed_run_progress_as_of}` plus the
+//! `azoth resume --as-of <ISO8601>` CLI flag that flips `AppState.
+//! read_only = true`) is shipped. The slider is scoped to its own
+//! follow-up round.
 
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};

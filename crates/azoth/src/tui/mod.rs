@@ -18,9 +18,9 @@ pub mod theme;
 pub mod util;
 pub mod whisper;
 
-pub fn run(resume: Option<String>) -> std::io::Result<()> {
+pub fn run(resume: Option<String>, as_of: Option<String>) -> std::io::Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    rt.block_on(app::run_app(resume))
+    rt.block_on(app::run_app(resume, as_of))
 }

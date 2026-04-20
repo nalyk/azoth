@@ -97,6 +97,7 @@ impl SqliteMirror {
                 turn_id,
                 outcome,
                 usage,
+                at,
                 ..
             } => {
                 let run_id = self.run_id_for_upsert();
@@ -106,6 +107,7 @@ impl SqliteMirror {
                     commit_outcome_label(*outcome),
                     None,
                     usage,
+                    at.as_deref(),
                 )?;
             }
             SessionEvent::TurnAborted {
@@ -113,11 +115,19 @@ impl SqliteMirror {
                 reason,
                 detail,
                 usage,
+                at,
                 ..
             } => {
                 let run_id = self.run_id_for_upsert();
                 let label = abort_reason_label(*reason);
-                self.upsert_turn(&run_id, turn_id, label, detail.as_deref(), usage)?;
+                self.upsert_turn(
+                    &run_id,
+                    turn_id,
+                    label,
+                    detail.as_deref(),
+                    usage,
+                    at.as_deref(),
+                )?;
             }
             SessionEvent::ImpactComputed {
                 turn_id,
@@ -256,6 +266,7 @@ impl SqliteMirror {
             .unwrap_or_default()
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn upsert_turn(
         &self,
         run_id: &str,
@@ -263,14 +274,19 @@ impl SqliteMirror {
         outcome: &str,
         detail: Option<&str>,
         usage: &Usage,
+        at: Option<&str>,
     ) -> Result<(), MirrorError> {
+        // Chronon CP-5 (m0007): `at` is the terminal marker's wall-clock
+        // (RFC3339 UTC). `NULL` for pre-CP-1 turns — they drop out of
+        // range-scan `WHERE at <= ?` queries by definition of SQL NULL.
         self.conn.execute(
             r#"
             INSERT INTO turns (
                 run_id, turn_id, outcome, detail,
                 input_tokens, output_tokens,
-                cache_read_tokens, cache_creation_tokens
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                cache_read_tokens, cache_creation_tokens,
+                at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
             ON CONFLICT(turn_id) DO UPDATE SET
                 run_id = excluded.run_id,
                 outcome = excluded.outcome,
@@ -278,7 +294,8 @@ impl SqliteMirror {
                 input_tokens = excluded.input_tokens,
                 output_tokens = excluded.output_tokens,
                 cache_read_tokens = excluded.cache_read_tokens,
-                cache_creation_tokens = excluded.cache_creation_tokens
+                cache_creation_tokens = excluded.cache_creation_tokens,
+                at = excluded.at
             "#,
             params![
                 run_id,
@@ -289,6 +306,7 @@ impl SqliteMirror {
                 usage.output_tokens,
                 usage.cache_read_tokens,
                 usage.cache_creation_tokens,
+                at,
             ],
         )?;
         Ok(())
@@ -813,8 +831,8 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(
-            v, 6,
-            "Sprint 6 ships m0006 (eval_runs) on top of m0005 (test_impact) / m0004 (co_edit_edges) / m0003 (symbols) / m0002 (FTS) / m0001 (turns)"
+            v, 7,
+            "Chronon CP-5 ships m0007 (turns.at + turns_by_at) on top of m0006 (eval_runs) / m0005 (test_impact) / m0004 (co_edit_edges) / m0003 (symbols) / m0002 (FTS) / m0001 (turns)"
         );
     }
 }

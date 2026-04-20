@@ -165,6 +165,13 @@ pub struct AppState {
     /// (`(idx + 1) % len`) for every subsequent Tab. Earlier the Tab
     /// handler called `order.iter().position()` on every keystroke.
     tab_cursor: Option<usize>,
+    /// Chronon CP-5: when set (via `azoth resume --as-of <ISO8601>`),
+    /// the session is in read-only mode. New turn submissions, contract
+    /// amendments, and approval grants are suppressed by the main select
+    /// loop and surfaced as a note. The TUI Rail slider for scrubbing
+    /// through prior snapshots is deferred — documented in the CP-6
+    /// commit and the invariant #8 landing in CLAUDE.md.
+    pub read_only: bool,
 }
 
 impl AppState {
@@ -218,6 +225,7 @@ impl AppState {
             scroll_locked: false,
             tab_order_cache: None,
             tab_cursor: None,
+            read_only: false,
         }
     }
 
@@ -1492,7 +1500,7 @@ async fn build_indexer_backends(
     })
 }
 
-pub async fn run_app(resume: Option<String>) -> io::Result<()> {
+pub async fn run_app(resume: Option<String>, as_of: Option<String>) -> io::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     stdout.execute(EnterAlternateScreen)?;
@@ -1541,6 +1549,12 @@ pub async fn run_app(resume: Option<String>) -> io::Result<()> {
         Some(s) => RunId::from(s),
         None => RunId::new(),
     };
+    // Chronon CP-5: `--as-of` only makes sense on a resumed session; the
+    // CLI already rejects bare `--as-of`, but double-guard here so future
+    // callers (SDK wrappers, daemon mode) can't set as_of without a
+    // resume run_id and silently get live-mode semantics.
+    let as_of = if resuming { as_of } else { None };
+    let read_only = as_of.is_some();
     let session_path = cwd
         .join(".azoth")
         .join("sessions")
@@ -1561,6 +1575,7 @@ pub async fn run_app(resume: Option<String>) -> io::Result<()> {
     let worker_cwd = cwd.clone();
     let worker_session_path = session_path.clone();
     let worker_artifacts_root = artifacts_root.clone();
+    let worker_as_of = as_of.clone();
 
     tokio::spawn(async move {
         // Build long-lived subsystems once. On resume we open the existing
@@ -1584,7 +1599,16 @@ pub async fn run_app(resume: Option<String>) -> io::Result<()> {
             }
         };
         if resuming {
-            match JsonlReader::open(&worker_session_path).replayable() {
+            let reader = JsonlReader::open(&worker_session_path);
+            // Chronon CP-5: under `--as-of`, hydrate only the replayable
+            // slice up to the cutoff. Everything committed later is
+            // invisible to the rebuilt UI — matches the
+            // contract/progress rehydration below.
+            let events_result = match worker_as_of.as_deref() {
+                Some(t) => reader.replayable_as_of(t),
+                None => reader.replayable(),
+            };
+            match events_result {
                 Ok(events) => {
                     for ev in events {
                         let _ = worker_session_tx.send(ev.0);
@@ -1648,7 +1672,16 @@ pub async fn run_app(resume: Option<String>) -> io::Result<()> {
         // empty history so the session at least starts cleanly instead of
         // aborting the worker.
         let mut history: Vec<Message> = if resuming {
-            match JsonlReader::open(&worker_session_path).rebuild_history() {
+            let reader = JsonlReader::open(&worker_session_path);
+            // Chronon CP-5: history rebuild is bounded by `--as-of` so the
+            // model never sees the conversation continuing past the cutoff
+            // even though read_only mode suppresses new sends anyway —
+            // defence in depth.
+            let history_result = match worker_as_of.as_deref() {
+                Some(t) => reader.rebuild_history_as_of(t),
+                None => reader.rebuild_history(),
+            };
+            match history_result {
                 Ok(h) => h,
                 Err(e) => {
                     tracing::warn!(error = %e, "rebuild history failed, starting empty");
@@ -1873,15 +1906,20 @@ pub async fn run_app(resume: Option<String>) -> io::Result<()> {
         // driver needs its own handle — the tap is one-way and never
         // loops back into the worker.
         let resume_reader = JsonlReader::open(&worker_session_path);
-        let mut active_contract: Option<Contract> =
-            resume_reader.last_accepted_contract().ok().flatten();
-        // Rehydrate `turns_completed` and the per-class effect tally from the
-        // replayable projection so the contract's `max_turns` / `effect_budget`
-        // gates resume exactly where the prior session left off. Any read
-        // failure falls back to a clean slate — matching the writer's
-        // tolerance of a missing / fresh log.
-        let (mut effects_consumed, mut turns_completed) =
-            resume_reader.committed_run_progress().unwrap_or_default();
+        // Chronon CP-5: both contract + progress rehydrate against the
+        // as-of cutoff under `--as-of`. Consequence: the runtime's view
+        // of "which contract is active" and "how much budget is spent"
+        // matches the past-snapshot the scrollback shows.
+        let mut active_contract: Option<Contract> = match worker_as_of.as_deref() {
+            Some(t) => resume_reader.last_accepted_contract_as_of(t).ok().flatten(),
+            None => resume_reader.last_accepted_contract().ok().flatten(),
+        };
+        let (mut effects_consumed, mut turns_completed) = match worker_as_of.as_deref() {
+            Some(t) => resume_reader
+                .committed_run_progress_as_of(t)
+                .unwrap_or_default(),
+            None => resume_reader.committed_run_progress().unwrap_or_default(),
+        };
 
         // Has a `RunStarted` event already been appended to this session's
         // JSONL? The TUI worker emits one just before the first
@@ -2115,7 +2153,17 @@ pub async fn run_app(resume: Option<String>) -> io::Result<()> {
     state.session_path = session_path.display().to_string();
     state.max_context_tokens = profile_max_ctx;
     state.status = profile_status;
-    let banner = if resuming { "resumed" } else { "session" };
+    state.read_only = read_only;
+    // Chronon CP-5: banner surfaces the as-of cutoff so the operator
+    // sees instantly that new turns will not fire. Deferred: a TUI Rail
+    // slider that scrubs through prior snapshots — CP-6 commit flagged
+    // it as needing its own UX round; read-only mode here is the
+    // load-bearing minimum.
+    let banner = match (resuming, as_of.as_deref()) {
+        (true, Some(t)) => format!("resumed · read-only · as-of {t}"),
+        (true, None) => "resumed".to_string(),
+        (false, _) => "session".to_string(),
+    };
     state
         .notes
         .push(Note::info(format!("{banner} · {}", session_path.display())));
@@ -2132,17 +2180,39 @@ pub async fn run_app(resume: Option<String>) -> io::Result<()> {
             Some(ev) = input_rx.recv() => {
                 state.handle_input(ev);
                 if let Some(text) = state.take_pending_user_text() {
-                    if user_tx.send(text).await.is_err() {
+                    if state.read_only {
+                        // Chronon CP-5: hard gate — drain the composer
+                        // but never forward to the worker. Input stays
+                        // usable so the operator can scroll / use
+                        // `/quit`, but nothing new hits the model.
+                        let _ = text;
+                        state
+                            .notes
+                            .push(Note::info("read-only · as-of snapshot · /quit to exit"));
+                        state.dirty = true;
+                    } else if user_tx.send(text).await.is_err() {
                         state.push_error("worker channel closed");
                     }
                 }
                 if let Some(contract) = state.take_pending_contract() {
-                    if contract_tx.send(contract).await.is_err() {
+                    if state.read_only {
+                        let _ = contract;
+                        state
+                            .notes
+                            .push(Note::info("read-only · contract locked to as-of snapshot"));
+                        state.dirty = true;
+                    } else if contract_tx.send(contract).await.is_err() {
                         state.push_error("worker channel closed");
                     }
                 }
                 if let Some(tool_name) = state.take_pending_approve() {
-                    if approve_tx.send(tool_name).await.is_err() {
+                    if state.read_only {
+                        let _ = tool_name;
+                        state
+                            .notes
+                            .push(Note::info("read-only · no tool calls in as-of snapshot"));
+                        state.dirty = true;
+                    } else if approve_tx.send(tool_name).await.is_err() {
                         state.push_error("worker channel closed");
                     }
                 }
