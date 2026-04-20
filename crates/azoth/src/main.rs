@@ -241,6 +241,16 @@ fn run_tui(resume: Option<String>, as_of: Option<String>) {
         eprintln!("--as-of requires a run_id (use: azoth resume <run_id> --as-of <iso8601>)");
         std::process::exit(2);
     }
+    // Validate RFC3339 shape up front: the forensic projection compares
+    // timestamps chronologically (not lexicographically), and a malformed
+    // cutoff would otherwise silently exclude every turn. Surfacing here
+    // gives the operator an actionable error before the TUI even opens.
+    if let Some(t) = as_of.as_deref() {
+        if time::OffsetDateTime::parse(t, &time::format_description::well_known::Rfc3339).is_err() {
+            eprintln!("malformed --as-of {t:?}: expected RFC3339 (e.g. 2026-04-20T10:00:00Z)");
+            std::process::exit(2);
+        }
+    }
     #[cfg(feature = "tui")]
     {
         if let Err(e) = tui::run(resume, as_of) {

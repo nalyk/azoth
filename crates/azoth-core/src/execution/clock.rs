@@ -22,6 +22,7 @@
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use time::OffsetDateTime;
 
 /// Canonical clock interface. All runtime time reads flow through a
 /// trait object so tests and replay can substitute deterministic sources.
@@ -40,15 +41,7 @@ pub trait Clock: Send + Sync + std::fmt::Debug {
     /// Chosen over letting callers format themselves so the output format
     /// stays stable across the codebase and survives event-log replay.
     fn now_iso(&self) -> String {
-        let st = self.now();
-        let secs = st.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-        let nanos = st
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .subsec_nanos();
-        let odt = time::OffsetDateTime::from_unix_timestamp(secs as i64)
-            .unwrap_or(time::OffsetDateTime::UNIX_EPOCH)
-            + Duration::from_nanos(nanos as u64);
+        let odt: OffsetDateTime = self.now().into();
         odt.format(&time::format_description::well_known::Rfc3339)
             .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
     }
@@ -135,15 +128,17 @@ impl VirtualClock {
         Self::new(UNIX_EPOCH + Duration::from_secs(secs))
     }
 
-    /// Advance both wall and monotonic readings by `d`. Monotonic moves
-    /// by real elapsed instant delta — we add `d` to a captured `Instant`
-    /// using checked_add, falling back to the old value on overflow
-    /// rather than panicking.
+    /// Advance both wall and monotonic readings by `d`. Both use
+    /// `checked_add` and fall back to the old value on overflow rather
+    /// than panicking — important for replay traces that synthesise
+    /// large jumps and for tests that advance in loops.
     pub fn advance(&self, d: Duration) {
         let mut s = self.state.lock().unwrap();
-        s.wall += d;
-        if let Some(next) = s.mono.checked_add(d) {
-            s.mono = next;
+        if let Some(next_wall) = s.wall.checked_add(d) {
+            s.wall = next_wall;
+        }
+        if let Some(next_mono) = s.mono.checked_add(d) {
+            s.mono = next_mono;
         }
     }
 
@@ -217,5 +212,33 @@ mod tests {
         let _: Arc<dyn Clock> = Arc::new(SystemClock);
         let _: Arc<dyn Clock> = Arc::new(FrozenClock::default());
         let _: Arc<dyn Clock> = Arc::new(VirtualClock::from_unix_secs(0));
+    }
+
+    #[test]
+    fn virtual_clock_advance_saturates_on_wall_overflow() {
+        // Near SystemTime's max representable range; advancing by another
+        // huge duration would panic under `+=`. The fix uses `checked_add`
+        // and falls back to the current value instead.
+        let huge = Duration::from_secs(i64::MAX as u64);
+        let c = VirtualClock::new(UNIX_EPOCH + huge);
+        let before = c.now();
+        c.advance(huge);
+        // On overflow, wall stays at its prior reading — no panic.
+        assert_eq!(c.now(), before, "wall should saturate, not panic");
+    }
+
+    #[test]
+    fn now_iso_preserves_subsecond_precision() {
+        // Regression for the as-of comparison bug: the RFC3339 formatter
+        // emits fractional seconds when nanos > 0. Lexicographic comparison
+        // against a non-fractional cutoff would sort this INCORRECTLY —
+        // the as-of scan must parse both sides before comparing.
+        let wall = UNIX_EPOCH + Duration::from_secs(1_700_000_000) + Duration::from_millis(500);
+        let c = FrozenClock::new(wall);
+        let iso = c.now_iso();
+        assert!(
+            iso.contains(".5") || iso.contains(".500"),
+            "expected fractional seconds, got {iso}"
+        );
     }
 }

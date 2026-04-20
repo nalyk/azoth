@@ -338,3 +338,67 @@ fn rebuild_history_as_of_returns_bounded_committed_exchanges() {
         other => panic!("unexpected {other:?}"),
     }
 }
+
+/// Regression — the scan was comparing RFC3339 timestamps
+/// lexicographically. Fractional seconds broke that: `.` (0x2E) < `Z`
+/// (0x5A) in ASCII, so an event at `2026-04-20T10:02:00.500Z` sorts
+/// *before* a cutoff at `2026-04-20T10:02:00Z` as strings, even though
+/// it is chronologically *after*. The fix parses both sides as
+/// `OffsetDateTime` before comparing.
+#[test]
+fn as_of_handles_fractional_second_events() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("session.jsonl");
+    let mut w = JsonlWriter::open(&path).unwrap();
+
+    write_run_started(&mut w, "2026-04-20T10:00:00Z");
+
+    // Turn at EXACTLY the cutoff (fractional-seconds zero) — included.
+    let t_before = TurnId::from("t_before".to_string());
+    write_start(&mut w, &t_before, "2026-04-20T10:01:00Z");
+    write_commit(&mut w, &t_before, Some("2026-04-20T10:02:00Z"), "a", "A");
+
+    // Turn 500ms AFTER the cutoff — must be excluded.
+    // Lexicographic compare would have included this (`.` < `Z`).
+    let t_after = TurnId::from("t_after".to_string());
+    write_start(&mut w, &t_after, "2026-04-20T10:02:00.100Z");
+    write_commit(&mut w, &t_after, Some("2026-04-20T10:02:00.500Z"), "b", "B");
+
+    drop(w);
+
+    let r = JsonlReader::open(&path);
+    let cutoff = "2026-04-20T10:02:00Z";
+    let forensic = r.forensic_as_of(cutoff).unwrap();
+
+    let committed_ids: Vec<String> = forensic
+        .iter()
+        .filter_map(|f| match &f.event {
+            SessionEvent::TurnCommitted { turn_id, .. } => Some(turn_id.as_str().to_string()),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(
+        committed_ids,
+        vec!["t_before".to_string()],
+        "only the at-or-before-cutoff turn should be visible (got {committed_ids:?})"
+    );
+}
+
+#[test]
+fn as_of_malformed_input_surfaces_error() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("session.jsonl");
+    let mut w = JsonlWriter::open(&path).unwrap();
+    write_run_started(&mut w, "2026-04-20T10:00:00Z");
+    drop(w);
+
+    let r = JsonlReader::open(&path);
+    let err = r.forensic_as_of("not-a-timestamp").unwrap_err();
+    match err {
+        azoth_core::event_store::jsonl::ProjectionError::MalformedAsOf { input, .. } => {
+            assert_eq!(input, "not-a-timestamp");
+        }
+        other => panic!("expected MalformedAsOf, got {other:?}"),
+    }
+}

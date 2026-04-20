@@ -36,6 +36,19 @@ pub enum ProjectionError {
         #[source]
         source: serde_json::Error,
     },
+    #[error("malformed as-of timestamp {input:?}: {detail}")]
+    MalformedAsOf { input: String, detail: String },
+}
+
+/// Parse an RFC3339 timestamp into an `OffsetDateTime`. Used to compare
+/// event timestamps chronologically instead of lexicographically —
+/// lexicographic comparison silently gets it wrong when fractional
+/// seconds appear on one side but not the other (e.g. cutoff
+/// `2023-11-14T22:13:20Z` vs event `2023-11-14T22:13:20.5Z`: the event
+/// sorts *before* the cutoff as strings because `.` < `Z` in ASCII,
+/// even though it is chronologically *after*).
+fn parse_rfc3339(s: &str) -> Option<time::OffsetDateTime> {
+    time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339).ok()
 }
 
 /// Append-only writer. Each `append` flushes the line to disk and fsyncs the
@@ -225,6 +238,22 @@ impl JsonlReader {
     /// `is_replayable` and consumers can't accidentally treat a dropped
     /// turn as committed.
     fn scan_as_of(&self, as_of: &str) -> Result<Scan, ProjectionError> {
+        // Parse the cutoff once. A malformed `--as-of` is a user-facing
+        // error, so surface it loudly rather than silently excluding
+        // everything.
+        let as_of_dt = parse_rfc3339(as_of).ok_or_else(|| ProjectionError::MalformedAsOf {
+            input: as_of.to_string(),
+            detail: "expected RFC3339 (e.g. 2026-04-20T10:00:00Z)".to_string(),
+        })?;
+        let le_as_of = |ts: &str| -> bool {
+            // Unparseable event timestamps exclude the turn from visibility:
+            // we can't prove chronological order, so conservative default
+            // is "not yet visible at `as_of`". In practice every runtime
+            // timestamp flows through `Clock::now_iso()` so parsing
+            // succeeds for all well-formed sessions.
+            parse_rfc3339(ts).map(|t| t <= as_of_dt).unwrap_or(false)
+        };
+
         let raw = self.scan()?;
 
         // First pass: per-turn effective terminal `at`.
@@ -250,26 +279,30 @@ impl JsonlReader {
 
         // Determine visible turns: turns with a terminal marker whose
         // effective `at` (own `at`, else `TurnStarted.timestamp`) is
-        // ≤ as_of.
+        // ≤ as_of. Comparison is chronological via parsed `OffsetDateTime`,
+        // not lexicographic — sub-second precision varies across events
+        // and the string-order fallback is silently wrong around the
+        // second boundary.
         let mut visible: std::collections::HashSet<TurnId> = std::collections::HashSet::new();
         for (turn_id, maybe_at) in &terminal_at {
             let effective = maybe_at
                 .as_deref()
                 .or_else(|| turn_started_at.get(turn_id).map(String::as_str));
             if let Some(ts) = effective {
-                if ts <= as_of {
+                if le_as_of(ts) {
                     visible.insert(turn_id.clone());
                 }
             }
         }
 
-        // Second pass: filter.
+        // Second pass: filter. Non-turn events gate on their own
+        // `timestamp`; turn events ride their turn's visibility decision.
         let events: Vec<SessionEvent> = raw
             .events
             .into_iter()
             .filter(|ev| match ev {
                 SessionEvent::RunStarted { timestamp, .. }
-                | SessionEvent::ContractAccepted { timestamp, .. } => timestamp.as_str() <= as_of,
+                | SessionEvent::ContractAccepted { timestamp, .. } => le_as_of(timestamp),
                 _ => match ev.turn_id() {
                     Some(t) => visible.contains(t),
                     None => true,
@@ -345,10 +378,12 @@ impl JsonlReader {
     /// own `timestamp` field; `TurnStarted` rides along with its turn's
     /// visibility decision.
     ///
-    /// Timestamps compare lexicographically, which is equivalent to
-    /// chronological comparison for RFC3339 strings with a fixed `Z`
-    /// offset — the format every `Clock` impl in `execution::clock`
-    /// produces.
+    /// Timestamps compare chronologically via parsed `OffsetDateTime`
+    /// (see [`scan_as_of`](Self::scan_as_of)) — the string-comparison
+    /// shortcut would be silently wrong around the second boundary
+    /// because sub-second precision in the emitted RFC3339 varies
+    /// between events. An unparseable `as_of` surfaces as
+    /// [`ProjectionError::MalformedAsOf`].
     ///
     /// The returned events carry the `non_replayable` tag under the
     /// same semantics as `forensic()` (committed-only = replayable).
@@ -516,12 +551,20 @@ impl JsonlReader {
         let scan = self.scan()?;
         // Index the last seen heartbeat per turn. Walk events forward so
         // the final assignment is the most recent heartbeat — same shape
-        // as the outcomes map.
-        let mut last_heartbeat: HashMap<TurnId, String> = HashMap::new();
+        // as the outcomes map. We carry `tokens_out` alongside the
+        // timestamp so the synthetic Stalled record can preserve the
+        // last-known token usage (runtime session budgets stay accurate
+        // after crash recovery instead of silently resetting to zero).
+        let mut last_heartbeat: HashMap<TurnId, (String, u64)> = HashMap::new();
         for ev in &scan.events {
-            if let SessionEvent::TurnHeartbeat { turn_id, at, .. } = ev {
+            if let SessionEvent::TurnHeartbeat {
+                turn_id,
+                at,
+                progress,
+            } = ev
+            {
                 if !at.is_empty() {
-                    last_heartbeat.insert(turn_id.clone(), at.clone());
+                    last_heartbeat.insert(turn_id.clone(), (at.clone(), progress.tokens_out));
                 }
             }
         }
@@ -543,16 +586,28 @@ impl JsonlReader {
         file.seek(SeekFrom::End(0))?;
         for turn_id in &dangling {
             let synthetic = match last_heartbeat.get(turn_id) {
-                Some(hb_at) => {
+                Some((hb_at, hb_tokens)) => {
                     // Heartbeat evidence exists → reclassify as Stalled.
                     // The `at` field carries the last heartbeat, not
                     // "now" — operators need to see when progress
                     // actually stopped, not when resume noticed.
+                    //
+                    // Preserve the last observed `tokens_out` from the
+                    // heartbeat. Usage is cumulative per turn, so the
+                    // final heartbeat is the closest honest estimate
+                    // of what the model actually emitted before
+                    // stalling. Saturating cast to u32: a single turn
+                    // emitting >4.2B tokens is outside any realistic
+                    // budget, clamping is safer than panicking.
+                    let output_tokens = u32::try_from(*hb_tokens).unwrap_or(u32::MAX);
                     SessionEvent::TurnAborted {
                         turn_id: turn_id.clone(),
                         reason: AbortReason::Stalled,
                         detail: Some(format!("last heartbeat at {hb_at}")),
-                        usage: Usage::default(),
+                        usage: Usage {
+                            output_tokens,
+                            ..Usage::default()
+                        },
                         at: Some(hb_at.clone()),
                     }
                 }
@@ -755,6 +810,84 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn recover_dangling_stalled_preserves_last_heartbeat_output_tokens() {
+        // A dangling turn with heartbeat evidence must reclassify as
+        // Stalled AND preserve the last observed `tokens_out` — otherwise
+        // a resuming worker that reads aggregate usage loses the tokens
+        // the model actually emitted before the stall.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let mut w = JsonlWriter::open(&path).unwrap();
+
+        let run_id = RunId::from("run_hb".to_string());
+        let contract_id = ContractId::from("ctr_hb".to_string());
+        let t1 = TurnId::from("t_hb".to_string());
+        w.append(&SessionEvent::RunStarted {
+            run_id: run_id.clone(),
+            contract_id,
+            timestamp: ts(),
+        })
+        .unwrap();
+        w.append(&SessionEvent::TurnStarted {
+            turn_id: t1.clone(),
+            run_id,
+            parent_turn: None,
+            timestamp: ts(),
+        })
+        .unwrap();
+        // Two heartbeats — the later one wins.
+        w.append(&SessionEvent::TurnHeartbeat {
+            turn_id: t1.clone(),
+            at: "2026-04-20T10:00:00Z".to_string(),
+            progress: crate::schemas::HeartbeatProgress {
+                content_blocks: 1,
+                tool_calls: 0,
+                tokens_out: 150,
+            },
+        })
+        .unwrap();
+        w.append(&SessionEvent::TurnHeartbeat {
+            turn_id: t1.clone(),
+            at: "2026-04-20T10:00:05Z".to_string(),
+            progress: crate::schemas::HeartbeatProgress {
+                content_blocks: 2,
+                tool_calls: 1,
+                tokens_out: 420,
+            },
+        })
+        .unwrap();
+        drop(w);
+
+        let r = JsonlReader::open(&path);
+        let recovered = r.recover_dangling_turns().unwrap();
+        assert_eq!(recovered, vec![t1.clone()]);
+
+        let forensic = r.forensic().unwrap();
+        let stalled = forensic
+            .iter()
+            .find_map(|f| match &f.event {
+                SessionEvent::TurnAborted {
+                    reason: AbortReason::Stalled,
+                    usage,
+                    at,
+                    ..
+                } => Some((usage.output_tokens, at.clone())),
+                _ => None,
+            })
+            .expect("synthetic TurnAborted{Stalled} should be present");
+
+        assert_eq!(
+            stalled.0, 420,
+            "output_tokens should come from latest heartbeat"
+        );
+        assert_eq!(
+            stalled.1.as_deref(),
+            Some("2026-04-20T10:00:05Z"),
+            "at should be the latest heartbeat's timestamp"
+        );
     }
 
     #[test]

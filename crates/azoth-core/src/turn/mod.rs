@@ -12,9 +12,10 @@ use crate::event_store::JsonlWriter;
 use crate::execution::{ExecutionContext, ToolDispatcher, ToolError};
 use crate::impact::DiffSource;
 use crate::schemas::{
-    AbortReason, CheckpointId, CommitOutcome, ContentBlock, Contract, Diff, EffectClass,
-    EffectCounter, EffectRecord, EffectRecordId, Message, ModelTurnRequest, RequestMetadata, Role,
-    RunId, SessionEvent, StopReason, StreamEvent, ToolDefinition, TurnId, Usage, ValidatorStatus,
+    AbortReason, CheckpointId, CommitOutcome, ContentBlock, ContentBlockStub, Contract, Diff,
+    EffectClass, EffectCounter, EffectRecord, EffectRecordId, Message, ModelTurnRequest,
+    RequestMetadata, Role, RunId, SessionEvent, StopReason, StreamEvent, ToolDefinition, TurnId,
+    Usage, ValidatorStatus,
 };
 use crate::telemetry;
 use crate::validators::{ImpactValidator, Validator};
@@ -391,6 +392,27 @@ impl<'a> TurnDriver<'a> {
             let invoke_fut = self.adapter.invoke(req, tx);
             tokio::pin!(invoke_fut);
 
+            // CP-2 streaming progress counters — reset per invoke iteration
+            // and composed with the turn-cumulative counters when the
+            // heartbeat tick builds its `HeartbeatProgress`. Without these,
+            // `content_blocks_so_far` / `tool_calls_so_far` / `total_usage`
+            // only move *after* `invoke_fut` returns, so a slow streaming
+            // call's in-flight heartbeats see no delta and the
+            // stall-detection signal stays silent during exactly the
+            // period the heartbeat exists to cover.
+            //
+            // `ContentBlockStop` is the authoritative "this block is done"
+            // signal (mirrors how the post-invoke loop counts
+            // `response.content`). `ContentBlockStart { ToolUse { .. } }`
+            // is the earliest point at which we know the block is a tool
+            // call. `MessageDelta.usage_delta.output_tokens` carries the
+            // streamed token count (adapters either stream real SSE deltas
+            // or synthesise one final delta via `emit_synthetic_stream` —
+            // both paths end up summing to the provider-reported total).
+            let mut stream_blocks_seen: u32 = 0;
+            let mut stream_tools_seen: u32 = 0;
+            let mut stream_output_tokens: u32 = 0;
+
             let invoke_result = loop {
                 tokio::select! {
                     biased;
@@ -439,16 +461,38 @@ impl<'a> TurnDriver<'a> {
                         return Ok(TurnOutcome::aborted(total_usage));
                     }
                     res = &mut invoke_fut => break res,
-                    Some(_ev) = rx.recv() => { /* drain, continue */ }
+                    Some(ev) = rx.recv() => {
+                        // Update streaming progress so the next heartbeat
+                        // tick sees real movement. Post-invoke accumulation
+                        // remains authoritative (`response.content` +
+                        // `response.usage`); these counters are reset
+                        // together with each invoke iteration.
+                        match &ev {
+                            StreamEvent::ContentBlockStart { block: ContentBlockStub::ToolUse { .. }, .. } => {
+                                stream_tools_seen = stream_tools_seen.saturating_add(1);
+                            }
+                            StreamEvent::ContentBlockStop { .. } => {
+                                stream_blocks_seen = stream_blocks_seen.saturating_add(1);
+                            }
+                            StreamEvent::MessageDelta { usage_delta, .. } => {
+                                stream_output_tokens = stream_output_tokens
+                                    .saturating_add(usage_delta.output_tokens);
+                            }
+                            _ => {}
+                        }
+                    }
                     // CP-2 heartbeat. Fires only when there is real
                     // progress since the last heartbeat — no-op throttle
                     // keeps fast turns silent. Placed last so the real
                     // adapter stream still wins tick scheduling.
                     _ = heartbeat_interval.tick() => {
                         let progress = crate::schemas::HeartbeatProgress {
-                            content_blocks: content_blocks_so_far,
-                            tool_calls: tool_calls_so_far,
-                            tokens_out: total_usage.output_tokens as u64,
+                            content_blocks: content_blocks_so_far
+                                .saturating_add(stream_blocks_seen),
+                            tool_calls: tool_calls_so_far
+                                .saturating_add(stream_tools_seen),
+                            tokens_out: (total_usage.output_tokens as u64)
+                                .saturating_add(stream_output_tokens as u64),
                         };
                         if progress != last_heartbeat_progress {
                             self.writer.append(&SessionEvent::TurnHeartbeat {
