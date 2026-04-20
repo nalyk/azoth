@@ -61,13 +61,19 @@ fn symbols_to_evidence(symbols: Vec<Symbol>, limit: usize) -> Vec<EvidenceItem> 
     symbols
         .into_iter()
         .enumerate()
-        .map(|(idx, s)| EvidenceItem {
-            label: format!("symbol {} ({})", s.name, s.kind.as_str()),
-            artifact_ref: Some(format!("{}#L{}", s.path, s.start_line)),
-            inline: None,
-            decision_weight: base.saturating_sub(idx as u32).max(1),
-            lane: Some("symbol".into()),
-            rerank_score: None,
+        .map(|(idx, s)| {
+            let valid_at = s.source_mtime;
+            EvidenceItem {
+                label: format!("symbol {} ({})", s.name, s.kind.as_str()),
+                artifact_ref: Some(format!("{}#L{}", s.path, s.start_line)),
+                inline: None,
+                decision_weight: base.saturating_sub(idx as u32).max(1),
+                lane: Some("symbol".into()),
+                rerank_score: None,
+                observed_at: None,
+                valid_at,
+                freshness: None,
+            }
         })
         .collect()
 }
@@ -105,6 +111,7 @@ mod tests {
             end_line: line,
             parent_id: None,
             language: "rust".into(),
+            source_mtime: None,
         }
     }
 

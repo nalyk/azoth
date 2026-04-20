@@ -36,6 +36,9 @@ fn with_snippet(label: &str, snippet: &str) -> EvidenceItem {
         decision_weight: 10,
         lane: None,
         rerank_score: None,
+        observed_at: None,
+        valid_at: None,
+        freshness: None,
     }
 }
 

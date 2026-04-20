@@ -43,6 +43,9 @@ fn v2_evidence_item_round_trips_with_new_fields_present() {
         decision_weight: 42,
         lane: Some("lexical".into()),
         rerank_score: Some(0.0163),
+        observed_at: None,
+        valid_at: None,
+        freshness: None,
     };
     let json = serde_json::to_string(&original).unwrap();
     let roundtripped: EvidenceItem = serde_json::from_str(&json).unwrap();
@@ -62,6 +65,9 @@ fn v2_evidence_item_with_none_lane_omits_field_on_serialize() {
         decision_weight: 1,
         lane: None,
         rerank_score: None,
+        observed_at: None,
+        valid_at: None,
+        freshness: None,
     };
     let json = serde_json::to_string(&v1_shape).unwrap();
     assert!(

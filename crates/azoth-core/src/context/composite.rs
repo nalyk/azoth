@@ -276,6 +276,9 @@ mod tests {
             decision_weight: w,
             lane: None,
             rerank_score: None,
+            observed_at: None,
+            valid_at: None,
+            freshness: None,
         }
     }
 
