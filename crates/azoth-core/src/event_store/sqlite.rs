@@ -113,6 +113,7 @@ impl SqliteMirror {
                 reason,
                 detail,
                 usage,
+                ..
             } => {
                 let run_id = self.run_id_for_upsert();
                 let label = abort_reason_label(*reason);
@@ -403,6 +404,7 @@ mod tests {
             },
             user_input: None,
             final_assistant: None,
+            at: None,
         }
     }
 
@@ -412,6 +414,7 @@ mod tests {
             reason,
             detail: Some("forced".to_string()),
             usage: Usage::default(),
+            at: None,
         }
     }
 
@@ -420,6 +423,7 @@ mod tests {
             turn_id: TurnId::from(tid.to_string()),
             reason: AbortReason::UserCancel,
             partial_usage: Default::default(),
+            at: None,
         }
     }
 

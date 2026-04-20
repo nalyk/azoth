@@ -344,6 +344,12 @@ impl JsonlReader {
                 turn_id: turn_id.clone(),
                 reason: AbortReason::Crash,
                 partial_usage: Default::default(),
+                // Chronon CP-1: honest `None` here — crash recovery
+                // runs at resume, long after the fact. Emitting
+                // "now" would be misleading; CP-2 stall detection
+                // will populate `at` from the last heartbeat when
+                // available.
+                at: None,
             };
             let line = serialize_line(&synthetic)?;
             file.write_all(line.as_bytes())?;
@@ -429,6 +435,7 @@ mod tests {
             usage: Usage::default(),
             user_input: None,
             final_assistant: None,
+            at: None,
         })
         .unwrap();
 
@@ -456,6 +463,7 @@ mod tests {
             reason: AbortReason::ValidatorFail,
             detail: Some("impact_tests".into()),
             usage: Usage::default(),
+            at: None,
         })
         .unwrap();
 

@@ -38,6 +38,7 @@ fn committed(tid: &str) -> SessionEvent {
         },
         user_input: None,
         final_assistant: None,
+        at: None,
     }
 }
 
@@ -47,6 +48,7 @@ fn aborted(tid: &str) -> SessionEvent {
         reason: AbortReason::ValidatorFail,
         detail: Some("test".to_string()),
         usage: Usage::default(),
+        at: None,
     }
 }
 

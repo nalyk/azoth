@@ -221,6 +221,7 @@ async fn rebuild_history_skips_turns_without_rehydrate_fields() {
         usage: Usage::default(),
         user_input: None,
         final_assistant: None,
+        at: None,
     })
     .unwrap();
     drop(w);

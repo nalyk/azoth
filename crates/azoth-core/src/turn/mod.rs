@@ -154,6 +154,7 @@ impl<'a> TurnDriver<'a> {
             reason,
             detail,
             usage,
+            at: Some(self.ctx.now_iso()),
         })?;
         telemetry::emit_turn_aborted(&self.run_id.0, &turn_id.0, &reason_label);
         Ok(())
@@ -308,6 +309,7 @@ impl<'a> TurnDriver<'a> {
                     turn_id: turn_id.clone(),
                     reason: AbortReason::UserCancel,
                     partial_usage: Default::default(),
+                    at: Some(self.ctx.now_iso()),
                 })?;
                 telemetry::emit_turn_interrupted(&self.run_id.0, &turn_id.0, "user_cancel");
                 return Ok(TurnOutcome::aborted(total_usage));
@@ -377,6 +379,7 @@ impl<'a> TurnDriver<'a> {
                                 input_tokens: total_usage.input_tokens,
                                 output_tokens: total_usage.output_tokens,
                             },
+                            at: Some(self.ctx.now_iso()),
                         })?;
                         telemetry::emit_turn_interrupted(&self.run_id.0, &turn_id.0, "user_cancel");
                         return Ok(TurnOutcome::aborted(total_usage));
@@ -875,6 +878,7 @@ impl<'a> TurnDriver<'a> {
                         usage: total_usage.clone(),
                         user_input: user_input_content.clone(),
                         final_assistant: Some(response.content.clone()),
+                        at: Some(self.ctx.now_iso()),
                     })?;
                     telemetry::emit_turn_committed(
                         &self.run_id.0,

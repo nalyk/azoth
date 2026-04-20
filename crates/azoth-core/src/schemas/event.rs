@@ -152,6 +152,10 @@ pub enum SessionEvent {
         /// `None` for turns written by pre-v1.5 driver versions.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         final_assistant: Option<Vec<ContentBlock>>,
+        /// Chronon CP-1: wall-clock (RFC3339 UTC) of the terminal
+        /// transition. `None` on pre-CP-1 sessions so replay stays clean.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        at: Option<String>,
     },
     TurnAborted {
         turn_id: TurnId,
@@ -160,12 +164,18 @@ pub enum SessionEvent {
         detail: Option<String>,
         #[serde(default)]
         usage: Usage,
+        /// Chronon CP-1: wall-clock of the abort. `None` on pre-CP-1.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        at: Option<String>,
     },
     TurnInterrupted {
         turn_id: TurnId,
         reason: AbortReason,
         #[serde(default)]
         partial_usage: UsageDelta,
+        /// Chronon CP-1: wall-clock of the interrupt. `None` on pre-CP-1.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        at: Option<String>,
     },
     /// A lexical/fts retrieval call completed. Emitted from retrieval
     /// call sites so the eval plane (Sprint 6) can measure precision@k

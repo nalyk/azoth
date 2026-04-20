@@ -36,6 +36,7 @@ fn committed(tid: &str, input: u32, output: u32) -> SessionEvent {
         },
         user_input: None,
         final_assistant: None,
+        at: None,
     }
 }
 
@@ -45,6 +46,7 @@ fn aborted(tid: &str, reason: AbortReason) -> SessionEvent {
         reason,
         detail: Some("forensic".to_string()),
         usage: Usage::default(),
+        at: None,
     }
 }
 

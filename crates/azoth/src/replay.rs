@@ -389,6 +389,7 @@ mod tests {
                 },
                 user_input: None,
                 final_assistant: None,
+                at: None,
             },
             SessionEvent::TurnStarted {
                 turn_id: t2.clone(),
@@ -400,6 +401,7 @@ mod tests {
                 turn_id: t2,
                 reason: AbortReason::UserCancel,
                 partial_usage: Default::default(),
+                at: None,
             },
         ]
     }
