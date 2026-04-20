@@ -413,6 +413,21 @@ impl<'a> TurnDriver<'a> {
             let mut stream_tools_seen: u32 = 0;
             let mut stream_output_tokens: u32 = 0;
 
+            // CP-2 wall-clock deadline future. Pinned once per model-invoke
+            // iteration so the select! inside the inner loop can poll it via
+            // `&mut` on every tick without re-creating the async wrapper —
+            // same pattern as `invoke_fut`. `has_deadline` captures the
+            // armed-ness test so the `async move` can consume `deadline`
+            // without blocking the select-branch guard expression.
+            let has_deadline = deadline.is_some();
+            let wall_deadline_fut = async move {
+                match deadline {
+                    Some(d) => tokio::time::sleep_until(d).await,
+                    None => std::future::pending::<()>().await,
+                }
+            };
+            tokio::pin!(wall_deadline_fut);
+
             let invoke_result = loop {
                 tokio::select! {
                     biased;
@@ -422,17 +437,27 @@ impl<'a> TurnDriver<'a> {
                     // CP-2 reminder: new branches below MUST NOT precede
                     // this one; reordering reintroduces MED-3.
                     _ = self.ctx.cancellation.wait_cancelled() => {
+                        // Fold streamed output tokens into the persisted
+                        // partial usage. `total_usage` is only accumulated
+                        // post-invoke, so any mid-stream cancellation would
+                        // otherwise drop every delta already received for
+                        // the in-flight call — understating token accounting
+                        // for exactly the turn that was cut short.
+                        let mut usage_at_abort = total_usage.clone();
+                        usage_at_abort.output_tokens = usage_at_abort
+                            .output_tokens
+                            .saturating_add(stream_output_tokens);
                         self.writer.append(&SessionEvent::TurnInterrupted {
                             turn_id: turn_id.clone(),
                             reason: AbortReason::UserCancel,
                             partial_usage: crate::schemas::UsageDelta {
-                                input_tokens: total_usage.input_tokens,
-                                output_tokens: total_usage.output_tokens,
+                                input_tokens: usage_at_abort.input_tokens,
+                                output_tokens: usage_at_abort.output_tokens,
                             },
                             at: Some(self.ctx.now_iso()),
                         })?;
                         telemetry::emit_turn_interrupted(&self.run_id.0, &turn_id.0, "user_cancel");
-                        return Ok(TurnOutcome::aborted(total_usage));
+                        return Ok(TurnOutcome::aborted(usage_at_abort));
                     }
                     // CP-2 wall-clock budget enforcement. Only armed when
                     // the active contract declares `scope.max_wall_secs`.
@@ -440,25 +465,28 @@ impl<'a> TurnDriver<'a> {
                     // before the invoke future so an overrunning adapter
                     // can't burn past the deadline via its own poll
                     // ordering.
-                    _ = async {
-                        match deadline {
-                            Some(d) => tokio::time::sleep_until(d).await,
-                            None => std::future::pending::<()>().await,
-                        }
-                    }, if deadline.is_some() => {
+                    _ = &mut wall_deadline_fut, if has_deadline => {
                         let spent = self.ctx.clock
                             .now_instant()
                             .saturating_duration_since(turn_started_instant)
                             .as_secs();
+                        // Same mid-stream-usage fix as the UserCancel
+                        // branch above — fold stream_output_tokens so the
+                        // persisted abort usage reflects tokens already
+                        // billed to us before the deadline fired.
+                        let mut usage_at_abort = total_usage.clone();
+                        usage_at_abort.output_tokens = usage_at_abort
+                            .output_tokens
+                            .saturating_add(stream_output_tokens);
                         self.record_abort(
                             &turn_id,
                             AbortReason::TimeExceeded,
                             Some(format!(
                                 "wall-clock budget {budget_secs}s exhausted (spent={spent}s)"
                             )),
-                            total_usage.clone(),
+                            usage_at_abort.clone(),
                         )?;
-                        return Ok(TurnOutcome::aborted(total_usage));
+                        return Ok(TurnOutcome::aborted(usage_at_abort));
                     }
                     res = &mut invoke_fut => break res,
                     Some(ev) = rx.recv() => {
@@ -509,11 +537,20 @@ impl<'a> TurnDriver<'a> {
             let response = match invoke_result {
                 Ok(r) => r,
                 Err(e) => {
+                    // Sibling to the UserCancel / TimeExceeded folds above.
+                    // An adapter error mid-stream leaves `response.usage`
+                    // unset, so the only token record for work already
+                    // billed to us is the streamed deltas we accumulated
+                    // in this invoke iteration.
+                    let mut usage_at_abort = total_usage.clone();
+                    usage_at_abort.output_tokens = usage_at_abort
+                        .output_tokens
+                        .saturating_add(stream_output_tokens);
                     self.record_abort(
                         &turn_id,
                         AbortReason::AdapterError,
                         Some(e.to_string()),
-                        total_usage.clone(),
+                        usage_at_abort,
                     )?;
                     return Err(TurnError::Adapter(e));
                 }

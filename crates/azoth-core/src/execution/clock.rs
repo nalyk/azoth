@@ -41,10 +41,19 @@ pub trait Clock: Send + Sync + std::fmt::Debug {
     /// Chosen over letting callers format themselves so the output format
     /// stays stable across the codebase and survives event-log replay.
     fn now_iso(&self) -> String {
-        let odt: OffsetDateTime = self.now().into();
-        odt.format(&time::format_description::well_known::Rfc3339)
-            .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
+        rfc3339_of(self.now())
     }
+}
+
+/// Format a `SystemTime` as an RFC3339 UTC string using the same fallback
+/// discipline as `Clock::now_iso`. Callers that have already captured a
+/// `SystemTime` sample should feed it here instead of re-reading the clock —
+/// otherwise the two fields can describe instants on either side of a second
+/// boundary or, under `VirtualClock`, a concurrent `advance()` call.
+pub(crate) fn rfc3339_of(st: SystemTime) -> String {
+    let odt: OffsetDateTime = st.into();
+    odt.format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
 }
 
 /// Production clock: both reads hit the OS.
