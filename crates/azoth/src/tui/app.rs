@@ -44,7 +44,7 @@ use azoth_core::schemas::{
     RunId, SessionEvent, TurnId,
 };
 use azoth_core::tools::{
-    BashTool, FsWriteTool, RepoReadFileTool, RepoReadSpansTool, RepoSearchTool,
+    BashTool, ClockTool, FsWriteTool, RepoReadFileTool, RepoReadSpansTool, RepoSearchTool,
 };
 use azoth_core::turn::TurnDriver;
 use azoth_core::validators::{
@@ -1636,6 +1636,7 @@ pub async fn run_app(resume: Option<String>) -> io::Result<()> {
         dispatcher.register(RepoReadSpansTool);
         dispatcher.register(FsWriteTool);
         dispatcher.register(BashTool);
+        dispatcher.register(ClockTool);
         let dispatcher = Arc::new(dispatcher);
 
         // Resume amnesia fix: if we're opening an existing session, rebuild
