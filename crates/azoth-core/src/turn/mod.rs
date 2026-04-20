@@ -191,7 +191,7 @@ impl<'a> TurnDriver<'a> {
                         turn_id: turn_id.clone(),
                         run_id: self.run_id.clone(),
                         parent_turn: None,
-                        timestamp: now_iso(),
+                        timestamp: self.ctx.now_iso(),
                     })?;
                     self.record_abort(
                         &turn_id,
@@ -276,7 +276,7 @@ impl<'a> TurnDriver<'a> {
                             turn_id: turn_id.clone(),
                             run_id: self.run_id.clone(),
                             parent_turn: None,
-                            timestamp: now_iso(),
+                            timestamp: self.ctx.now_iso(),
                         })?;
                         self.record_abort(
                             &turn_id,
@@ -296,7 +296,7 @@ impl<'a> TurnDriver<'a> {
             turn_id: turn_id.clone(),
             run_id: self.run_id.clone(),
             parent_turn: None,
-            timestamp: now_iso(),
+            timestamp: self.ctx.now_iso(),
         })?;
         telemetry::emit_turn_started(&self.run_id.0, &turn_id.0);
 
@@ -807,7 +807,7 @@ impl<'a> TurnDriver<'a> {
                             let mut impact_failed: Option<(String, Option<String>)> = None;
                             for report in reports {
                                 let vname = report.name.to_string();
-                                let ran_at = now_iso();
+                                let ran_at = self.ctx.now_iso();
 
                                 // Persist plan detail whenever the
                                 // validator produced one (including
@@ -958,11 +958,10 @@ fn approximate_input_tokens(req: &ModelTurnRequest) -> u32 {
     bytes.div_ceil(4) as u32
 }
 
-fn now_iso() -> String {
-    time::OffsetDateTime::now_utc()
-        .format(&time::format_description::well_known::Rfc3339)
-        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
-}
+// `fn now_iso` (pre-Chronon) lived here. All call sites now go through
+// `self.ctx.now_iso()` which delegates to the injected `Clock`. See
+// `crate::execution::clock` for rationale. Retained as comment so grep
+// for `now_iso` finds the migration point.
 
 /// Persist a tool's output content blocks to the content-addressed artifact
 /// store and return the resulting `ArtifactId` for the `ToolResult` event.

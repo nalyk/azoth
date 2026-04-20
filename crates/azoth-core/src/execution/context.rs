@@ -1,6 +1,7 @@
 //! Execution context threaded through every tool invocation.
 
 use crate::artifacts::ArtifactStore;
+use crate::execution::clock::{system_clock, Clock};
 use crate::schemas::{RunId, TurnId};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -64,6 +65,10 @@ pub struct ExecutionContext {
     /// get a fuse-overlayfs merged view rooted at this path; for now the
     /// field is informational.
     pub repo_root: std::path::PathBuf,
+    /// Canonical clock seam — every persisted timestamp and every
+    /// elapsed-since calculation on this context flows through here. See
+    /// `execution::clock` for the Chronon Plane rationale.
+    pub clock: Arc<dyn Clock>,
 }
 
 pub struct ExecutionContextBuilder {
@@ -72,11 +77,17 @@ pub struct ExecutionContextBuilder {
     artifacts: ArtifactStore,
     repo_root: std::path::PathBuf,
     cancellation: Option<CancellationToken>,
+    clock: Option<Arc<dyn Clock>>,
 }
 
 impl ExecutionContextBuilder {
     pub fn cancellation(mut self, cancellation: CancellationToken) -> Self {
         self.cancellation = Some(cancellation);
+        self
+    }
+
+    pub fn clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = Some(clock);
         self
     }
 
@@ -87,6 +98,7 @@ impl ExecutionContextBuilder {
             artifacts: self.artifacts,
             cancellation: self.cancellation.unwrap_or_default(),
             repo_root: self.repo_root,
+            clock: self.clock.unwrap_or_else(system_clock),
         }
     }
 }
@@ -104,10 +116,17 @@ impl ExecutionContext {
             artifacts,
             repo_root,
             cancellation: None,
+            clock: None,
         }
     }
 
     pub fn cancelled(&self) -> bool {
         self.cancellation.is_cancelled()
+    }
+
+    /// Shorthand for `ctx.clock.now_iso()`, the canonical way to stamp a
+    /// new SessionEvent inside core code.
+    pub fn now_iso(&self) -> String {
+        self.clock.now_iso()
     }
 }
