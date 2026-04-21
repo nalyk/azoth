@@ -17,7 +17,7 @@
 
 Every turn runs under a contract with explicit success criteria. Every side effect is classified into one of seven effect classes and budgeted against that contract. Bash runs inside a Landlock jail when you turn the sandbox on. Every run leaves a replayable JSONL event log, a SQLite mirror, and a content-addressed artifact store. The model proposes. The runtime decides.
 
-Rust workspace. Interactive TUI. Linux only. v2.0.1 ships fmt + clippy clean, the full workspace test suite green on Linux x86_64, and SLSA v1.0 build provenance attached.
+Rust workspace. Interactive TUI. Linux only. v2.0.2 ships fmt + clippy clean, the full workspace test suite green on Linux x86_64, and SLSA v1.0 build provenance attached.
 
 <p align="center">
   <a href="assets/start_screen.png"><img alt="azoth starting a fresh session — status line reads 'no contract yet', 0 turns, ctx 0%; the composer invites 'what are we building?' against the PAPER dark palette" src="assets/start_screen.png" width="100%"></a>
@@ -417,7 +417,8 @@ azoth/
 
 ## Version history
 
-- **v2.0.1** (current, main). Tier-B `stage_overlay_back` symlink-escape hardening. Three rounds: refuse symlinks whose canonical target escapes the merged view; canonicalize against `ws.merged` (not `repo_root`) so same-turn-created targets validate independently of `read_dir` order; refuse every absolute symlink target outright (absolute paths captured from `$PWD` under the ephemeral overlay mount dangle forever post-unmount).
+- **v2.0.2** (current, main). Chronon Plane — invariant #8: *time is taint, not preface*. Every persisted timestamp flows through an injected `Clock` (`SystemClock` in production, `FrozenClock` in tests, `VirtualClock` for replay). Externally-observed facts carry `(observed_at, valid_at)`. Contracts may bound wall-clock spend via `scope.max_wall_secs`; open turns emit throttled `TurnHeartbeat` events. `azoth resume --as-of <ISO8601>` reconstructs a forensic projection at any wall-clock point (m0007 adds the `turns.at` index). Seven bot-review rounds closed.
+- **v2.0.1**. Tier-B `stage_overlay_back` symlink-escape hardening. Three rounds: refuse symlinks whose canonical target escapes the merged view; canonicalize against `ws.merged` (not `repo_root`) so same-turn-created targets validate independently of `read_dir` order; refuse every absolute symlink target outright (absolute paths captured from `$PWD` under the ephemeral overlay mount dangle forever post-unmount).
 - **v2.0.0**. Composite retrieval, tree-sitter symbols, co-edit graph, TDAD impact, eval plane, sandbox Tier-A/B enforcement on bash, live-retrieval flag, seven bot-review rounds closed.
 - **v1.5**. Adapters (Anthropic OAuth + OpenAI), content-block protocol, JSONL dual projection, Tier-A/B sandbox smoke, `ContextKernel` v0, Tools + `ToolDispatcher` + `AuthorityEngine`, TUI MVP.
 
