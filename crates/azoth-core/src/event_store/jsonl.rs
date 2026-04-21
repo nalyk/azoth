@@ -237,6 +237,38 @@ impl JsonlReader {
     /// Outcomes are filtered to the visible set so downstream
     /// `is_replayable` and consumers can't accidentally treat a dropped
     /// turn as committed.
+    ///
+    /// ## Performance profile (deferred optimisation, tracked in PR #18 rounds 4/5/6)
+    ///
+    /// Gemini raised multi-pass / intermediate-HashMap memory usage on
+    /// three separate review rounds (comments 3114085221, 3114141532,
+    /// 3114298726). The concerns are real at the *library* level but
+    /// orthogonal to the v2.0.2 release gate:
+    ///
+    /// - JSONL is authoritative (CLAUDE.md CRIT-1). The m0007 SQLite
+    ///   index (landed CP-5) mirrors `turn_started` + terminal markers
+    ///   plus `turns.at`, but does **not** carry heartbeats, content
+    ///   blocks, tool results, or effect records. Those events live only
+    ///   in the JSONL stream, so `scan_as_of` has to load it to answer a
+    ///   forensic query.
+    /// - The two intermediate maps (`turn_started_at`, `terminal_at`)
+    ///   are the simplest correct shape: terminal markers can appear
+    ///   before or after the corresponding `TurnStarted` in log order
+    ///   under parallel-turn futures, so a single-pass filter would
+    ///   mis-classify turns whose terminal marker scans before their
+    ///   opener. Visible-set construction is O(turns), not O(events).
+    /// - Streaming projection wants a real benchmark harness and its
+    ///   own PR — premature without a profile showing multi-pass as the
+    ///   dominant cost. The upstream cost is the JSONL load itself
+    ///   (BufReader + line parsing + serde); the in-memory folds are
+    ///   constant-factor work over an already-materialised Vec.
+    ///
+    /// When/how to revisit: (a) `scan_as_of` shows up in a TUI hot path
+    /// (currently only CLI `azoth resume --as-of` + rail rebuild on
+    /// session open, neither per-frame) and (b) a new
+    /// `turns_at_heartbeats` SQLite index lands so the forensic
+    /// projection can ride the mirror instead of the JSONL. Either
+    /// trigger flips this to a streaming impl; neither is true today.
     fn scan_as_of(&self, as_of: &str) -> Result<Scan, ProjectionError> {
         // Parse the cutoff once. A malformed `--as-of` is a user-facing
         // error, so surface it loudly rather than silently excluding
@@ -638,6 +670,21 @@ impl JsonlReader {
             file.write_all(line.as_bytes())?;
             file.write_all(b"\n")?;
         }
+        // PR #18 round 6 (gemini MED 3114298744 — rejected with docs,
+        // NOT a fix): gemini flagged "markers not explicitly flushed or
+        // synced; consider sync_all". Empirically verified: `sync_data`
+        // IS called here, which maps to POSIX `fdatasync(2)`. For
+        // append-only JSONL the on-disk distinction is:
+        //   - `sync_data` / fdatasync → data blocks + essential metadata
+        //     (file size — needed to read the appended bytes back)
+        //   - `sync_all` / fsync → above + all metadata (mtime, atime)
+        // Recovery markers are durable after `sync_data`: a subsequent
+        // process can `File::open` the file, read its full (grown) size,
+        // and scan every appended byte. `sync_all` would add mtime
+        // persistence which we don't depend on for correctness. Keeping
+        // `sync_data` avoids the extra seek on the inode metadata block
+        // on every recovery path. Symmetric with the main-append path
+        // at line ~136 which also uses `sync_data`.
         file.sync_data()?;
         Ok(dangling)
     }
