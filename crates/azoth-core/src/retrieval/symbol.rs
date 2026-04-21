@@ -61,6 +61,16 @@ pub enum SymbolKind {
     Impl,
     Module,
     Const,
+    // v2.1 additions for Py/TS/Go grammars. Serde `rename_all =
+    // "snake_case"` keeps pre-2.1 JSONL deserialising — older sessions
+    // carry only the original eight variants. `type_alias` is the
+    // two-word wire tag.
+    Class,
+    Method,
+    Interface,
+    TypeAlias,
+    Decorator,
+    Package,
 }
 
 impl SymbolKind {
@@ -76,6 +86,12 @@ impl SymbolKind {
             SymbolKind::Impl => "impl",
             SymbolKind::Module => "module",
             SymbolKind::Const => "const",
+            SymbolKind::Class => "class",
+            SymbolKind::Method => "method",
+            SymbolKind::Interface => "interface",
+            SymbolKind::TypeAlias => "type_alias",
+            SymbolKind::Decorator => "decorator",
+            SymbolKind::Package => "package",
         }
     }
 
@@ -91,6 +107,12 @@ impl SymbolKind {
             "impl" => SymbolKind::Impl,
             "module" => SymbolKind::Module,
             "const" => SymbolKind::Const,
+            "class" => SymbolKind::Class,
+            "method" => SymbolKind::Method,
+            "interface" => SymbolKind::Interface,
+            "type_alias" => SymbolKind::TypeAlias,
+            "decorator" => SymbolKind::Decorator,
+            "package" => SymbolKind::Package,
             _ => return None,
         })
     }
@@ -163,11 +185,57 @@ mod tests {
             SymbolKind::Impl,
             SymbolKind::Module,
             SymbolKind::Const,
+            // v2.1
+            SymbolKind::Class,
+            SymbolKind::Method,
+            SymbolKind::Interface,
+            SymbolKind::TypeAlias,
+            SymbolKind::Decorator,
+            SymbolKind::Package,
         ] {
             let s = k.as_str();
             assert_eq!(SymbolKind::from_wire(s), Some(k), "tag {s} must round-trip");
         }
         assert_eq!(SymbolKind::from_wire("not_a_kind"), None);
+    }
+
+    /// Pre-2.1 sessions must still deserialise unchanged — asserts the
+    /// serde `rename_all = "snake_case"` contract is stable for every
+    /// original variant. Complements `symbol_kind_wire_round_trips`
+    /// by exercising the `serde_json` surface directly.
+    #[test]
+    fn pre_2_1_serde_tags_deserialize() {
+        for (tag, want) in [
+            ("\"function\"", SymbolKind::Function),
+            ("\"struct\"", SymbolKind::Struct),
+            ("\"enum\"", SymbolKind::Enum),
+            ("\"enum_variant\"", SymbolKind::EnumVariant),
+            ("\"trait\"", SymbolKind::Trait),
+            ("\"impl\"", SymbolKind::Impl),
+            ("\"module\"", SymbolKind::Module),
+            ("\"const\"", SymbolKind::Const),
+        ] {
+            let got: SymbolKind = serde_json::from_str(tag).expect("tag must deserialise");
+            assert_eq!(got, want, "tag {tag}");
+        }
+    }
+
+    /// v2.1 variants round-trip via serde with the documented tags.
+    #[test]
+    fn v2_1_serde_tags_round_trip() {
+        for (tag, want) in [
+            ("\"class\"", SymbolKind::Class),
+            ("\"method\"", SymbolKind::Method),
+            ("\"interface\"", SymbolKind::Interface),
+            ("\"type_alias\"", SymbolKind::TypeAlias),
+            ("\"decorator\"", SymbolKind::Decorator),
+            ("\"package\"", SymbolKind::Package),
+        ] {
+            let got: SymbolKind = serde_json::from_str(tag).expect("tag must deserialise");
+            assert_eq!(got, want);
+            let re = serde_json::to_string(&got).unwrap();
+            assert_eq!(re, tag);
+        }
     }
 
     #[tokio::test]

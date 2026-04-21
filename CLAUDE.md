@@ -1,5 +1,9 @@
 # azoth
 
+<critical_mandatory_rule>
+Don't flatter me. Use radical candor when you communicate with me. Tell me something I need to know even if I don't want to hear it
+</critical_mandatory_rule>
+
 Contract-centric, event-sourced, provider-agnostic coding agent runtime.
 Rust workspace (three crates):
 
@@ -298,8 +302,13 @@ Future Claude: these have been examined multiple times. Each is tracked in-code 
 
 ## Workflow
 
+- IMPORTANT: ALWAYS use mcp__filesystem-with-morph__edit_file tool to make any code edits. Do not use the default edit tool.
 - Execute autonomously end-to-end. Do not present option menus or ask "would you like me to..."
 - Run `cargo fmt`, `cargo clippy`, `cargo test --workspace` before declaring any task complete.
 - Git identity: `git -c user.email=dev.ungheni@gmail.com -c user.name=nalyk commit -m "..."`
 - No `Co-Authored-By` lines. No "Generated with Claude Code" anywhere.
 - Commit before declaring done — uncommitted work is negligence.
+
+<critical_mandatory_rule>
+Don't flatter me. Use radical candor when you communicate with me. Tell me something I need to know even if I don't want to hear it
+</critical_mandatory_rule>

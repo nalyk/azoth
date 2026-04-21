@@ -45,6 +45,7 @@
 //! mirror's own connection and this one coexist. Migrations are
 //! re-run defensively on open; the migrator is idempotent.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::UNIX_EPOCH;
@@ -53,6 +54,8 @@ use azoth_core::event_store::migrations;
 use azoth_core::event_store::sqlite::MirrorError;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use thiserror::Error;
+
+use crate::code_graph::{Language, ParserKey};
 
 /// Default ceiling on file size. Larger files get skipped — matches the
 /// Sprint 1 "cheap indexer" policy; Sprint 2 tree-sitter extraction may
@@ -344,11 +347,16 @@ fn reindex_blocking(
     // Prepare the symbol writer's DELETE + INSERT once for the whole
     // Phase-4 transaction (PR #6 gemini-code-assist MED — prior code
     // re-prepared both per file, burning ~1 sqlite3_prepare_v2 per
-    // writer call × files-in-pass). The Rust parser is lazily built
-    // on first Rust hit and reused for every subsequent .rs file so
-    // we pay `Parser::new` + `set_language` at most once per pass.
+    // writer call × files-in-pass). Parsers are lazily built on first
+    // hit per `ParserKey` and reused for every subsequent file that
+    // hashes to the same key, so we pay `Parser::new` + `set_language`
+    // at most once per parser flavor per pass. For PR-A only Rust is
+    // wired (one `ParserKey` slot); PRs 2.1-B/C/D extend the dispatcher
+    // in `code_graph` and the map populates itself automatically.
+    // TypeScript is path-sensitive — `.ts` and `.tsx` hash to distinct
+    // `ParserKey` variants (codex P2 on PR #19 + `code_graph::parser_key`).
     let mut symbol_writer = crate::code_graph::SymbolWriter::new(&tx)?;
-    let mut rust_parser: Option<tree_sitter::Parser> = None;
+    let mut parsers: HashMap<ParserKey, tree_sitter::Parser> = HashMap::new();
 
     let mut doc_insert = tx.prepare(
         "INSERT INTO documents (path, mtime, language, content) VALUES (?1, ?2, ?3, ?4)",
@@ -368,18 +376,22 @@ fn reindex_blocking(
             }
         }
 
-        // Sprint 2 — tree-sitter symbol extraction, Rust only. The
-        // language detector from `detect_language` names the grammar
-        // ("rust"); every other language skips the extractor until
-        // v2.1 lands the Python/TS/Go grammars. Extraction failures
-        // (bad bytes, parser error) never abort the reindex; the file
-        // simply lacks symbols this pass and gets another shot next
-        // pass.
-        if w.language == Some("rust") {
+        // Sprint 2 / v2.1-A — tree-sitter symbol extraction routed
+        // through the central `code_graph` dispatcher. Only languages
+        // recognised by `Language::from_wire` enter the extractor;
+        // non-grammar tags (markdown, toml, javascript, json, yaml,
+        // shell) fall through untouched. Inside the dispatcher,
+        // languages without a wired grammar return
+        // `ExtractError::UnsupportedLanguage` — `extract_and_store`
+        // treats that as a benign skip (no warn log) until PRs
+        // 2.1-B/C/D land. Extraction failures never abort the reindex;
+        // the file simply lacks symbols this pass.
+        if let Some(lang) = w.language.and_then(Language::from_wire) {
             stats.symbols_extracted = stats.symbols_extracted.saturating_add(extract_and_store(
                 &w.path,
                 &w.content,
-                &mut rust_parser,
+                lang,
+                &mut parsers,
                 &mut symbol_writer,
             )?);
         }
@@ -402,20 +414,101 @@ fn reindex_blocking(
     // The subquery is cheap: `symbols_by_path_line_idx` covers the
     // leading `path` column so the scan is an index lookup per row.
     // On a well-synced DB the outer query returns zero rows.
-    let backfill: Vec<(String, String)> = {
+    //
+    // **Known perf leak (gemini MED on PR #19 f41217f, accepted
+    // advisory, deferred).** This predicate conflates "never
+    // indexed for symbols" with "indexed but produced zero symbols":
+    // a Rust file that parses successfully to `vec![]` (comment-only,
+    // empty, or stub `mod.rs` re-exports) writes zero `symbols` rows
+    // on Phase-4, then re-qualifies for this backfill on every
+    // subsequent reindex pass until its content changes. I'm leaving
+    // it unfixed in 2.1-A for three reasons:
+    //
+    //   - **Scope.** PR 2.1-A is "SymbolKind extension + language
+    //     dispatcher." Schema changes belong in their own PR behind
+    //     a migration step.
+    //   - **Cost.** Each wasted re-extract is one `SELECT content`
+    //     + one tree-sitter parse + one no-op `DELETE FROM symbols
+    //     WHERE path=?`. On typical repos the empty-symbol
+    //     population is small (a handful of re-export `mod.rs`
+    //     files, test stubs) so per-pass waste is single-digit ms.
+    //     The cost scales with that population, not with repo size.
+    //   - **Origin.** I did not introduce this predicate — it shipped
+    //     in PR #6's backfill (codex P2 #4) — but I'm touching this
+    //     function this round, so the defer is mine to own.
+    //
+    // **Reopen condition.** Fix when (a) PR 2.1-B/C/D lands a grammar
+    // whose typical files often produce zero symbols (Go's
+    // `doc.go`, TypeScript `.d.ts`, Python `__init__.py`) so the
+    // empty-symbol population grows, OR (b) user-visible reindex
+    // latency on a real repo surfaces this as a hot path.
+    //
+    // **Fix shape when reopened.** Add `symbols_extracted_at INTEGER
+    // NULL` to `documents` via a new migration (`m00NN_symbols_meta.rs`).
+    // `SymbolWriter::replace` stamps `symbols_extracted_at = ?`
+    // atomically with its DELETE+INSERT. This predicate becomes
+    // `WHERE symbols_extracted_at IS NULL` — once a path is
+    // extracted (even to zero symbols), it's no longer re-fetched
+    // until its content (and thus `documents.content`) changes,
+    // which already forces a Phase-4 Update that re-stamps the
+    // column. Makes backfill idempotent without changing the
+    // healing semantics for scenarios (1) and (2) above.
+    let backfill: Vec<(String, String, String)> = {
         let mut stmt = tx.prepare(
-            "SELECT path, content FROM documents
+            "SELECT path, content, language FROM documents
              WHERE language = 'rust'
                AND path NOT IN (SELECT DISTINCT path FROM symbols)",
         )?;
-        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?;
         rows.collect::<Result<Vec<_>, _>>()?
     };
-    for (path, content) in &backfill {
+    for (path, content, lang_tag) in &backfill {
+        // Dispatch language is derived from the row's `language`
+        // column (the Phase-3 writer's source-of-truth), not
+        // hardcoded — gemini MED on PR #19 dbb5cdc. Previously
+        // `Language::Rust` was pinned here, which meant PRs 2.1-B/C/D
+        // had to remember to edit **two** places (the `WHERE`
+        // predicate AND this call) in lock-step. Now widening the
+        // predicate is sufficient; dispatch follows automatically —
+        // BUT only widen the `WHERE` predicate in the SAME PR that
+        // lands the grammar in `parser_for` + `extract_for`. Widening
+        // ahead of grammars is a per-reindex perf leak: every
+        // Python/TS/Go doc missing from `symbols` gets fetched +
+        // handed to `extract_and_store` only to return `Ok(0)` via
+        // the `UnsupportedLanguage` skip. The backfill query hits
+        // every grammarless doc on every reindex pass until a
+        // grammar lands — documented for future Claude per gemini
+        // MED on PR #19 2b9d064.
+        //
+        // `from_wire` returning `None` means a row slipped the
+        // predicate (schema drift, manual INSERT, migration desync);
+        // warn so the anomaly surfaces in ops rather than
+        // disappearing into a silent `continue` — gemini MED on PR
+        // #19 b1ddfeb. The Phase-4 loop at ~:390 uses the same
+        // `from_wire` without a warn because it runs over EVERY
+        // walked row; non-grammar tags (markdown, toml, …) hit None
+        // as the expected common case there. The asymmetry is
+        // intentional: warn where None is anomalous (WHERE-filtered),
+        // stay silent where None is expected (unfiltered walk).
+        let Some(lang) = Language::from_wire(lang_tag) else {
+            tracing::warn!(
+                path = %path,
+                lang_tag = %lang_tag,
+                "backfill: skipping document with unknown language tag (schema drift?)"
+            );
+            continue;
+        };
         stats.symbols_extracted = stats.symbols_extracted.saturating_add(extract_and_store(
             path,
             content,
-            &mut rust_parser,
+            lang,
+            &mut parsers,
             &mut symbol_writer,
         )?);
     }
@@ -445,78 +538,251 @@ fn reindex_blocking(
         [],
     )?;
 
+    // Phase 5 reconciliation — gemini MEDs on PR #19 8fc89d5 lines
+    // 389 and 459. The stale-path purge above handles paths that
+    // vanished from the walk; it does NOT handle paths that are
+    // still walked but whose `(documents.language, symbols.language)`
+    // pair is no longer valid under this binary. Two real classes
+    // of drift survive into here:
+    //
+    //   1. **Language transition on mtime-unchanged path.** The
+    //      walker gates Phase-4 on mtime, so a path whose
+    //      `documents.language` flipped from a grammar-wired tag
+    //      ('rust') to a non-grammar tag ('markdown', or NULL) —
+    //      detector drift across binary versions, admin edit of
+    //      the mirror, schema migration corner — never re-enters
+    //      `extract_and_store`, and its stale symbol rows live
+    //      forever. Rounds 6/7's UnsupportedLanguage purge only
+    //      fires when Phase-4 calls extract_and_store; unchanged
+    //      files bypass it.
+    //
+    //   2. **Downgrade from a future extractor-wired binary on
+    //      mtime-unchanged path.** A hypothetical 2.1-B binary
+    //      writes `symbols.language='python'` rows. User downgrades
+    //      to 2.1-A where Python is enumerated (in `Language`) but
+    //      not extractor-wired. An mtime-unchanged .py file never
+    //      triggers Phase-4; the backfill's `language='rust'`
+    //      predicate skips it. Stale Python symbols survive until
+    //      the file is edited.
+    //
+    // Both classes collapse into one predicate when we scope
+    // valid symbol rows to the extractor-wired set AND require a
+    // matching documents row: a symbol row is valid iff
+    //
+    //   (a) `symbols.language` is in `Language::all_extractor_wired()`
+    //       — catches class (2), and
+    //   (b) a `documents` row exists at the same `path` with the
+    //       same `language` — catches class (1).
+    //
+    // The bulk DELETE below fires after the walk-based purges so
+    // it only scans what those didn't already remove. On a
+    // fresh-consistent DB it purges zero rows; the cost is one
+    // index-assisted pass over `symbols` via `documents.path` PK.
+    //
+    // Reconciliation is intentionally a separate statement from the
+    // stale-path DELETE above: the semantics differ (walk-presence
+    // vs language-consistency), and keeping them split makes the
+    // reason each row was purged traceable through logs if we ever
+    // add per-phase counters.
+    let wired = crate::code_graph::Language::all_extractor_wired();
+    let placeholders = std::iter::repeat("?")
+        .take(wired.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "DELETE FROM symbols
+         WHERE language NOT IN ({placeholders})
+            OR NOT EXISTS (
+                SELECT 1 FROM documents d
+                WHERE d.path = symbols.path
+                  AND d.language = symbols.language
+            )"
+    );
+    let wire_params: Vec<&'static str> = wired.iter().map(|l| l.as_str()).collect();
+    let reconciled = tx.execute(
+        &sql,
+        rusqlite::params_from_iter(wire_params.iter().copied()),
+    )?;
+    if reconciled > 0 {
+        tracing::info!(
+            reconciled_rows = reconciled,
+            "indexer: reconcile pass purged stale symbol rows (language transition or downgrade)"
+        );
+    }
+
     tx.commit()?;
     Ok(stats)
 }
 
-/// Run the tree-sitter extractor for one Rust file and persist the
-/// result via the shared `SymbolWriter`. Used by both the per-file
-/// write loop and the post-loop backfill pass — the two call sites
-/// share identical extract-then-write-or-purge semantics.
+/// Run the tree-sitter extractor for one file and persist the result
+/// via the shared `SymbolWriter`. Used by both the per-file write
+/// loop and the post-loop backfill pass — the two call sites share
+/// identical extract-then-write-or-purge semantics.
 ///
-/// The lazy `Option<Parser>` stays owned by the caller so a single
-/// parser instance threads through the entire reindex pass. On
-/// parser init failure (ABI mismatch) we skip and return 0; the
-/// caller continues with its next file without the error cascading.
+/// Parser instances are cached per language in the caller-owned
+/// `parsers` map so a single `Parser::new + set_language` per
+/// language threads through the entire reindex pass. On parser init
+/// failure (ABI mismatch) or extraction failure we skip and return 0;
+/// the caller continues with its next file without the error
+/// cascading.
 ///
-/// **Codex P2 #5 (PR #6)**: on extractor failure we explicitly
-/// replace the path's symbol rows with an empty set. The module doc
-/// comment promises "symbols missing until next pass" after a parse
-/// error; leaving pre-edit rows in place would instead serve stale
-/// content as if current, contradicting that promise and corrupting
-/// retrieval. `SymbolWriter::replace` with an empty slice deletes
-/// every row for the path and inserts nothing.
+/// **v2.1-A dispatcher routing (gemini MED-3 on 830eaa5)**: grammar
+/// selection goes through `code_graph::parser_for` and
+/// `code_graph::extract_for`. Languages without a wired grammar
+/// surface as `ExtractError::UnsupportedLanguage` — treated as a
+/// benign skip (no log) because this is the expected state until PRs
+/// 2.1-B/C/D land. The noisier `ExtractError::Language` (ABI
+/// mismatch) and `ExtractError::Parse` still warn.
+///
+/// **Codex P2 #5 (PR #6) + gemini HIGH on 2b9d064 + gemini MED on
+/// 0cff561**: the uniform invariant this function upholds is *"when
+/// this function returns `Ok(0)` for `path`, the DB contains zero
+/// symbol rows for `path` with `language = lang_tag`"*. Every early
+/// `return Ok(0)` branch must therefore call
+/// `SymbolWriter::replace(path, lang_tag, &[])` (a no-op on a
+/// greenfield DB; a purge on a DB seeded by a prior binary). The four
+/// branches and why each purges:
+///
+/// - `parser_for(..) → Err(ExtractError::Language|Parse)` (ABI
+///   mismatch or parser init failure): the path *may* already have
+///   rows from a prior successful pass on a compatible grammar;
+///   purging prevents stale retrieval until the ABI is restored.
+/// - `parser_for(..) → Err(UnsupportedLanguage)`: covers the
+///   downgrade scenario — a future binary (e.g. 2.1-B with Python
+///   wired) may have written rows for this path; re-indexing on a
+///   binary where the variant exists but the grammar is not wired
+///   must clear them. `replace` is cheap on paths with no rows, so
+///   the no-op greenfield case pays <1ms per Python/TS/Go file.
+/// - `extract_for(..) → Err(ExtractError::Parse)` (syntax errors,
+///   runtime parser failure): same promise as the ABI path.
+/// - `extract_for(..) → Err(UnsupportedLanguage)`: only reachable if
+///   a future PR wires `parser_for` for a language but not
+///   `extract_for`. Defensive symmetry with the init site keeps the
+///   invariant holding even if the two dispatcher arms desync.
+///
+/// The early-return arms intentionally do not log a warning for
+/// `UnsupportedLanguage`: one log per Python/TS/Go file per reindex
+/// pass would flood stderr until PRs 2.1-B/C/D land. The purge is
+/// silent; the noisier `Err(Language|Parse)` arms still warn.
 fn extract_and_store(
     path: &str,
     content: &str,
-    rust_parser: &mut Option<tree_sitter::Parser>,
+    lang: Language,
+    parsers: &mut HashMap<ParserKey, tree_sitter::Parser>,
     symbol_writer: &mut crate::code_graph::SymbolWriter<'_>,
 ) -> Result<u32, IndexerError> {
-    let parser = match rust_parser.as_mut() {
-        Some(p) => p,
-        None => match crate::code_graph::rust_parser() {
-            Ok(p) => {
-                *rust_parser = Some(p);
-                rust_parser.as_mut().expect("just set above")
-            }
-            Err(e) => {
-                // set_language failing is catastrophic (grammar ABI
-                // mismatch) — skip this file and let the rest of the
-                // pass continue.
-                tracing::warn!(
-                    error = %e,
-                    "tree-sitter rust parser init failed; skipping path"
-                );
-                return Ok(0);
-            }
-        },
+    let lang_tag = lang.as_str();
+
+    // `parser_key` may fail if the `(language, path)` pair from the
+    // DB is internally inconsistent (data-invariant violation — see
+    // `code_graph::parser_key` doc). Treat Err the same way as every
+    // other non-success branch in this function: log loudly, purge
+    // this path's symbol rows, and return `Ok(0)`. The reindex
+    // continues for every OTHER file in the pass, which is the
+    // point of flipping from `unreachable!()` to `Result` on the
+    // 4th gemini raise in PR #19 — a corrupt row should not kill
+    // the session's whole reindex (CLAUDE.md: "SQLite mirror is a
+    // rebuildable secondary index"). Uniform invariant: when this
+    // function returns `Ok(0)`, the DB holds zero symbol rows for
+    // `path`.
+    let key = match crate::code_graph::parser_key(lang, Path::new(path)) {
+        Ok(k) => k,
+        Err(e) => {
+            tracing::error!(
+                path = %path,
+                language = %lang_tag,
+                error = %e,
+                "parser_key rejected (language, path) pair as data-invariant violation; \
+                 purging stale rows and skipping this file"
+            );
+            symbol_writer.replace(path, lang_tag, &[])?;
+            return Ok(0);
+        }
     };
-    match crate::code_graph::extract_rust(parser, content) {
-        Ok(syms) => Ok(symbol_writer.replace(path, "rust", &syms)?),
+
+    // Full `entry(key)` match (gemini MED on PR #19) — the cache is
+    // keyed by `ParserKey` so `.ts` and `.tsx` files keep distinct
+    // parsers once PR 2.1-C lands.
+    let parser = match parsers.entry(key) {
+        std::collections::hash_map::Entry::Occupied(slot) => slot.into_mut(),
+        std::collections::hash_map::Entry::Vacant(slot) => {
+            match crate::code_graph::parser_for(lang, Path::new(path)) {
+                Ok(p) => slot.insert(p),
+                Err(crate::code_graph::ExtractError::UnsupportedLanguage(_)) => {
+                    // Expected state for non-Rust languages until PRs
+                    // 2.1-B/C/D land: silent (no warn — would flood
+                    // stderr on every Python/TS/Go file) but NOT empty
+                    // — purge any rows a prior binary (e.g. 2.1-B with
+                    // Python wired) may have written for this path.
+                    // See function doc (gemini MED on PR #19 0cff561)
+                    // for the uniform invariant motivating this.
+                    symbol_writer.replace(path, lang_tag, &[])?;
+                    return Ok(0);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        path = %path,
+                        language = %lang_tag,
+                        error = %e,
+                        "tree-sitter parser init failed; purging stale rows for this path"
+                    );
+                    // Sibling to the extractor-failure branch below
+                    // (gemini HIGH on PR #19 2b9d064). Both paths end
+                    // in `Ok(0)` with a warn; both must uphold the
+                    // "symbols missing until next pass" promise, else
+                    // pre-edit rows survive as silent retrieval rot
+                    // until the file is re-touched. Round-2 introduced
+                    // the init-path warn but missed the purge — caught
+                    // at the sibling site via gemini's cross-branch
+                    // diff audit.
+                    symbol_writer.replace(path, lang_tag, &[])?;
+                    return Ok(0);
+                }
+            }
+        }
+    };
+
+    match crate::code_graph::extract_for(lang, parser, content) {
+        Ok(syms) => Ok(symbol_writer.replace(path, lang_tag, &syms)?),
+        Err(crate::code_graph::ExtractError::UnsupportedLanguage(_)) => {
+            // Dispatcher says no grammar wired; equivalent behaviour
+            // to the parser_for branch above. Reachable only if a
+            // future grammar lands parser_for but not extract_for
+            // (defensive against desync between the two arms). Purge
+            // for defensive symmetry — if a prior binary ever wrote
+            // rows for this path and the current binary rejects them
+            // via extract_for, the uniform "Ok(0) ⇒ zero rows"
+            // invariant must still hold. See function doc.
+            symbol_writer.replace(path, lang_tag, &[])?;
+            Ok(0)
+        }
         Err(e) => {
             tracing::warn!(
                 path = %path,
+                language = %lang_tag,
                 error = %e,
-                "tree-sitter rust extractor failed; purging stale rows for this path"
+                "tree-sitter extractor failed; purging stale rows for this path"
             );
-            // Replace-with-empty deletes every prior row for the path,
-            // matching the "missing until next pass" promise.
-            symbol_writer.replace(path, "rust", &[])?;
+            symbol_writer.replace(path, lang_tag, &[])?;
             Ok(0)
         }
     }
 }
 
+/// Language tag for `documents.language`. v2.1 routes grammar-wired
+/// languages through `code_graph::detect_language` so there is one
+/// source of truth for the four grammars; non-grammar tags (markdown,
+/// toml, javascript, json, yaml, shell) are still recognised here to
+/// keep `documents.language` byte-stable across v2.0 → v2.1.
 fn detect_language(path: &Path) -> Option<&'static str> {
+    if let Some(lang) = crate::code_graph::detect_language(path) {
+        return Some(lang.as_str());
+    }
     let ext = path.extension().and_then(|s| s.to_str())?;
     match ext {
-        "rs" => Some("rust"),
         "md" => Some("markdown"),
         "toml" => Some("toml"),
-        "py" => Some("python"),
-        "ts" | "tsx" => Some("typescript"),
         "js" | "jsx" => Some("javascript"),
-        "go" => Some("go"),
         "json" => Some("json"),
         "yml" | "yaml" => Some("yaml"),
         "sh" | "bash" => Some("shell"),
@@ -722,5 +988,454 @@ mod tests {
             )
             .unwrap();
         assert_eq!(n, 0, "ignored.log must be filtered by .ignore");
+    }
+
+    /// v2.1-A gemini MED-3: the indexer routes symbol extraction
+    /// through `code_graph::extract_for`/`parser_for`, so non-Rust
+    /// languages recognised by `Language::from_wire` (Python, TS, Go)
+    /// flow through the dispatcher but silently produce no symbols
+    /// until PRs 2.1-B/C/D wire their grammars. This test locks the
+    /// contract: a `.py` file is indexed as a document with
+    /// `language='python'`, but the `symbols` table carries no rows
+    /// for that path.
+    #[tokio::test]
+    async fn pending_grammar_file_indexed_without_symbols() {
+        let td = TempDir::new().unwrap();
+        let db = td.path().join("mirror.sqlite");
+        let repo = td.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(repo.join("alpha.rs"), "fn alpha() {}\n").unwrap();
+        std::fs::write(repo.join("script.py"), "def beta():\n    pass\n").unwrap();
+
+        let idx = RepoIndexer::open(&db, &repo).unwrap();
+        let stats = idx.reindex_incremental().await.unwrap();
+        assert_eq!(stats.inserted, 2, "both files inserted into documents");
+        assert_eq!(
+            stats.symbols_extracted, 1,
+            "only Rust contributes symbols; Python dispatcher arm returns UnsupportedLanguage"
+        );
+
+        let guard = idx.conn.lock().unwrap();
+        let py_doc_lang: String = guard
+            .query_row(
+                "SELECT language FROM documents WHERE path = 'script.py'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(py_doc_lang, "python");
+
+        let py_symbol_rows: i64 = guard
+            .query_row(
+                "SELECT COUNT(*) FROM symbols WHERE path = 'script.py'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            py_symbol_rows, 0,
+            "Python grammar not wired yet — no symbol rows expected"
+        );
+
+        let rs_symbol_rows: i64 = guard
+            .query_row(
+                "SELECT COUNT(*) FROM symbols WHERE path = 'alpha.rs'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            rs_symbol_rows >= 1,
+            "Rust extractor still produces at least one symbol for alpha.rs"
+        );
+    }
+
+    /// v2.1-A PR #19 round-9 (gemini MED 4th raise; reversal of my
+    /// round-6/round-8 rejections). `parser_key` now returns
+    /// `Err(LanguagePathMismatch)` instead of panicking when the
+    /// `(Language, path)` pair violates the data invariant. The
+    /// indexer's call site must translate this to log + purge +
+    /// `Ok(0)` — same uniform invariant as round-7's
+    /// UnsupportedLanguage purge. This test exercises that translation
+    /// directly: set up a minimal SymbolWriter context, call
+    /// `extract_and_store` with a corrupt `(TypeScript, "foo.go")`
+    /// pair, assert the function returns Ok(0) (no panic, reindex
+    /// pass survives) AND that pre-existing symbol rows for the
+    /// corrupt path are purged.
+    ///
+    /// Why a direct `extract_and_store` call instead of an end-to-end
+    /// reindex: in 2.1-A, no code path from `reindex_incremental`
+    /// reaches the LanguagePathMismatch arm because `detect_language`
+    /// is deterministic on path extension (Phase-4 walker can't
+    /// emit a `(TypeScript, foo.go)` pair) and the backfill's WHERE
+    /// clause is `language = 'rust'` (TypeScript rows not selected).
+    /// The Err arm becomes production-reachable in 2.1-C when the
+    /// backfill widens; until then, it's defensive + test-covered.
+    #[tokio::test]
+    async fn parser_key_mismatch_logs_purges_and_returns_ok_zero() {
+        let td = TempDir::new().unwrap();
+        let db = td.path().join("mirror.sqlite");
+        let repo = td.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        // One normal Rust file so the reindex produces a real
+        // symbol row — lets us assert "other files still indexed"
+        // after the corrupt call exercises the new error path.
+        std::fs::write(repo.join("alpha.rs"), "fn alpha() {}\n").unwrap();
+
+        let idx = RepoIndexer::open(&db, &repo).unwrap();
+        let _ = idx.reindex_incremental().await.unwrap();
+
+        // Pre-seed a symbol row for the path we're about to hand
+        // through the corrupt-pair call — simulates a prior-version
+        // binary that indexed this file and left rows behind. The
+        // round-9 purge must wipe it.
+        let corrupt_path = "src/corrupt.go";
+        {
+            let guard = idx.conn.lock().unwrap();
+            guard
+                .execute(
+                    "INSERT INTO documents (path, mtime, language, content)
+                     VALUES (?1, 0, 'typescript', 'whatever')",
+                    [corrupt_path],
+                )
+                .unwrap();
+            guard
+                .execute(
+                    "INSERT INTO symbols (name, kind, path, start_line, end_line, parent_id, language, digest)
+                     VALUES ('stale', 'function', ?1, 1, 2, NULL, 'typescript', 'stale-digest')",
+                    [corrupt_path],
+                )
+                .unwrap();
+            let n: i64 = guard
+                .query_row(
+                    "SELECT COUNT(*) FROM symbols WHERE path = ?1",
+                    [corrupt_path],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1, "pre-seed sanity: one stale row in place");
+        }
+
+        // Open a transaction over the same connection and invoke
+        // `extract_and_store` directly with the corrupt pair. This is
+        // exactly what the 2.1-C backfill will do when a row with
+        // language='typescript' + path='*.go' enters the loop.
+        {
+            let mut guard = idx.conn.lock().unwrap();
+            let tx = guard
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let mut writer = crate::code_graph::SymbolWriter::new(&tx).unwrap();
+            let mut parsers: HashMap<ParserKey, tree_sitter::Parser> = HashMap::new();
+            let out = extract_and_store(
+                corrupt_path,
+                "whatever",
+                Language::TypeScript,
+                &mut parsers,
+                &mut writer,
+            )
+            .expect("corrupt pair must not panic the reindex; it must log + purge + Ok(0)");
+            assert_eq!(
+                out, 0,
+                "Err(LanguagePathMismatch) branch returns zero symbols written"
+            );
+            drop(writer);
+            tx.commit().unwrap();
+        }
+
+        // Post-conditions: (a) corrupt path's symbol rows purged,
+        // (b) the unrelated alpha.rs row is still present (the
+        // reindex pass survived the corrupt pair instead of
+        // panicking and aborting).
+        let guard = idx.conn.lock().unwrap();
+        let corrupt_rows: i64 = guard
+            .query_row(
+                "SELECT COUNT(*) FROM symbols WHERE path = ?1",
+                [corrupt_path],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            corrupt_rows, 0,
+            "LanguagePathMismatch must purge stale rows, same uniform invariant as UnsupportedLanguage"
+        );
+        let alpha_rows: i64 = guard
+            .query_row(
+                "SELECT COUNT(*) FROM symbols WHERE path = 'alpha.rs'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            alpha_rows >= 1,
+            "unrelated files indexed before the corrupt call remain — reindex didn't die"
+        );
+    }
+
+    /// v2.1-A PR #19 round-7 gemini MED on `0cff561`: the
+    /// `UnsupportedLanguage` branches in `extract_and_store` (parser-init
+    /// site + extractor site) must purge any existing symbol rows for
+    /// the re-indexed path, not silently `return Ok(0)`. Motivating
+    /// scenario: a future binary (e.g. 2.1-B) wires Python, writes
+    /// Python symbol rows; the user downgrades back to 2.1-A where the
+    /// Python enum variant exists but the grammar is not wired. On
+    /// re-edit, `Language::from_wire("python")` → `Some(Python)` →
+    /// `extract_and_store` → `parser_for(Python)` returns
+    /// `UnsupportedLanguage`. Without the purge, the stale v2.1-B
+    /// symbol rows persist in the 2.1-A DB and corrupt retrieval until
+    /// the file is re-edited on a binary that wires Python again.
+    ///
+    /// Class lesson (see memory:
+    /// `feedback_audit_sibling_sites_on_class_bugs.md`): round-6 fixed
+    /// the same purge gap on the parser-init `Err(_)` branch by
+    /// sibling-pointing at the extractor-failure `Err(_)` branch; the
+    /// audit covered the `Err(_)` axis but missed the symmetric
+    /// `UnsupportedLanguage` axis at both sites. Structural bugs repeat
+    /// on every axis of the same sibling relation, not just the one
+    /// you happened to inspect.
+    #[tokio::test]
+    async fn unsupported_language_purges_stale_symbol_rows_on_downgrade() {
+        use std::fs::OpenOptions;
+        use std::time::{Duration, SystemTime};
+
+        let td = TempDir::new().unwrap();
+        let db = td.path().join("mirror.sqlite");
+        let repo = td.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let py = repo.join("script.py");
+        std::fs::write(&py, "def foo():\n    pass\n").unwrap();
+
+        // Pin mtime at a known ns-precision value so we can force an
+        // `Op::Update` on the second pass without relying on wall-clock
+        // drift.
+        let t0 = SystemTime::UNIX_EPOCH + Duration::new(1_700_000_000, 111_111_111);
+        OpenOptions::new()
+            .write(true)
+            .open(&py)
+            .unwrap()
+            .set_modified(t0)
+            .unwrap();
+
+        let idx = RepoIndexer::open(&db, &repo).unwrap();
+        let first = idx.reindex_incremental().await.unwrap();
+        assert_eq!(first.inserted, 1);
+        assert_eq!(
+            first.symbols_extracted, 0,
+            "2.1-A: Python grammar not wired → no symbols on fresh index"
+        );
+
+        // Simulate a prior-version binary (e.g. hypothetical 2.1-B with
+        // Python wired) having written a symbol row for this path.
+        {
+            let guard = idx.conn.lock().unwrap();
+            guard
+                .execute(
+                    "INSERT INTO symbols (name, kind, path, start_line, end_line, parent_id, language, digest)
+                     VALUES ('foo', 'function', 'script.py', 1, 2, NULL, 'python', 'stale-digest')",
+                    [],
+                )
+                .unwrap();
+            let n: i64 = guard
+                .query_row(
+                    "SELECT COUNT(*) FROM symbols WHERE path = 'script.py'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1, "pre-seeded stale symbol row must be present");
+        }
+
+        // Edit the file + bump mtime so Phase-4 sees Op::Update and
+        // hands the path to `extract_and_store`. Without the
+        // UnsupportedLanguage purge, the stale symbol row survives
+        // because `return Ok(0)` skipped `SymbolWriter::replace`.
+        std::fs::write(&py, "def bar():\n    pass\n").unwrap();
+        let t1 = SystemTime::UNIX_EPOCH + Duration::new(1_700_000_000, 999_999_999);
+        OpenOptions::new()
+            .write(true)
+            .open(&py)
+            .unwrap()
+            .set_modified(t1)
+            .unwrap();
+
+        let second = idx.reindex_incremental().await.unwrap();
+        assert_eq!(second.updated, 1, "second pass must re-touch the file");
+        assert_eq!(
+            second.symbols_extracted, 0,
+            "Python still unwired; no new symbols this pass"
+        );
+
+        let guard = idx.conn.lock().unwrap();
+        let stale_rows: i64 = guard
+            .query_row(
+                "SELECT COUNT(*) FROM symbols WHERE path = 'script.py'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            stale_rows, 0,
+            "UnsupportedLanguage must purge stale rows on re-index, not leak them"
+        );
+    }
+
+    /// Round-10 gemini MED #1 on 8fc89d5 (line 389). Covers the
+    /// **language-transition on mtime-unchanged path** class bug:
+    ///
+    ///   foo.rs is indexed as Rust → symbol rows exist.
+    ///   Something flips documents.language to 'markdown' without
+    ///   touching the file's mtime — a future binary's detector
+    ///   drift, an admin editing the mirror, or a cross-version
+    ///   re-walk that reclassifies the path.
+    ///   The walker sees mtime-unchanged → Op::Skip → Phase-4 never
+    ///   calls extract_and_store → the UnsupportedLanguage purge
+    ///   path (which is how round-6/7 fixed the *changed-file*
+    ///   downgrade case) is bypassed entirely.
+    ///
+    /// Before the Phase-5 reconciliation: stale Rust symbol rows
+    /// outlive the language transition indefinitely — retrieval
+    /// surfaces a file that no longer looks like code.
+    ///
+    /// After the reconciliation: the predicate "symbols.language
+    /// must be extractor-wired AND match a documents row with the
+    /// same path+language" fails for the transitioned path, so its
+    /// symbol rows are purged in bulk.
+    #[tokio::test]
+    async fn reconcile_purges_symbols_when_language_transitions_on_unchanged_path() {
+        let td = TempDir::new().unwrap();
+        let db = td.path().join("mirror.sqlite");
+        let repo = td.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(repo.join("foo.rs"), "fn alpha() {}\n").unwrap();
+
+        let idx = RepoIndexer::open(&db, &repo).unwrap();
+        let first = idx.reindex_incremental().await.unwrap();
+        assert!(
+            first.symbols_extracted > 0,
+            "first pass must produce Rust symbol rows to stage the transition"
+        );
+
+        // Flip documents.language to 'markdown' without touching the
+        // file — mirrors the detector-drift / admin-edit / cross-
+        // version re-walk scenario. The stored mtime stays the same,
+        // so the next walk's mtime gate will mark foo.rs as
+        // unchanged and Phase-4 will skip it entirely.
+        {
+            let guard = idx.conn.lock().unwrap();
+            guard
+                .execute(
+                    "UPDATE documents SET language = 'markdown' WHERE path = 'foo.rs'",
+                    [],
+                )
+                .unwrap();
+            let pre: i64 = guard
+                .query_row(
+                    "SELECT COUNT(*) FROM symbols WHERE path = 'foo.rs'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(
+                pre > 0,
+                "stale Rust symbol rows must exist before reconcile runs"
+            );
+        }
+
+        let second = idx.reindex_incremental().await.unwrap();
+        assert_eq!(
+            second.updated, 0,
+            "mtime-unchanged path must not re-enter Phase-4 write loop"
+        );
+        assert_eq!(second.inserted, 0, "no new inserts — same file, same mtime");
+
+        let guard = idx.conn.lock().unwrap();
+        let post: i64 = guard
+            .query_row(
+                "SELECT COUNT(*) FROM symbols WHERE path = 'foo.rs'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            post, 0,
+            "reconcile must purge Rust symbol rows after documents.language flips to a non-grammar tag"
+        );
+    }
+
+    /// Round-10 gemini MED #2 on 8fc89d5 (line 459). Covers the
+    /// **downgrade with mtime-unchanged path** class bug:
+    ///
+    ///   A hypothetical 2.1-B binary indexes foo.py into
+    ///   symbols.language='python'. User downgrades to 2.1-A where
+    ///   Python is enumerated but not extractor-wired.
+    ///   Reindex in 2.1-A: walker sees foo.py unchanged → Op::Skip
+    ///   → Phase-4 never touches it. Backfill's WHERE clause is
+    ///   `language = 'rust'` → skips foo.py too. The changed-file
+    ///   UnsupportedLanguage purge (rounds 6/7) never fires.
+    ///
+    /// The stale Python rows survive forever until someone edits
+    /// the file. Phase-5 reconciliation catches this by scoping
+    /// valid symbols to the extractor-wired set — not the broader
+    /// `Language::from_wire` set.
+    ///
+    /// Simulated by inserting a 2.1-B-shaped row directly; the
+    /// injection step is the same pattern used by
+    /// `unsupported_language_purges_stale_symbol_rows_on_downgrade`
+    /// above.
+    #[tokio::test]
+    async fn reconcile_purges_symbols_whose_language_is_not_extractor_wired() {
+        let td = TempDir::new().unwrap();
+        let db = td.path().join("mirror.sqlite");
+        let repo = td.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(repo.join("foo.py"), "def alpha():\n    pass\n").unwrap();
+
+        let idx = RepoIndexer::open(&db, &repo).unwrap();
+        let first = idx.reindex_incremental().await.unwrap();
+        assert_eq!(
+            first.symbols_extracted, 0,
+            "2.1-A: Python grammar not wired → zero symbols on fresh index"
+        );
+
+        // Inject a 2.1-B-shaped stale row on the mtime-unchanged
+        // path. Phase-4 will skip this file next pass; only Phase-5
+        // reconciliation can catch the staleness.
+        {
+            let guard = idx.conn.lock().unwrap();
+            guard
+                .execute(
+                    "INSERT INTO symbols (name, kind, path, start_line, end_line, parent_id, language, digest)
+                     VALUES ('alpha', 'function', 'foo.py', 0, 1, NULL, 'python', 'stale-downgrade')",
+                    [],
+                )
+                .unwrap();
+            let pre: i64 = guard
+                .query_row(
+                    "SELECT COUNT(*) FROM symbols WHERE path = 'foo.py'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(pre, 1, "injected downgrade artifact must be present");
+        }
+
+        let second = idx.reindex_incremental().await.unwrap();
+        assert_eq!(
+            second.updated, 0,
+            "foo.py mtime-unchanged — Phase-4 must skip, reconcile is the only purge path"
+        );
+
+        let guard = idx.conn.lock().unwrap();
+        let post: i64 = guard
+            .query_row(
+                "SELECT COUNT(*) FROM symbols WHERE path = 'foo.py'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            post, 0,
+            "reconcile must purge symbol rows whose language is not extractor-wired in this binary"
+        );
     }
 }
