@@ -438,9 +438,21 @@ fn reindex_blocking(
         // predicate AND this call) in lock-step. Now widening the
         // predicate is sufficient; dispatch follows automatically.
         // `from_wire` returning `None` means a row slipped the
-        // predicate (schema drift); skip defensively rather than
-        // unwrap.
+        // predicate (schema drift, manual INSERT, migration desync);
+        // warn so the anomaly surfaces in ops rather than
+        // disappearing into a silent `continue` — gemini MED on PR
+        // #19 b1ddfeb. The Phase-4 loop at ~:390 uses the same
+        // `from_wire` without a warn because it runs over EVERY
+        // walked row; non-grammar tags (markdown, toml, …) hit None
+        // as the expected common case there. The asymmetry is
+        // intentional: warn where None is anomalous (WHERE-filtered),
+        // stay silent where None is expected (unfiltered walk).
         let Some(lang) = Language::from_wire(lang_tag) else {
+            tracing::warn!(
+                path = %path,
+                lang_tag = %lang_tag,
+                "backfill: skipping document with unknown language tag (schema drift?)"
+            );
             continue;
         };
         stats.symbols_extracted = stats.symbols_extracted.saturating_add(extract_and_store(

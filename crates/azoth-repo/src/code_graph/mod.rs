@@ -167,24 +167,24 @@ pub fn parser_key(lang: Language, path: &Path) -> ParserKey {
         Language::TypeScript => match path.extension().and_then(|s| s.to_str()) {
             Some("tsx") => ParserKey::TypeScriptTsx,
             Some("ts") => ParserKey::TypeScriptTs,
-            // `detect_language` only routes `.ts`/`.tsx` to
-            // `Language::TypeScript` today, so reaching this arm
-            // means detection was widened (e.g. `.mts`, `.cts`)
-            // without a matching conscious choice here. Gemini MED
-            // on PR #19 dbb5cdc: a silent `_ => TypeScriptTs`
-            // default would hide that drift. `.mts` and `.cts`
-            // both parse as `LANGUAGE_TYPESCRIPT` (no JSX), so
-            // `TypeScriptTs` is the safe release-build fallback;
-            // the `debug_assert!` forces the drift to surface in
-            // CI rather than ship silently.
-            other => {
-                debug_assert!(
-                    false,
-                    "parser_key: unhandled TypeScript extension {other:?} — \
-                     widen detect_language and parser_key together"
-                );
-                ParserKey::TypeScriptTs
-            }
+            // `detect_language` and `parser_key` are a **paired
+            // invariant**: every extension admitted by the former's
+            // TypeScript arm must have a conscious landing arm here.
+            // Today the former only admits `.ts`/`.tsx`, so reaching
+            // this branch is a violation of the paired invariant —
+            // not a graceful-degradation opportunity. `unreachable!()`
+            // (gemini MED on PR #19 b1ddfeb, preferred over the
+            // round-4 `debug_assert!(false, …)` because the branch is
+            // genuinely unreachable under the current contract, and
+            // the idiomatic macro signals that to both reader and
+            // compiler). Widening `detect_language` to `.mts`/`.cts`
+            // in a future PR MUST widen this match in the same
+            // commit; CI tests that exercise the new extension will
+            // hit this panic immediately.
+            other => unreachable!(
+                "parser_key: unhandled TypeScript extension {other:?} — \
+                 widen detect_language and parser_key together"
+            ),
         },
         Language::Go => ParserKey::Go,
     }
