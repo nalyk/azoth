@@ -190,8 +190,17 @@ fn line_range(node: &Node<'_>) -> (u32, u32) {
 /// we use SHA-256 here for algorithmic stability. Truncating to 16 hex
 /// chars keeps the column narrow while leaving 64 bits of collision
 /// resistance — ample for a "did this body change" check.
+///
+/// Both indices are clamped to `bytes.len()` before slicing. Prior
+/// to PR 2.1-B round 2 only `end` was clamped; if tree-sitter's
+/// error-recovery or a between-parse-and-walk source truncation
+/// yielded a node with `start_byte > bytes.len()`, the slice would
+/// panic. Gemini flagged the sibling pattern in `python.rs` on PR
+/// #20; the audit surfaced this site too (sibling-audit feedback
+/// memory — structural bugs propagate on every copy until
+/// explicitly audited).
 fn short_digest(node: &Node<'_>, bytes: &[u8]) -> String {
-    let start = node.start_byte();
+    let start = node.start_byte().min(bytes.len());
     let end = node.end_byte().min(bytes.len());
     let slice = &bytes[start..end];
     let mut h = Sha256::new();

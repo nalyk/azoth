@@ -178,8 +178,18 @@ fn line_range(node: &Node<'_>) -> (u32, u32) {
 /// SHA-256 digest of the node's source bytes, truncated to 16 hex
 /// chars. Parity with `rust.rs::short_digest` — see that doc for
 /// rationale.
+///
+/// Both indices are clamped to `bytes.len()` before slicing (gemini
+/// MED on PR #20 2c11436). Tree-sitter guarantees `start_byte <=
+/// end_byte` on well-formed trees, so clamping both preserves the
+/// range invariant; the clamp is pure defence against pathological
+/// states (error-recovery, truncated source between parse and walk).
+/// `rust.rs::short_digest` had the same pattern and received the
+/// same fix in this round — see sibling-audit feedback memory for
+/// why inheriting a bug across sibling modules repeats on every
+/// copy until audited.
 fn short_digest(node: &Node<'_>, bytes: &[u8]) -> String {
-    let start = node.start_byte();
+    let start = node.start_byte().min(bytes.len());
     let end = node.end_byte().min(bytes.len());
     let slice = &bytes[start..end];
     let mut h = Sha256::new();
