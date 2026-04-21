@@ -181,9 +181,32 @@ pub fn parser_key(lang: Language, path: &Path) -> ParserKey {
             // in a future PR MUST widen this match in the same
             // commit; CI tests that exercise the new extension will
             // hit this panic immediately.
+            //
+            // Gemini R6 raised an adjacent concern: the `documents`
+            // table is DURABLE state, so a future binary that
+            // **narrows** `detect_language` (drops an extension) would
+            // leave old rows whose stored `language="typescript"` no
+            // longer round-trips through the current match. We
+            // deliberately prefer panic over `Option`/`Result`
+            // propagation for this scenario: the paired-invariant
+            // contract spans binary versions via a **migration** —
+            // narrowing `detect_language` requires an `m00NN_*.rs`
+            // step that purges `documents` rows for the retired
+            // extension. Reindexing without that migration step is
+            // itself a contract violation; panicking with the
+            // actionable "widen detect_language and parser_key
+            // together" message beats a silent Ok(0)-skip that would
+            // leave retrieval subtly wrong forever. The
+            // manually-edited-DB scenario is user-poisoned state,
+            // out of scope. Tests lock the happy-case mapping
+            // exhaustively (`parser_key_typescript_discriminates_tsx`
+            // + `parser_key_non_typescript_ignores_path`); the
+            // unreachable arm stays as the invariant sentinel.
             other => unreachable!(
                 "parser_key: unhandled TypeScript extension {other:?} — \
-                 widen detect_language and parser_key together"
+                 widen detect_language and parser_key together, \
+                 and add a migration to purge DB rows for any \
+                 extension removed from detect_language"
             ),
         },
         Language::Go => ParserKey::Go,

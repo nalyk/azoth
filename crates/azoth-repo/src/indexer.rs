@@ -436,7 +436,17 @@ fn reindex_blocking(
         // `Language::Rust` was pinned here, which meant PRs 2.1-B/C/D
         // had to remember to edit **two** places (the `WHERE`
         // predicate AND this call) in lock-step. Now widening the
-        // predicate is sufficient; dispatch follows automatically.
+        // predicate is sufficient; dispatch follows automatically —
+        // BUT only widen the `WHERE` predicate in the SAME PR that
+        // lands the grammar in `parser_for` + `extract_for`. Widening
+        // ahead of grammars is a per-reindex perf leak: every
+        // Python/TS/Go doc missing from `symbols` gets fetched +
+        // handed to `extract_and_store` only to return `Ok(0)` via
+        // the `UnsupportedLanguage` skip. The backfill query hits
+        // every grammarless doc on every reindex pass until a
+        // grammar lands — documented for future Claude per gemini
+        // MED on PR #19 2b9d064.
+        //
         // `from_wire` returning `None` means a row slipped the
         // predicate (schema drift, manual INSERT, migration desync);
         // warn so the anomaly surfaces in ops rather than
@@ -513,13 +523,19 @@ fn reindex_blocking(
 /// 2.1-B/C/D land. The noisier `ExtractError::Language` (ABI
 /// mismatch) and `ExtractError::Parse` still warn.
 ///
-/// **Codex P2 #5 (PR #6)**: on extractor failure we explicitly
+/// **Codex P2 #5 (PR #6) + gemini HIGH on PR #19 2b9d064**: on
+/// *either* parser-init failure (non-`UnsupportedLanguage` — e.g.
+/// tree-sitter ABI mismatch) or extractor failure, we explicitly
 /// replace the path's symbol rows with an empty set. The module doc
 /// comment promises "symbols missing until next pass" after a parse
-/// error; leaving pre-edit rows in place would instead serve stale
-/// content as if current, contradicting that promise and corrupting
-/// retrieval. `SymbolWriter::replace` with an empty slice deletes
-/// every row for the path and inserts nothing.
+/// error; that promise applies uniformly to both failure paths —
+/// leaving pre-edit rows in place would instead serve stale content
+/// as if current, corrupting retrieval until the file is edited again
+/// and the mtime gate re-admits it. `SymbolWriter::replace` with an
+/// empty slice deletes every row for the path and inserts nothing.
+/// The `UnsupportedLanguage` branches are treated as benign skips
+/// (no purge, no log) — a path whose language has no wired grammar
+/// never had symbol rows to begin with.
 fn extract_and_store(
     path: &str,
     content: &str,
@@ -546,10 +562,21 @@ fn extract_and_store(
                 }
                 Err(e) => {
                     tracing::warn!(
+                        path = %path,
                         language = %lang_tag,
                         error = %e,
-                        "tree-sitter parser init failed; skipping path"
+                        "tree-sitter parser init failed; purging stale rows for this path"
                     );
+                    // Sibling to the extractor-failure branch below
+                    // (gemini HIGH on PR #19 2b9d064). Both paths end
+                    // in `Ok(0)` with a warn; both must uphold the
+                    // "symbols missing until next pass" promise, else
+                    // pre-edit rows survive as silent retrieval rot
+                    // until the file is re-touched. Round-2 introduced
+                    // the init-path warn but missed the purge — caught
+                    // at the sibling site via gemini's cross-branch
+                    // diff audit.
+                    symbol_writer.replace(path, lang_tag, &[])?;
                     return Ok(0);
                 }
             }
