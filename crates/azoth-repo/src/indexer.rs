@@ -523,19 +523,36 @@ fn reindex_blocking(
 /// 2.1-B/C/D land. The noisier `ExtractError::Language` (ABI
 /// mismatch) and `ExtractError::Parse` still warn.
 ///
-/// **Codex P2 #5 (PR #6) + gemini HIGH on PR #19 2b9d064**: on
-/// *either* parser-init failure (non-`UnsupportedLanguage` — e.g.
-/// tree-sitter ABI mismatch) or extractor failure, we explicitly
-/// replace the path's symbol rows with an empty set. The module doc
-/// comment promises "symbols missing until next pass" after a parse
-/// error; that promise applies uniformly to both failure paths —
-/// leaving pre-edit rows in place would instead serve stale content
-/// as if current, corrupting retrieval until the file is edited again
-/// and the mtime gate re-admits it. `SymbolWriter::replace` with an
-/// empty slice deletes every row for the path and inserts nothing.
-/// The `UnsupportedLanguage` branches are treated as benign skips
-/// (no purge, no log) — a path whose language has no wired grammar
-/// never had symbol rows to begin with.
+/// **Codex P2 #5 (PR #6) + gemini HIGH on 2b9d064 + gemini MED on
+/// 0cff561**: the uniform invariant this function upholds is *"when
+/// this function returns `Ok(0)` for `path`, the DB contains zero
+/// symbol rows for `path` with `language = lang_tag`"*. Every early
+/// `return Ok(0)` branch must therefore call
+/// `SymbolWriter::replace(path, lang_tag, &[])` (a no-op on a
+/// greenfield DB; a purge on a DB seeded by a prior binary). The four
+/// branches and why each purges:
+///
+/// - `parser_for(..) → Err(ExtractError::Language|Parse)` (ABI
+///   mismatch or parser init failure): the path *may* already have
+///   rows from a prior successful pass on a compatible grammar;
+///   purging prevents stale retrieval until the ABI is restored.
+/// - `parser_for(..) → Err(UnsupportedLanguage)`: covers the
+///   downgrade scenario — a future binary (e.g. 2.1-B with Python
+///   wired) may have written rows for this path; re-indexing on a
+///   binary where the variant exists but the grammar is not wired
+///   must clear them. `replace` is cheap on paths with no rows, so
+///   the no-op greenfield case pays <1ms per Python/TS/Go file.
+/// - `extract_for(..) → Err(ExtractError::Parse)` (syntax errors,
+///   runtime parser failure): same promise as the ABI path.
+/// - `extract_for(..) → Err(UnsupportedLanguage)`: only reachable if
+///   a future PR wires `parser_for` for a language but not
+///   `extract_for`. Defensive symmetry with the init site keeps the
+///   invariant holding even if the two dispatcher arms desync.
+///
+/// The early-return arms intentionally do not log a warning for
+/// `UnsupportedLanguage`: one log per Python/TS/Go file per reindex
+/// pass would flood stderr until PRs 2.1-B/C/D land. The purge is
+/// silent; the noisier `Err(Language|Parse)` arms still warn.
 fn extract_and_store(
     path: &str,
     content: &str,
@@ -556,8 +573,13 @@ fn extract_and_store(
                 Ok(p) => slot.insert(p),
                 Err(crate::code_graph::ExtractError::UnsupportedLanguage(_)) => {
                     // Expected state for non-Rust languages until PRs
-                    // 2.1-B/C/D land; silent skip avoids log spam on
-                    // every Python/TS/Go file in the repo.
+                    // 2.1-B/C/D land: silent (no warn — would flood
+                    // stderr on every Python/TS/Go file) but NOT empty
+                    // — purge any rows a prior binary (e.g. 2.1-B with
+                    // Python wired) may have written for this path.
+                    // See function doc (gemini MED on PR #19 0cff561)
+                    // for the uniform invariant motivating this.
+                    symbol_writer.replace(path, lang_tag, &[])?;
                     return Ok(0);
                 }
                 Err(e) => {
@@ -589,7 +611,12 @@ fn extract_and_store(
             // Dispatcher says no grammar wired; equivalent behaviour
             // to the parser_for branch above. Reachable only if a
             // future grammar lands parser_for but not extract_for
-            // (defensive against desync between the two arms).
+            // (defensive against desync between the two arms). Purge
+            // for defensive symmetry — if a prior binary ever wrote
+            // rows for this path and the current binary rejects them
+            // via extract_for, the uniform "Ok(0) ⇒ zero rows"
+            // invariant must still hold. See function doc.
+            symbol_writer.replace(path, lang_tag, &[])?;
             Ok(0)
         }
         Err(e) => {
@@ -883,6 +910,113 @@ mod tests {
         assert!(
             rs_symbol_rows >= 1,
             "Rust extractor still produces at least one symbol for alpha.rs"
+        );
+    }
+
+    /// v2.1-A PR #19 round-7 gemini MED on `0cff561`: the
+    /// `UnsupportedLanguage` branches in `extract_and_store` (parser-init
+    /// site + extractor site) must purge any existing symbol rows for
+    /// the re-indexed path, not silently `return Ok(0)`. Motivating
+    /// scenario: a future binary (e.g. 2.1-B) wires Python, writes
+    /// Python symbol rows; the user downgrades back to 2.1-A where the
+    /// Python enum variant exists but the grammar is not wired. On
+    /// re-edit, `Language::from_wire("python")` → `Some(Python)` →
+    /// `extract_and_store` → `parser_for(Python)` returns
+    /// `UnsupportedLanguage`. Without the purge, the stale v2.1-B
+    /// symbol rows persist in the 2.1-A DB and corrupt retrieval until
+    /// the file is re-edited on a binary that wires Python again.
+    ///
+    /// Class lesson (see memory:
+    /// `feedback_audit_sibling_sites_on_class_bugs.md`): round-6 fixed
+    /// the same purge gap on the parser-init `Err(_)` branch by
+    /// sibling-pointing at the extractor-failure `Err(_)` branch; the
+    /// audit covered the `Err(_)` axis but missed the symmetric
+    /// `UnsupportedLanguage` axis at both sites. Structural bugs repeat
+    /// on every axis of the same sibling relation, not just the one
+    /// you happened to inspect.
+    #[tokio::test]
+    async fn unsupported_language_purges_stale_symbol_rows_on_downgrade() {
+        use std::fs::OpenOptions;
+        use std::time::{Duration, SystemTime};
+
+        let td = TempDir::new().unwrap();
+        let db = td.path().join("mirror.sqlite");
+        let repo = td.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let py = repo.join("script.py");
+        std::fs::write(&py, "def foo():\n    pass\n").unwrap();
+
+        // Pin mtime at a known ns-precision value so we can force an
+        // `Op::Update` on the second pass without relying on wall-clock
+        // drift.
+        let t0 = SystemTime::UNIX_EPOCH + Duration::new(1_700_000_000, 111_111_111);
+        OpenOptions::new()
+            .write(true)
+            .open(&py)
+            .unwrap()
+            .set_modified(t0)
+            .unwrap();
+
+        let idx = RepoIndexer::open(&db, &repo).unwrap();
+        let first = idx.reindex_incremental().await.unwrap();
+        assert_eq!(first.inserted, 1);
+        assert_eq!(
+            first.symbols_extracted, 0,
+            "2.1-A: Python grammar not wired → no symbols on fresh index"
+        );
+
+        // Simulate a prior-version binary (e.g. hypothetical 2.1-B with
+        // Python wired) having written a symbol row for this path.
+        {
+            let guard = idx.conn.lock().unwrap();
+            guard
+                .execute(
+                    "INSERT INTO symbols (name, kind, path, start_line, end_line, parent_id, language, digest)
+                     VALUES ('foo', 'function', 'script.py', 1, 2, NULL, 'python', 'stale-digest')",
+                    [],
+                )
+                .unwrap();
+            let n: i64 = guard
+                .query_row(
+                    "SELECT COUNT(*) FROM symbols WHERE path = 'script.py'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1, "pre-seeded stale symbol row must be present");
+        }
+
+        // Edit the file + bump mtime so Phase-4 sees Op::Update and
+        // hands the path to `extract_and_store`. Without the
+        // UnsupportedLanguage purge, the stale symbol row survives
+        // because `return Ok(0)` skipped `SymbolWriter::replace`.
+        std::fs::write(&py, "def bar():\n    pass\n").unwrap();
+        let t1 = SystemTime::UNIX_EPOCH + Duration::new(1_700_000_000, 999_999_999);
+        OpenOptions::new()
+            .write(true)
+            .open(&py)
+            .unwrap()
+            .set_modified(t1)
+            .unwrap();
+
+        let second = idx.reindex_incremental().await.unwrap();
+        assert_eq!(second.updated, 1, "second pass must re-touch the file");
+        assert_eq!(
+            second.symbols_extracted, 0,
+            "Python still unwired; no new symbols this pass"
+        );
+
+        let guard = idx.conn.lock().unwrap();
+        let stale_rows: i64 = guard
+            .query_row(
+                "SELECT COUNT(*) FROM symbols WHERE path = 'script.py'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            stale_rows, 0,
+            "UnsupportedLanguage must purge stale rows on re-index, not leak them"
         );
     }
 }
