@@ -43,6 +43,20 @@ pub enum AbortReason {
     /// available in v2 (Tier C/D) or a runtime dependency is
     /// missing. The turn never dispatched the tool.
     SandboxDenied,
+    /// Chronon CP-2: the contract's `scope.max_wall_secs` budget was
+    /// exhausted mid-turn. Deterministic stop requested by the
+    /// TurnDriver's wall-clock race, distinct from `TokenBudget`
+    /// (turn-count exhaustion) and `ModelTruncated` (provider stop
+    /// reason). Detail field carries the budget and actual spent
+    /// seconds so operators can choose between "raise budget" and
+    /// "split work."
+    TimeExceeded,
+    /// Chronon CP-2: an in-flight turn stopped emitting heartbeats
+    /// for longer than the configured stall threshold. Resume-time
+    /// reclassification of a dangling turn whose last event trail
+    /// includes a heartbeat older than the threshold; for fresh
+    /// sessions with no heartbeats this still reads as `Crash`.
+    Stalled,
 }
 
 /// Union of every line that can appear in a session's JSONL log.
@@ -152,6 +166,10 @@ pub enum SessionEvent {
         /// `None` for turns written by pre-v1.5 driver versions.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         final_assistant: Option<Vec<ContentBlock>>,
+        /// Chronon CP-1: wall-clock (RFC3339 UTC) of the terminal
+        /// transition. `None` on pre-CP-1 sessions so replay stays clean.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        at: Option<String>,
     },
     TurnAborted {
         turn_id: TurnId,
@@ -160,12 +178,18 @@ pub enum SessionEvent {
         detail: Option<String>,
         #[serde(default)]
         usage: Usage,
+        /// Chronon CP-1: wall-clock of the abort. `None` on pre-CP-1.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        at: Option<String>,
     },
     TurnInterrupted {
         turn_id: TurnId,
         reason: AbortReason,
         #[serde(default)]
         partial_usage: UsageDelta,
+        /// Chronon CP-1: wall-clock of the interrupt. `None` on pre-CP-1.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        at: Option<String>,
     },
     /// A lexical/fts retrieval call completed. Emitted from retrieval
     /// call sites so the eval plane (Sprint 6) can measure precision@k
@@ -282,6 +306,33 @@ pub enum SessionEvent {
         #[serde(default, skip_serializing_if = "String::is_empty")]
         task_id: String,
     },
+    /// Chronon CP-2 heartbeat. Emitted by the TurnDriver on a throttled
+    /// cadence during an open turn so operators (and the forensic
+    /// projection) can distinguish "turn is alive and working" from
+    /// "turn hung / crashed / deadlocked." `progress` tallies what the
+    /// driver has produced since the previous heartbeat; if all three
+    /// counters are zero the driver skips the heartbeat entirely (no-op
+    /// throttle). Stored wall-clock via `at`, so replay is coherent.
+    TurnHeartbeat {
+        turn_id: TurnId,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        at: String,
+        progress: HeartbeatProgress,
+    },
+}
+
+/// Progress tally carried on each heartbeat. All fields are cumulative
+/// since the turn opened, not deltas since the last heartbeat — makes
+/// stall-detection arithmetic trivial (compare to the previous
+/// heartbeat's counters to see whether anything moved).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct HeartbeatProgress {
+    #[serde(default)]
+    pub content_blocks: u32,
+    #[serde(default)]
+    pub tool_calls: u32,
+    #[serde(default)]
+    pub tokens_out: u64,
 }
 
 impl SessionEvent {
@@ -308,7 +359,8 @@ impl SessionEvent {
             | RetrievalQueried { turn_id, .. }
             | SymbolResolved { turn_id, .. }
             | ImpactComputed { turn_id, .. }
-            | EvalSampled { turn_id, .. } => Some(turn_id),
+            | EvalSampled { turn_id, .. }
+            | TurnHeartbeat { turn_id, .. } => Some(turn_id),
         }
     }
 

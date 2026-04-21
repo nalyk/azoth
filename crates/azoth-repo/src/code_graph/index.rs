@@ -155,6 +155,11 @@ fn row_to_symbol(row: &rusqlite::Row<'_>) -> rusqlite::Result<Symbol> {
         end_line: row.get::<_, i64>(5)? as u32,
         parent_id: parent_id.map(SymbolId),
         language: row.get(7)?,
+        // CP-3: leaving source_mtime None here keeps the existing
+        // symbol-query hot path untouched. The FTS lane already
+        // plumbs valid_at via its documents JOIN; symbols can be
+        // enriched in a follow-up with `JOIN documents ON path`.
+        source_mtime: None,
     })
 }
 

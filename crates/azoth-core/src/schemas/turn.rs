@@ -43,7 +43,7 @@ pub struct WorkingSetItem {
 /// provenance (which backend produced it) and a post-rerank score for
 /// forensic replay. Both carry `#[serde(default)]` so v1.5 JSONL
 /// sessions deserialise unchanged (risk ledger #1 — schema stability).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct EvidenceItem {
     pub label: String,
     pub artifact_ref: Option<String>,
@@ -58,6 +58,25 @@ pub struct EvidenceItem {
     /// identity reranker is used or on pre-v2 items.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rerank_score: Option<f32>,
+    /// Chronon CP-3: Unix epoch seconds — when Azoth actually read
+    /// this evidence from its source. Populated at the retrieval
+    /// boundary. `None` on pre-CP-3 items.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_at: Option<u64>,
+    /// Chronon CP-3: Unix epoch seconds — when the source was last
+    /// known good. For FTS5/symbol items this is the file's mtime;
+    /// for co-edit items, the most recent commit touching the pair;
+    /// for API-sourced items, the `Date` header. `None` when the
+    /// source cannot provide a validity timestamp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_at: Option<u64>,
+    /// Chronon CP-3: normalized freshness score in `[0.0, 1.0]`. 1.0
+    /// means "as fresh as possible"; 0.0 means "decayed beyond the
+    /// configured half-life horizon." Populated by the composite
+    /// collector using `(now - valid_at) / half_life` → exp decay.
+    /// `None` when `valid_at` is also None or decay is disabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub freshness: Option<f32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -113,6 +113,11 @@ pub struct Symbol {
     pub parent_id: Option<SymbolId>,
     /// Stable language tag mirroring `documents.language` (`rust`, etc.).
     pub language: String,
+    /// Chronon CP-3: Unix epoch seconds — source mtime at index
+    /// time (read from `documents.mtime_nanos / 1e9`). `None` on
+    /// pre-CP-3 sessions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_mtime: Option<u64>,
 }
 
 /// Retrieval surface. Two affordances cover what Sprint 4's composite

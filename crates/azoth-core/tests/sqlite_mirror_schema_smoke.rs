@@ -38,6 +38,7 @@ fn committed(tid: &str) -> SessionEvent {
         },
         user_input: None,
         final_assistant: None,
+        at: None,
     }
 }
 
@@ -47,6 +48,7 @@ fn aborted(tid: &str) -> SessionEvent {
         reason: AbortReason::ValidatorFail,
         detail: Some("test".to_string()),
         usage: Usage::default(),
+        at: None,
     }
 }
 
@@ -76,8 +78,8 @@ fn fresh_open_creates_v1_schema_and_accepts_terminal_events() {
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
     assert_eq!(
-        user_version, 6,
-        "Sprint 6 ships m0006 (eval_runs) on top of m0005 (test_impact) / m0004 (co_edit_edges) / m0003 (symbols) / m0002 (FTS) / m0001 (turns)"
+        user_version, 7,
+        "Chronon CP-5 ships m0007 (turns.at + turns_by_at) on top of m0006 (eval_runs) / m0005 (test_impact) / m0004 (co_edit_edges) / m0003 (symbols) / m0002 (FTS) / m0001 (turns)"
     );
 
     let mut cols: Vec<String> = {
@@ -91,6 +93,7 @@ fn fresh_open_creates_v1_schema_and_accepts_terminal_events() {
     assert_eq!(
         cols,
         vec![
+            "at",
             "cache_creation_tokens",
             "cache_read_tokens",
             "detail",
@@ -115,6 +118,16 @@ fn fresh_open_creates_v1_schema_and_accepts_terminal_events() {
         )
         .unwrap();
     assert_eq!(index_exists, 1);
+
+    // Chronon CP-5: the at-index backs forensic as-of queries.
+    let at_index_exists: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='turns_by_at'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(at_index_exists, 1, "m0007 turns_by_at index must exist");
 }
 
 #[test]

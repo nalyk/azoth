@@ -185,6 +185,7 @@ async fn drive_with_impact(
             approval_bridge: approval_tx,
             contract: Some(contract_ref),
             turns_completed: 0,
+            run_started_tokio: None,
             kernel: None,
             validators: &[],
             effects_consumed: &mut effects,

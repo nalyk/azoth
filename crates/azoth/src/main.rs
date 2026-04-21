@@ -25,6 +25,12 @@ enum Command {
     Resume {
         /// The `run_id` of the session file to reopen.
         run_id: String,
+        /// Chronon CP-5: resume in read-only mode at a wall-clock cutoff.
+        /// Only turns terminated at or before `<ISO8601>` are hydrated;
+        /// new turns are suppressed. Format: RFC3339 UTC, e.g.
+        /// `2026-04-20T15:42:00Z`.
+        #[arg(long, value_name = "ISO8601")]
+        as_of: Option<String>,
     },
     /// Render a prior session's JSONL log to stdout. Replayable projection by
     /// default; pass `--forensic` to include aborted/interrupted turns.
@@ -142,8 +148,8 @@ fn main() {
     }
 
     match cli.command.unwrap_or(Command::Tui) {
-        Command::Tui => run_tui(None),
-        Command::Resume { run_id } => run_tui(Some(run_id)),
+        Command::Tui => run_tui(None, None),
+        Command::Resume { run_id, as_of } => run_tui(Some(run_id), as_of),
         Command::Replay {
             run_id,
             forensic,
@@ -230,17 +236,31 @@ fn main() {
     }
 }
 
-fn run_tui(resume: Option<String>) {
+fn run_tui(resume: Option<String>, as_of: Option<String>) {
+    if as_of.is_some() && resume.is_none() {
+        eprintln!("--as-of requires a run_id (use: azoth resume <run_id> --as-of <iso8601>)");
+        std::process::exit(2);
+    }
+    // Validate RFC3339 shape up front: the forensic projection compares
+    // timestamps chronologically (not lexicographically), and a malformed
+    // cutoff would otherwise silently exclude every turn. Surfacing here
+    // gives the operator an actionable error before the TUI even opens.
+    if let Some(t) = as_of.as_deref() {
+        if time::OffsetDateTime::parse(t, &time::format_description::well_known::Rfc3339).is_err() {
+            eprintln!("malformed --as-of {t:?}: expected RFC3339 (e.g. 2026-04-20T10:00:00Z)");
+            std::process::exit(2);
+        }
+    }
     #[cfg(feature = "tui")]
     {
-        if let Err(e) = tui::run(resume) {
+        if let Err(e) = tui::run(resume, as_of) {
             eprintln!("tui error: {e}");
             std::process::exit(1);
         }
     }
     #[cfg(not(feature = "tui"))]
     {
-        let _ = resume;
+        let _ = (resume, as_of);
         eprintln!("this build was compiled without the `tui` feature");
         std::process::exit(2);
     }

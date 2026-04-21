@@ -97,6 +97,7 @@ async fn driver_honors_persisted_contract_round_trip() {
             approval_bridge: approval_tx,
             contract: Some(&rehydrated),
             turns_completed: 0,
+            run_started_tokio: None,
             kernel: None,
             validators: &[],
             effects_consumed: &mut effects,
@@ -178,6 +179,7 @@ async fn driver_aborts_when_contract_max_turns_reached() {
             contract: Some(&maxed),
             // Already at the limit — the next call must abort.
             turns_completed: 1,
+            run_started_tokio: None,
             kernel: None,
             validators: &[],
             effects_consumed: &mut effects,

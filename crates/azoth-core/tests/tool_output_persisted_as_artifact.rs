@@ -97,6 +97,7 @@ async fn tool_result_event_carries_artifact_id_and_blob_lands_on_disk() {
             approval_bridge: approval_tx,
             contract: None,
             turns_completed: 0,
+            run_started_tokio: None,
             kernel: None,
             validators: &[],
             effects_consumed: &mut effects,

@@ -144,6 +144,9 @@ mod tests {
             decision_weight: w,
             lane: lane.map(|s| s.into()),
             rerank_score: None,
+            observed_at: None,
+            valid_at: None,
+            freshness: None,
         }
     }
 

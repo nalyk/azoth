@@ -121,6 +121,14 @@ impl EvidenceCollector for GraphEvidenceCollector {
                             decision_weight: decision_weight.max(1),
                             lane: Some("graph".into()),
                             rerank_score: None,
+                            // CP-3: co-edit graph has no per-pair
+                            // mtime handy in the current schema;
+                            // populating valid_at from last commit
+                            // time is deferred until co_edit_edges
+                            // carries it (future sprint).
+                            observed_at: None,
+                            valid_at: None,
+                            freshness: None,
                         });
                     }
                 }

@@ -188,6 +188,7 @@ async fn hostile_symbol_name_flows_byte_verbatim_to_evidence_lane() {
         end_line: 1,
         parent_id: None,
         language: "rust".into(),
+        source_mtime: None,
     };
     let coll = SymbolEvidenceCollector::new(Arc::new(ScriptedSymbols {
         hits: vec![hostile],
@@ -221,6 +222,7 @@ async fn path_traversal_in_symbol_path_is_not_canonicalised_away() {
         end_line: 42,
         parent_id: None,
         language: "rust".into(),
+        source_mtime: None,
     };
     let coll = SymbolEvidenceCollector::new(Arc::new(ScriptedSymbols {
         hits: vec![hostile],
@@ -248,6 +250,7 @@ async fn hostile_fts_snippet_is_tagged_lexical_and_byte_preserved() {
         start_line: 7,
         end_line: 7,
         snippet: hostile_snip.to_string(),
+        source_mtime: None,
     };
     let retrieval = Arc::new(ScriptedLexical { hits: vec![span] });
     let coll = LexicalEvidenceCollector::new(retrieval as Arc<dyn LexicalRetrieval>);
@@ -284,6 +287,7 @@ async fn control_bytes_in_symbol_name_survive_into_evidence() {
         end_line: 1,
         parent_id: None,
         language: "rust".into(),
+        source_mtime: None,
     };
     let coll = SymbolEvidenceCollector::new(Arc::new(ScriptedSymbols {
         hits: vec![hostile],

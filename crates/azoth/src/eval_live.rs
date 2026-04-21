@@ -318,6 +318,9 @@ mod tests {
             decision_weight: w,
             lane: None,
             rerank_score: None,
+            observed_at: None,
+            valid_at: None,
+            freshness: None,
         }
     }
 
@@ -329,6 +332,9 @@ mod tests {
             decision_weight: w,
             lane: None,
             rerank_score: None,
+            observed_at: None,
+            valid_at: None,
+            freshness: None,
         }
     }
 
@@ -354,6 +360,9 @@ mod tests {
             decision_weight: 7,
             lane: Some("graph".into()),
             rerank_score: None,
+            observed_at: None,
+            valid_at: None,
+            freshness: None,
         };
         let got = extract_path(&item).unwrap();
         assert_eq!(got, "crates/azoth-core/src/execution/dispatcher.rs");

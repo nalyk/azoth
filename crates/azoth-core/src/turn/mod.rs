@@ -12,9 +12,10 @@ use crate::event_store::JsonlWriter;
 use crate::execution::{ExecutionContext, ToolDispatcher, ToolError};
 use crate::impact::DiffSource;
 use crate::schemas::{
-    AbortReason, CheckpointId, CommitOutcome, ContentBlock, Contract, Diff, EffectClass,
-    EffectCounter, EffectRecord, EffectRecordId, Message, ModelTurnRequest, RequestMetadata, Role,
-    RunId, SessionEvent, StopReason, StreamEvent, ToolDefinition, TurnId, Usage, ValidatorStatus,
+    AbortReason, CheckpointId, CommitOutcome, ContentBlock, ContentBlockStub, Contract, Diff,
+    EffectClass, EffectCounter, EffectRecord, EffectRecordId, Message, ModelTurnRequest,
+    RequestMetadata, Role, RunId, SessionEvent, StopReason, StreamEvent, ToolDefinition, TurnId,
+    Usage, ValidatorStatus,
 };
 use crate::telemetry;
 use crate::validators::{ImpactValidator, Validator};
@@ -83,6 +84,17 @@ pub struct TurnDriver<'a> {
     /// The caller owns this counter and increments it after a successful
     /// `drive_turn`; the driver compares it against `contract.scope.max_turns`.
     pub turns_completed: u32,
+    /// Optional run-start anchor on the **tokio** timer, captured once at
+    /// the beginning of the session and reused across every `drive_turn`
+    /// call. When `Some`, `scope.max_wall_secs` is enforced as an
+    /// absolute deadline (`anchor + budget`) so a 60s session budget
+    /// caps the entire run — not just each turn in isolation. When
+    /// `None`, the deadline resets per turn (legacy behaviour kept
+    /// intact for unit tests that only exercise one turn). Production
+    /// paths MUST pass `Some(tokio::time::Instant::now())` captured
+    /// once before the worker loop, otherwise `max_wall_secs` silently
+    /// degrades to a per-turn cap.
+    pub run_started_tokio: Option<tokio::time::Instant>,
     /// Optional `ContextKernel` used to compile a per-turn `ContextPacket`.
     /// When both `contract` and `kernel` are `Some`, the driver invokes
     /// `kernel.compile` once at the start of every `drive_turn` and shadows
@@ -139,6 +151,60 @@ pub struct TurnDriver<'a> {
     pub diff_source: Option<&'a dyn DiffSource>,
 }
 
+/// Fold per-invoke streamed usage deltas into a base `Usage` snapshot,
+/// returning a new `Usage`. Every mid-invoke abort branch — UserCancel,
+/// TimeExceeded, AdapterError — persists its usage *before* `invoke_fut`
+/// completes, so `response.usage` never lands; these streaming counters
+/// are the only token record for the in-flight call. Saturating-add keeps
+/// accounting bounded under pathological adapter output without panicking.
+fn usage_with_stream(base: &Usage, streamed_in: u32, streamed_out: u32) -> Usage {
+    let mut u = base.clone();
+    u.input_tokens = u.input_tokens.saturating_add(streamed_in);
+    u.output_tokens = u.output_tokens.saturating_add(streamed_out);
+    u
+}
+
+/// Format the `wall-clock budget …s exhausted …` detail string attached to
+/// a `TurnAborted{TimeExceeded}` record. Run-scoped number is the headline;
+/// turn-scoped number is appended only when they differ (multi-turn run
+/// aborted on a later turn). Extracted so the inner-select branch and the
+/// per-await race wrappers emit byte-identical detail.
+fn format_wall_timeout_detail(budget_secs: u64, run_spent: u64, turn_spent: u64) -> String {
+    if turn_spent == run_spent {
+        format!("wall-clock budget {budget_secs}s exhausted (spent={run_spent}s)")
+    } else {
+        format!(
+            "wall-clock budget {budget_secs}s exhausted \
+             (run_spent={run_spent}s, this_turn={turn_spent}s)"
+        )
+    }
+}
+
+/// Race `fut` against the wall deadline. Returns `Ok(T)` when the future
+/// completes first, `Err(())` when the deadline fires. Callers treat
+/// `Err(())` as a TimeExceeded signal and abort via
+/// `record_wall_timeout_abort`.
+///
+/// `biased; res = fut` wins ties so an await that's already ready at the
+/// deadline instant still gets to succeed (deadline treats "≤ d" as
+/// exhausted, the future gets to complete).
+///
+/// When `deadline` is `None`, this degenerates to `fut.await` — zero
+/// overhead for contracts that don't declare `scope.max_wall_secs`.
+async fn race_wall_deadline<F, T>(fut: F, deadline: Option<tokio::time::Instant>) -> Result<T, ()>
+where
+    F: std::future::Future<Output = T>,
+{
+    match deadline {
+        Some(d) => tokio::select! {
+            biased;
+            res = fut => Ok(res),
+            _ = tokio::time::sleep_until(d) => Err(()),
+        },
+        None => Ok(fut.await),
+    }
+}
+
 impl<'a> TurnDriver<'a> {
     /// Append a `TurnAborted` marker with the given reason and detail.
     fn record_abort(
@@ -154,9 +220,49 @@ impl<'a> TurnDriver<'a> {
             reason,
             detail,
             usage,
+            at: Some(self.ctx.now_iso()),
         })?;
         telemetry::emit_turn_aborted(&self.run_id.0, &turn_id.0, &reason_label);
         Ok(())
+    }
+
+    /// Record a `TurnAborted{TimeExceeded}` marker, common to every
+    /// wall-deadline fire site (inner-select invoke race + per-await race
+    /// wrappers around approval wait / tool dispatch / diff source /
+    /// impact validators). Returns the usage snapshot to attach to the
+    /// `TurnOutcome::aborted` the caller returns.
+    ///
+    /// PR #18 round 6 (codex P1 3114300370): pre-fix the wall deadline
+    /// only raced the per-invoke `select!`, so once control entered the
+    /// `StopReason::ToolUse` arm (tool dispatch, approval wait, validator
+    /// diff) the deadline effectively paused. A `bash` command, slow
+    /// approval, or large-repo diff could run far past `max_wall_secs`.
+    /// Every long-await site now routes through `race_wall_deadline` +
+    /// this helper so the session budget is honoured across the entire
+    /// turn, not just the invoke portion.
+    #[allow(clippy::too_many_arguments)]
+    fn record_wall_timeout_abort(
+        &mut self,
+        turn_id: &TurnId,
+        deadline_anchor: tokio::time::Instant,
+        turn_started_tokio: tokio::time::Instant,
+        budget_secs: u64,
+        total_usage: &Usage,
+        stream_input_tokens: u32,
+        stream_output_tokens: u32,
+    ) -> Result<Usage, std::io::Error> {
+        let run_spent = deadline_anchor.elapsed().as_secs();
+        let turn_spent = turn_started_tokio.elapsed().as_secs();
+        let detail = format_wall_timeout_detail(budget_secs, run_spent, turn_spent);
+        let usage_at_abort =
+            usage_with_stream(total_usage, stream_input_tokens, stream_output_tokens);
+        self.record_abort(
+            turn_id,
+            AbortReason::TimeExceeded,
+            Some(detail),
+            usage_at_abort.clone(),
+        )?;
+        Ok(usage_at_abort)
     }
 
     /// Drive a single turn. `messages` is the conversation tail the Context
@@ -191,7 +297,7 @@ impl<'a> TurnDriver<'a> {
                         turn_id: turn_id.clone(),
                         run_id: self.run_id.clone(),
                         parent_turn: None,
-                        timestamp: now_iso(),
+                        timestamp: self.ctx.now_iso(),
                     })?;
                     self.record_abort(
                         &turn_id,
@@ -276,7 +382,7 @@ impl<'a> TurnDriver<'a> {
                             turn_id: turn_id.clone(),
                             run_id: self.run_id.clone(),
                             parent_turn: None,
-                            timestamp: now_iso(),
+                            timestamp: self.ctx.now_iso(),
                         })?;
                         self.record_abort(
                             &turn_id,
@@ -296,11 +402,115 @@ impl<'a> TurnDriver<'a> {
             turn_id: turn_id.clone(),
             run_id: self.run_id.clone(),
             parent_turn: None,
-            timestamp: now_iso(),
+            timestamp: self.ctx.now_iso(),
         })?;
         telemetry::emit_turn_started(&self.run_id.0, &turn_id.0);
 
         let mut total_usage = Usage::default();
+
+        // CP-2: wall-clock deadline. Tokio's timer uses its own monotonic
+        // clock; the deadline race survives DST/NTP jumps that would
+        // confuse a SystemTime-based deadline.
+        //
+        // PR #18 round 7 (gemini MED 3115612853): this path bypasses
+        // the injected `Clock`. Under production `SystemClock` that's
+        // the *correct* behaviour — tokio's monotonic timer is the
+        // canonical deadline source, not wall-clock `SystemTime`.
+        // Under `#[tokio::test(start_paused = true)]` tokio's timer
+        // is itself virtual, so paused-time tests see deterministic
+        // deadline firing already.
+        //
+        // Known limit: a `VirtualClock`-driven replay harness would
+        // NOT be byte-identical on deadline firing, because the
+        // replay clock advances `SystemTime`/`Instant` independently
+        // of tokio's timer. v2.0.2 sidesteps this because the only
+        // replay surface (`azoth resume --as-of`) is read-only TUI
+        // hydration — no turns are driven, no deadline is armed. A
+        // future replay-*driven* harness (tracked for v2.5
+        // deterministic replay) wants `Clock::sleep_until_monotonic`
+        // so the deadline future and the clock share the same source
+        // of virtual time. An earlier revision of this comment
+        // referenced `ExecutionMode::Replay` as "landing in CP-5";
+        // that enum never materialised, so the stale reference was
+        // misleading — this comment is the truthful replacement.
+        //
+        // Scope: `scope.max_wall_secs` is documented as the budget for
+        // the **entire session** (contract.rs Scope::max_wall_secs). A
+        // prior version recomputed the deadline from `Instant::now()` at
+        // the start of every `drive_turn`, which meant a 60s session
+        // budget could be evaded by running N turns of 55s each. Fix:
+        // when the caller threads a run-start anchor via
+        // `self.run_started_tokio`, the deadline is absolute
+        // (`anchor + budget`), so each turn's remaining budget tightens
+        // with the run's age. When `None`, fall back to per-turn
+        // semantics so single-turn unit tests keep their byte shape.
+        let budget_secs = self
+            .contract
+            .and_then(|c| c.scope.max_wall_secs)
+            .unwrap_or(0);
+        // `turn_started_tokio` is the per-turn monotonic anchor. It
+        // doubles as the deadline base when no run anchor is supplied
+        // (legacy per-turn enforcement), and it always drives the
+        // *turn*-scoped elapsed reporting below. Invariant #8 stays
+        // intact: `ctx.clock` drives every persisted wall-clock
+        // timestamp and every non-deadline `now_instant()` site — the
+        // tokio snapshots only feed deadline arithmetic.
+        let turn_started_tokio = tokio::time::Instant::now();
+        let deadline_anchor = self.run_started_tokio.unwrap_or(turn_started_tokio);
+        // PR #18 round 6 (gemini MED 3114298729): `anchor + Duration` panics
+        // on overflow (e.g. `max_wall_secs = u64::MAX`). Use `checked_add`
+        // and fall through to `None` on overflow, which disarms the
+        // deadline rather than panicking. Pairs with the round-4 lesson
+        // (silent u64→u32 clamp of tokens_out needed a `tracing::warn!`):
+        // silent fallback is the exact antipattern, so emit a loud
+        // warning if overflow ever fires so an operator sees that
+        // `max_wall_secs` was effectively ignored for the session
+        // instead of silently mistaking "no deadline fired" for "within
+        // budget".
+        //
+        // Sibling audit: grepped `crates/azoth-core/src/` for
+        // `anchor + `, `Instant::now() + `, `_tokio + ` — this is the
+        // only `tokio::time::Instant + Duration` site. Every other time
+        // arithmetic is either `checked_add` already or on `SystemTime`
+        // (VirtualClock::advance, round-4 fix).
+        let deadline: Option<tokio::time::Instant> = self
+            .contract
+            .and_then(|c| c.scope.max_wall_secs)
+            .and_then(|secs| {
+                let d = deadline_anchor.checked_add(std::time::Duration::from_secs(secs));
+                if d.is_none() {
+                    tracing::warn!(
+                        run_id = %self.run_id.0,
+                        max_wall_secs = secs,
+                        "max_wall_secs would overflow tokio::time::Instant; disarming \
+                         deadline — session wall budget will NOT be enforced"
+                    );
+                }
+                d
+            });
+
+        // Heartbeat throttle. First tick is swallowed by `interval`
+        // (fires immediately), so the first heartbeat we actually
+        // emit is at T+2s — keeps fast turns heartbeat-free.
+        let mut heartbeat_interval = tokio::time::interval(std::time::Duration::from_secs(2));
+        heartbeat_interval.tick().await; // swallow immediate first tick
+        heartbeat_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // PR #18 round 5 (gemini MED): start as `None` so the very first
+        // heartbeat tick of the turn always emits, even when no progress
+        // has been observed. Pre-fix the initial value was
+        // `HeartbeatProgress::default()` — equal to the progress
+        // computed on the first tick of a deadlocked first invoke
+        // (zeros all the way down), so the equality gate suppressed the
+        // emit and a turn that hung on its very first invoke produced
+        // *zero* heartbeats — exactly the deadlock signal the heartbeat
+        // exists to surface. With `Option`, the first emit is
+        // unconditional (the prior value is `None`, never equal to
+        // `Some(progress)`), and subsequent emits stay gated on
+        // delta-change. Fast turns that complete before the 2s tick
+        // still emit nothing because the tick branch never runs.
+        let mut last_heartbeat_progress: Option<crate::schemas::HeartbeatProgress> = None;
+        let mut content_blocks_so_far: u32 = 0;
+        let mut tool_calls_so_far: u32 = 0;
 
         loop {
             if self.ctx.cancelled() {
@@ -308,6 +518,7 @@ impl<'a> TurnDriver<'a> {
                     turn_id: turn_id.clone(),
                     reason: AbortReason::UserCancel,
                     partial_usage: Default::default(),
+                    at: Some(self.ctx.now_iso()),
                 })?;
                 telemetry::emit_turn_interrupted(&self.run_id.0, &turn_id.0, "user_cancel");
                 return Ok(TurnOutcome::aborted(total_usage));
@@ -363,37 +574,182 @@ impl<'a> TurnDriver<'a> {
             let invoke_fut = self.adapter.invoke(req, tx);
             tokio::pin!(invoke_fut);
 
+            // CP-2 streaming progress counters — reset per invoke iteration
+            // and composed with the turn-cumulative counters when the
+            // heartbeat tick builds its `HeartbeatProgress`. Without these,
+            // `content_blocks_so_far` / `tool_calls_so_far` / `total_usage`
+            // only move *after* `invoke_fut` returns, so a slow streaming
+            // call's in-flight heartbeats see no delta and the
+            // stall-detection signal stays silent during exactly the
+            // period the heartbeat exists to cover.
+            //
+            // `ContentBlockStop` is the authoritative "this block is done"
+            // signal (mirrors how the post-invoke loop counts
+            // `response.content`). `ContentBlockStart { ToolUse { .. } }`
+            // is the earliest point at which we know the block is a tool
+            // call. `MessageDelta.usage_delta.output_tokens` carries the
+            // streamed token count (adapters either stream real SSE deltas
+            // or synthesise one final delta via `emit_synthetic_stream` —
+            // both paths end up summing to the provider-reported total).
+            let mut stream_blocks_seen: u32 = 0;
+            let mut stream_tools_seen: u32 = 0;
+            // `MessageDelta.usage_delta` carries BOTH input and output tokens.
+            // Round 2 only tracked output because that's all the heartbeat
+            // surfaces; mid-invoke aborts need both so the persisted partial
+            // usage matches what the provider billed for the in-flight call.
+            let mut stream_input_tokens: u32 = 0;
+            let mut stream_output_tokens: u32 = 0;
+
+            // CP-2 wall-clock deadline future. Pinned once per model-invoke
+            // iteration so the select! inside the inner loop can poll it via
+            // `&mut` on every tick without re-creating the async wrapper —
+            // same pattern as `invoke_fut`. `has_deadline` captures the
+            // armed-ness test so the `async move` can consume `deadline`
+            // without blocking the select-branch guard expression.
+            let has_deadline = deadline.is_some();
+            let wall_deadline_fut = async move {
+                match deadline {
+                    Some(d) => tokio::time::sleep_until(d).await,
+                    None => std::future::pending::<()>().await,
+                }
+            };
+            tokio::pin!(wall_deadline_fut);
+
             let invoke_result = loop {
                 tokio::select! {
                     biased;
                     // Cancellation first so a mid-stream Ctrl+C is never
                     // starved by a flood of deltas — matches the TUI's
                     // top-level `biased` select discipline (MED-3 fix).
+                    // CP-2 reminder: new branches below MUST NOT precede
+                    // this one; reordering reintroduces MED-3.
                     _ = self.ctx.cancellation.wait_cancelled() => {
+                        // Fold streamed deltas into the persisted partial
+                        // usage. `total_usage` is only accumulated post-invoke,
+                        // so any mid-stream cancellation would otherwise drop
+                        // every delta already received for the in-flight call —
+                        // understating token accounting for exactly the turn
+                        // that was cut short. Helper is shared with the
+                        // TimeExceeded and AdapterError siblings so all three
+                        // stay in lockstep if the fold logic changes.
+                        let usage_at_abort = usage_with_stream(
+                            &total_usage,
+                            stream_input_tokens,
+                            stream_output_tokens,
+                        );
                         self.writer.append(&SessionEvent::TurnInterrupted {
                             turn_id: turn_id.clone(),
                             reason: AbortReason::UserCancel,
                             partial_usage: crate::schemas::UsageDelta {
-                                input_tokens: total_usage.input_tokens,
-                                output_tokens: total_usage.output_tokens,
+                                input_tokens: usage_at_abort.input_tokens,
+                                output_tokens: usage_at_abort.output_tokens,
                             },
+                            at: Some(self.ctx.now_iso()),
                         })?;
                         telemetry::emit_turn_interrupted(&self.run_id.0, &turn_id.0, "user_cancel");
-                        return Ok(TurnOutcome::aborted(total_usage));
+                        return Ok(TurnOutcome::aborted(usage_at_abort));
+                    }
+                    // CP-2 wall-clock budget enforcement. Only armed when
+                    // the active contract declares `scope.max_wall_secs`.
+                    // Sits after cancellation so Ctrl+C still wins; sits
+                    // before the invoke future so an overrunning adapter
+                    // can't burn past the deadline via its own poll
+                    // ordering.
+                    _ = &mut wall_deadline_fut, if has_deadline => {
+                        // Inner-select wall-deadline race (invoke path).
+                        // Round 6: helper is shared with the per-await
+                        // race wrappers in the `StopReason::ToolUse` /
+                        // `EndTurn` arms so every time-exceeded abort
+                        // emits byte-identical detail + usage folding.
+                        let usage_at_abort = self.record_wall_timeout_abort(
+                            &turn_id,
+                            deadline_anchor,
+                            turn_started_tokio,
+                            budget_secs,
+                            &total_usage,
+                            stream_input_tokens,
+                            stream_output_tokens,
+                        )?;
+                        return Ok(TurnOutcome::aborted(usage_at_abort));
                     }
                     res = &mut invoke_fut => break res,
-                    Some(_ev) = rx.recv() => { /* drain, continue */ }
+                    Some(ev) = rx.recv() => {
+                        // Update streaming progress so the next heartbeat
+                        // tick sees real movement. Post-invoke accumulation
+                        // remains authoritative (`response.content` +
+                        // `response.usage`); these counters are reset
+                        // together with each invoke iteration.
+                        match &ev {
+                            StreamEvent::ContentBlockStart { block: ContentBlockStub::ToolUse { .. }, .. } => {
+                                stream_tools_seen = stream_tools_seen.saturating_add(1);
+                            }
+                            StreamEvent::ContentBlockStop { .. } => {
+                                stream_blocks_seen = stream_blocks_seen.saturating_add(1);
+                            }
+                            StreamEvent::MessageDelta { usage_delta, .. } => {
+                                stream_input_tokens = stream_input_tokens
+                                    .saturating_add(usage_delta.input_tokens);
+                                stream_output_tokens = stream_output_tokens
+                                    .saturating_add(usage_delta.output_tokens);
+                            }
+                            _ => {}
+                        }
+                    }
+                    // CP-2 heartbeat. Placed last so the real adapter
+                    // stream still wins tick scheduling. Fires when
+                    // progress has changed since the last heartbeat OR
+                    // on the very first tick of the turn (initial
+                    // `last_heartbeat_progress = None` — guarantees a
+                    // liveness emit even when the first invoke
+                    // deadlocks before producing anything; see init
+                    // rationale above).
+                    //
+                    // Known structural limitation (deferred — separate
+                    // PR): the tick branch only polls *during model
+                    // invokes*. Long-running tool execution between
+                    // invokes (Bash, web fetch, sandboxed builds)
+                    // pauses the heartbeat because the inner
+                    // `select!` is exited while the outer loop walks
+                    // the tool dispatch. A correct fix moves heartbeat
+                    // ticking to the outer loop and races it against
+                    // the dispatch future — substantial enough to want
+                    // its own PR. Tracked for v2.5.
+                    _ = heartbeat_interval.tick() => {
+                        let progress = crate::schemas::HeartbeatProgress {
+                            content_blocks: content_blocks_so_far
+                                .saturating_add(stream_blocks_seen),
+                            tool_calls: tool_calls_so_far
+                                .saturating_add(stream_tools_seen),
+                            tokens_out: (total_usage.output_tokens as u64)
+                                .saturating_add(stream_output_tokens as u64),
+                        };
+                        if last_heartbeat_progress.as_ref() != Some(&progress) {
+                            self.writer.append(&SessionEvent::TurnHeartbeat {
+                                turn_id: turn_id.clone(),
+                                at: self.ctx.now_iso(),
+                                progress: progress.clone(),
+                            })?;
+                            last_heartbeat_progress = Some(progress);
+                        }
+                    }
                 }
             };
 
             let response = match invoke_result {
                 Ok(r) => r,
                 Err(e) => {
+                    // Sibling to the UserCancel / TimeExceeded folds above.
+                    // An adapter error mid-stream leaves `response.usage`
+                    // unset, so the only token record for work already
+                    // billed to us is the streamed deltas we accumulated
+                    // in this invoke iteration.
+                    let usage_at_abort =
+                        usage_with_stream(&total_usage, stream_input_tokens, stream_output_tokens);
                     self.record_abort(
                         &turn_id,
                         AbortReason::AdapterError,
                         Some(e.to_string()),
-                        total_usage.clone(),
+                        usage_at_abort,
                     )?;
                     return Err(TurnError::Adapter(e));
                 }
@@ -415,6 +771,12 @@ impl<'a> TurnDriver<'a> {
                     index: idx,
                     block: block.clone(),
                 })?;
+                // CP-2 heartbeat progress counters. Update as blocks
+                // land so the next heartbeat tick sees the delta.
+                content_blocks_so_far = content_blocks_so_far.saturating_add(1);
+                if matches!(block, ContentBlock::ToolUse { .. }) {
+                    tool_calls_so_far = tool_calls_so_far.saturating_add(1);
+                }
             }
 
             messages.push(Message {
@@ -531,21 +893,73 @@ impl<'a> TurnDriver<'a> {
                                         summary,
                                         responder: resp_tx,
                                     };
-                                    if self.approval_bridge.send(msg).await.is_err() {
-                                        self.writer.append(&SessionEvent::ApprovalDenied {
-                                            turn_id: turn_id.clone(),
-                                            approval_id: approval_id.clone(),
-                                        })?;
-                                        self.record_abort(
-                                            &turn_id,
-                                            AbortReason::ApprovalDenied,
-                                            Some("approval bridge closed".into()),
-                                            total_usage.clone(),
-                                        )?;
-                                        return Ok(TurnOutcome::aborted(total_usage));
+                                    // Round 6: race the bridge send against the
+                                    // wall deadline. Normally bounded and
+                                    // fast, but a stuck TUI worker could
+                                    // otherwise block indefinitely.
+                                    match race_wall_deadline(
+                                        self.approval_bridge.send(msg),
+                                        deadline,
+                                    )
+                                    .await
+                                    {
+                                        Ok(Ok(())) => {}
+                                        Ok(Err(_)) => {
+                                            self.writer.append(&SessionEvent::ApprovalDenied {
+                                                turn_id: turn_id.clone(),
+                                                approval_id: approval_id.clone(),
+                                            })?;
+                                            self.record_abort(
+                                                &turn_id,
+                                                AbortReason::ApprovalDenied,
+                                                Some("approval bridge closed".into()),
+                                                total_usage.clone(),
+                                            )?;
+                                            return Ok(TurnOutcome::aborted(total_usage));
+                                        }
+                                        Err(()) => {
+                                            let usage = self.record_wall_timeout_abort(
+                                                &turn_id,
+                                                deadline_anchor,
+                                                turn_started_tokio,
+                                                budget_secs,
+                                                &total_usage,
+                                                0,
+                                                0,
+                                            )?;
+                                            return Ok(TurnOutcome::aborted(usage));
+                                        }
                                     }
 
-                                    match resp_rx.await {
+                                    // Round 6: race approval wait against the
+                                    // wall deadline. User approval is the
+                                    // unbounded worst case — pre-fix a user
+                                    // leaving the modal open past the
+                                    // session budget would pause the
+                                    // deadline. Now the turn aborts at the
+                                    // budget, leaving the ApprovalRequest
+                                    // marker in forensic view (open
+                                    // request + TimeExceeded aborts — the
+                                    // request was made, the deadline
+                                    // fired, the turn stopped).
+                                    let approval_response =
+                                        match race_wall_deadline(resp_rx, deadline).await {
+                                            Ok(r) => r,
+                                            Err(()) => {
+                                                let usage = self.record_wall_timeout_abort(
+                                                    &turn_id,
+                                                    deadline_anchor,
+                                                    turn_started_tokio,
+                                                    budget_secs,
+                                                    &total_usage,
+                                                    0,
+                                                    0,
+                                                )?;
+                                                return Ok(TurnOutcome::aborted(usage));
+                                            }
+                                        };
+
+                                    match approval_response {
                                         Ok(ApprovalResponse::Grant { scope }) => {
                                             let tok =
                                                 mint_from_approval(&tool_name, ec, scope.clone());
@@ -594,13 +1008,41 @@ impl<'a> TurnDriver<'a> {
                             );
                             let raw = Tainted::new(Origin::ModelOutput, input.clone());
                             let tool_start = std::time::Instant::now();
-                            let result = crate::execution::dispatch_tool(
-                                self.dispatcher,
-                                name,
-                                raw,
-                                self.ctx,
+                            // Round 6: race tool dispatch against the wall
+                            // deadline. A long-running bash/web tool is the
+                            // canonical failure case codex P1 flagged —
+                            // pre-fix a 3600s bash call could run to
+                            // completion under a 30s session budget because
+                            // the deadline only fired inside the invoke
+                            // select. Drop-on-timeout leaves any spawned
+                            // subprocess to be reaped by its own logic; the
+                            // TimeExceeded record is what matters for the
+                            // contract semantics.
+                            let result = match race_wall_deadline(
+                                crate::execution::dispatch_tool(
+                                    self.dispatcher,
+                                    name,
+                                    raw,
+                                    self.ctx,
+                                ),
+                                deadline,
                             )
-                            .await;
+                            .await
+                            {
+                                Ok(r) => r,
+                                Err(()) => {
+                                    let usage = self.record_wall_timeout_abort(
+                                        &turn_id,
+                                        deadline_anchor,
+                                        turn_started_tokio,
+                                        budget_secs,
+                                        &total_usage,
+                                        0,
+                                        0,
+                                    )?;
+                                    return Ok(TurnOutcome::aborted(usage));
+                                }
+                            };
                             let tool_duration_ms = tool_start.elapsed().as_millis() as u64;
 
                             let (content, is_error) = match result {
@@ -756,39 +1198,62 @@ impl<'a> TurnDriver<'a> {
                         //    at emission time so the SQLite mirror can
                         //    project into `test_impact.ran_at NOT NULL`.
                         if !self.impact_validators.is_empty() {
+                            // Round 6: race diff-source against the wall
+                            // deadline. Large-repo `git diff` can be slow
+                            // enough to push past the budget. The inner
+                            // match keeps the existing Skip-on-error
+                            // semantics byte-identical.
                             let diff: Diff = match self.diff_source {
-                                Some(src) => match src.diff().await {
-                                    Ok(d) => d,
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            error = %e,
-                                            source = src.name(),
-                                            "diff_source failed; proceeding with empty diff"
-                                        );
-                                        // Skip, not Fail: the subsystem
-                                        // is opt-in and a diff-source
-                                        // outage is genuinely
-                                        // non-fatal. The event still
-                                        // lands in JSONL so eval can
-                                        // measure how often it fires.
-                                        let vname = format!("diff_source:{}", src.name());
-                                        self.writer.append(&SessionEvent::ValidatorResult {
-                                            turn_id: turn_id.clone(),
-                                            validator: vname.clone(),
-                                            status: ValidatorStatus::Skip,
-                                            detail: Some(format!(
-                                                "{e}; proceeding with empty diff"
-                                            )),
-                                        })?;
-                                        telemetry::emit_validator_result(
-                                            &self.run_id.0,
-                                            &turn_id.0,
-                                            &vname,
-                                            ValidatorStatus::Skip,
-                                        );
-                                        Diff::empty()
+                                Some(src) => {
+                                    let diff_result =
+                                        match race_wall_deadline(src.diff(), deadline).await {
+                                            Ok(r) => r,
+                                            Err(()) => {
+                                                let usage = self.record_wall_timeout_abort(
+                                                    &turn_id,
+                                                    deadline_anchor,
+                                                    turn_started_tokio,
+                                                    budget_secs,
+                                                    &total_usage,
+                                                    0,
+                                                    0,
+                                                )?;
+                                                return Ok(TurnOutcome::aborted(usage));
+                                            }
+                                        };
+                                    match diff_result {
+                                        Ok(d) => d,
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                error = %e,
+                                                source = src.name(),
+                                                "diff_source failed; proceeding with empty diff"
+                                            );
+                                            // Skip, not Fail: the subsystem
+                                            // is opt-in and a diff-source
+                                            // outage is genuinely
+                                            // non-fatal. The event still
+                                            // lands in JSONL so eval can
+                                            // measure how often it fires.
+                                            let vname = format!("diff_source:{}", src.name());
+                                            self.writer.append(&SessionEvent::ValidatorResult {
+                                                turn_id: turn_id.clone(),
+                                                validator: vname.clone(),
+                                                status: ValidatorStatus::Skip,
+                                                detail: Some(format!(
+                                                    "{e}; proceeding with empty diff"
+                                                )),
+                                            })?;
+                                            telemetry::emit_validator_result(
+                                                &self.run_id.0,
+                                                &turn_id.0,
+                                                &vname,
+                                                ValidatorStatus::Skip,
+                                            );
+                                            Diff::empty()
+                                        }
                                     }
-                                },
+                                }
                                 None => Diff::empty(),
                             };
 
@@ -797,17 +1262,43 @@ impl<'a> TurnDriver<'a> {
                             // order, so the emission loop below stays
                             // deterministic. First-fail-wins semantics
                             // preserved by iterating the ordered Vec.
-                            let reports = join_all(
-                                self.impact_validators
-                                    .iter()
-                                    .map(|iv| iv.validate(contract, &diff)),
+                            //
+                            // Round 6: race the fan-out against the wall
+                            // deadline. Any single validator hanging past
+                            // the budget would otherwise block the whole
+                            // turn. Drop-on-timeout discards in-flight
+                            // validator futures; their partial state is
+                            // non-durable (no EffectRecord yet written)
+                            // so forensic integrity is preserved.
+                            let reports = match race_wall_deadline(
+                                join_all(
+                                    self.impact_validators
+                                        .iter()
+                                        .map(|iv| iv.validate(contract, &diff)),
+                                ),
+                                deadline,
                             )
-                            .await;
+                            .await
+                            {
+                                Ok(r) => r,
+                                Err(()) => {
+                                    let usage = self.record_wall_timeout_abort(
+                                        &turn_id,
+                                        deadline_anchor,
+                                        turn_started_tokio,
+                                        budget_secs,
+                                        &total_usage,
+                                        0,
+                                        0,
+                                    )?;
+                                    return Ok(TurnOutcome::aborted(usage));
+                                }
+                            };
 
                             let mut impact_failed: Option<(String, Option<String>)> = None;
                             for report in reports {
                                 let vname = report.name.to_string();
-                                let ran_at = now_iso();
+                                let ran_at = self.ctx.now_iso();
 
                                 // Persist plan detail whenever the
                                 // validator produced one (including
@@ -875,6 +1366,7 @@ impl<'a> TurnDriver<'a> {
                         usage: total_usage.clone(),
                         user_input: user_input_content.clone(),
                         final_assistant: Some(response.content.clone()),
+                        at: Some(self.ctx.now_iso()),
                     })?;
                     telemetry::emit_turn_committed(
                         &self.run_id.0,
@@ -958,11 +1450,10 @@ fn approximate_input_tokens(req: &ModelTurnRequest) -> u32 {
     bytes.div_ceil(4) as u32
 }
 
-fn now_iso() -> String {
-    time::OffsetDateTime::now_utc()
-        .format(&time::format_description::well_known::Rfc3339)
-        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
-}
+// `fn now_iso` (pre-Chronon) lived here. All call sites now go through
+// `self.ctx.now_iso()` which delegates to the injected `Clock`. See
+// `crate::execution::clock` for rationale. Retained as comment so grep
+// for `now_iso` finds the migration point.
 
 /// Persist a tool's output content blocks to the content-addressed artifact
 /// store and return the resulting `ArtifactId` for the `ToolResult` event.

@@ -79,6 +79,7 @@ fn committed_run_progress_counts_only_committed_turn_effects() {
         usage: Usage::default(),
         user_input: None,
         final_assistant: None,
+        at: None,
     })
     .unwrap();
 
@@ -103,6 +104,7 @@ fn committed_run_progress_counts_only_committed_turn_effects() {
         reason: AbortReason::ValidatorFail,
         detail: Some("validator said no".into()),
         usage: Usage::default(),
+        at: None,
     })
     .unwrap();
 
@@ -137,6 +139,7 @@ fn committed_run_progress_counts_only_committed_turn_effects() {
         usage: Usage::default(),
         user_input: None,
         final_assistant: None,
+        at: None,
     })
     .unwrap();
 

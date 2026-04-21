@@ -18,12 +18,19 @@ pub enum RetrievalError {
     Other(String),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Span {
     pub path: String,
     pub start_line: usize,
     pub end_line: usize,
     pub snippet: String,
+    /// Chronon CP-3: Unix epoch seconds — source mtime at index
+    /// time. FTS5 and symbol indexers populate this from the
+    /// `documents` table; ripgrep-based retrieval leaves it None
+    /// (no cheap mtime read in the hot path). `None` on pre-CP-3
+    /// sessions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_mtime: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -202,6 +209,8 @@ impl<'a> grep_searcher::Sink for Collector<'a> {
             start_line: line_num,
             end_line: line_num,
             snippet,
+            // ripgrep path: no mtime read in the hot path.
+            source_mtime: None,
         });
         Ok(self.out.len() < self.limit)
     }

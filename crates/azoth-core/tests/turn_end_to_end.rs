@@ -98,6 +98,7 @@ async fn tui_worker_pipeline_drives_full_turn_sequence() {
             approval_bridge: approval_tx,
             contract: None,
             turns_completed: 0,
+            run_started_tokio: None,
             kernel: None,
             validators: &[],
             effects_consumed: &mut effects,

@@ -343,6 +343,7 @@ mod tests {
                 final_assistant: Some(vec![ContentBlock::Text {
                     text: "Found the fix in auth.rs.".into(),
                 }]),
+                at: None,
             },
         ]
     }
@@ -459,6 +460,7 @@ mod tests {
                 final_assistant: Some(vec![ContentBlock::Text {
                     text: "committed text".into(),
                 }]),
+                at: None,
             },
             SessionEvent::TurnStarted {
                 turn_id: t_bad.clone(),
@@ -478,6 +480,7 @@ mod tests {
                 reason: AbortReason::ValidatorFail,
                 detail: Some("nope".into()),
                 usage: Usage::default(),
+                at: None,
             },
         ];
 

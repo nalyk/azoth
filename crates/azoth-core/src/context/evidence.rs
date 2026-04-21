@@ -80,15 +80,26 @@ fn spans_to_evidence(spans: Vec<Span>, limit: usize) -> Vec<EvidenceItem> {
     spans
         .into_iter()
         .enumerate()
-        .map(|(idx, s)| EvidenceItem {
-            label: format!("{}:{}", s.path, s.start_line),
-            artifact_ref: None,
-            inline: Some(s.snippet),
-            // First hit gets `base`, decaying by 1; floor at 1 so every
-            // item remains distinguishable from the kernel default of 0.
-            decision_weight: base.saturating_sub(idx as u32).max(1),
-            lane: Some("lexical".into()),
-            rerank_score: None,
+        .map(|(idx, s)| {
+            let valid_at = s.source_mtime;
+            EvidenceItem {
+                label: format!("{}:{}", s.path, s.start_line),
+                artifact_ref: None,
+                inline: Some(s.snippet),
+                // First hit gets `base`, decaying by 1; floor at 1 so
+                // every item remains distinguishable from the kernel
+                // default of 0.
+                decision_weight: base.saturating_sub(idx as u32).max(1),
+                lane: Some("lexical".into()),
+                rerank_score: None,
+                // CP-3: observed_at stays None here — the retrieval
+                // impl stamps it when the composite collector runs.
+                // valid_at propagates from the Span if the backend
+                // supplied one (FTS5 does, ripgrep does not).
+                observed_at: None,
+                valid_at,
+                freshness: None,
+            }
         })
         .collect()
 }
@@ -117,6 +128,7 @@ mod tests {
             start_line: line,
             end_line: line,
             snippet: snippet.into(),
+            source_mtime: None,
         }
     }
 

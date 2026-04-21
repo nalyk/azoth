@@ -69,6 +69,7 @@ async fn end_turn_outcome_carries_final_assistant_content() {
         approval_bridge: approval_tx,
         contract: None,
         turns_completed: 0,
+        run_started_tokio: None,
         kernel: None,
         validators: &[],
         effects_consumed: &mut effects,
@@ -158,6 +159,7 @@ async fn contract_max_turns_abort_returns_none_final_assistant() {
         contract: Some(&persisted),
         // Already at the cap → drive_turn aborts before calling invoke.
         turns_completed: 1,
+        run_started_tokio: None,
         kernel: None,
         validators: &[],
         effects_consumed: &mut effects,

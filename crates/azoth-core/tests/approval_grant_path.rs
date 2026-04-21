@@ -113,6 +113,7 @@ async fn drive_with_responder(
             approval_bridge: atx,
             contract: None,
             turns_completed: 0,
+            run_started_tokio: None,
             kernel: None,
             validators: &[],
             effects_consumed: &mut effects,

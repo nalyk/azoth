@@ -26,7 +26,7 @@ cargo fmt --check
 AZOTH_PROFILE=anthropic cargo run  # or: ollama-qwen-anthropic (default), openai, openrouter
 ```
 
-## Seven Invariants
+## Eight Invariants
 
 These are runtime laws. Code that violates any invariant is a bug regardless of whether it compiles.
 
@@ -37,6 +37,7 @@ These are runtime laws. Code that violates any invariant is a bug regardless of 
 5. **Every run leaves structured evidence** — SessionEvents, checkpoints, artifacts
 6. **Every subsystem is eval-able** — telemetry emits measurable signals
 7. **Turn-scoped atomicity** — TurnStarted must be followed by exactly one of TurnCommitted / TurnAborted / TurnInterrupted
+8. **Time is taint, not preface** (Chronon Plane, v2.0.2) — every persisted timestamp flows through an injected `Clock` (production: `SystemClock`; tests: `FrozenClock`; replay: `VirtualClock`); every externally-observed fact the model sees can carry `(observed_at, valid_at)`; contracts may bound wall-clock spend via `scope.max_wall_secs`; open turns emit `TurnHeartbeat` at a throttled cadence. Time never enters the constitution lane as a frozen string.
 
 ## Architecture Constraints
 

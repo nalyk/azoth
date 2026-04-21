@@ -107,6 +107,7 @@ async fn cancel_during_flood_writes_turn_interrupted_under_100ms() {
             approval_bridge: approval_tx,
             contract: None,
             turns_completed: 0,
+            run_started_tokio: None,
             kernel: None,
             validators: &[],
             effects_consumed: &mut effects,

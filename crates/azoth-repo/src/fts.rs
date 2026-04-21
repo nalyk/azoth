@@ -104,9 +104,16 @@ fn fts_search_blocking(
 
     // snippet(tbl, col_index, open, close, ellipsis, ntoken).
     // col_index=1 corresponds to `content` (0-indexed after rowid).
+    // CP-3: JOIN against `documents.mtime_nanos` so every returned
+    // Span carries an `source_mtime` (seconds since epoch). Falls
+    // back to None (via NULL → Option) when the content-sync trigger
+    // lags behind the FTS view.
     let sql = format!(
-        "SELECT path, snippet(documents_fts, 1, '', '', '…', {snippet_tokens}) \
+        "SELECT documents_fts.path, \
+                snippet(documents_fts, 1, '', '', '…', {snippet_tokens}), \
+                documents.mtime \
          FROM documents_fts \
+         LEFT JOIN documents ON documents.path = documents_fts.path \
          WHERE documents_fts MATCH ?1 \
          ORDER BY rank \
          LIMIT ?2"
@@ -117,13 +124,24 @@ fn fts_search_blocking(
         .map_err(|e| RetrievalError::Other(format!("prepare: {e}")))?;
     let rows = stmt
         .query_map(params![phrase, limit as i64], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<i64>>(2)?,
+            ))
         })
         .map_err(|e| RetrievalError::Other(format!("query: {e}")))?;
 
     let mut out = Vec::new();
     for row in rows {
-        let (path, snippet) = row.map_err(|e| RetrievalError::Other(format!("row: {e}")))?;
+        let (path, snippet, mtime_nanos) =
+            row.map_err(|e| RetrievalError::Other(format!("row: {e}")))?;
+        // `documents.mtime` is nanoseconds since epoch (see indexer).
+        // Seconds is plenty of precision for freshness-decay math;
+        // downcast when present.
+        let source_mtime = mtime_nanos
+            .filter(|ns| *ns > 0)
+            .map(|ns| (ns / 1_000_000_000) as u64);
         out.push(Span {
             path,
             // FTS5 operates at document granularity — line numbers would
@@ -133,6 +151,7 @@ fn fts_search_blocking(
             start_line: 0,
             end_line: 0,
             snippet: normalize_snippet(&snippet),
+            source_mtime,
         });
     }
     Ok(out)

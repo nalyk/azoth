@@ -38,6 +38,9 @@ fn item(label: &str, w: u32) -> EvidenceItem {
         decision_weight: w,
         lane: None,
         rerank_score: None,
+        observed_at: None,
+        valid_at: None,
+        freshness: None,
     }
 }
 
