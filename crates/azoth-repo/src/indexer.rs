@@ -507,16 +507,20 @@ fn extract_and_store(
     }
 }
 
+/// Language tag for `documents.language`. v2.1 routes grammar-wired
+/// languages through `code_graph::detect_language` so there is one
+/// source of truth for the four grammars; non-grammar tags (markdown,
+/// toml, javascript, json, yaml, shell) are still recognised here to
+/// keep `documents.language` byte-stable across v2.0 → v2.1.
 fn detect_language(path: &Path) -> Option<&'static str> {
+    if let Some(lang) = crate::code_graph::detect_language(path) {
+        return Some(lang.as_str());
+    }
     let ext = path.extension().and_then(|s| s.to_str())?;
     match ext {
-        "rs" => Some("rust"),
         "md" => Some("markdown"),
         "toml" => Some("toml"),
-        "py" => Some("python"),
-        "ts" | "tsx" => Some("typescript"),
         "js" | "jsx" => Some("javascript"),
-        "go" => Some("go"),
         "json" => Some("json"),
         "yml" | "yaml" => Some("yaml"),
         "sh" | "bash" => Some("shell"),
