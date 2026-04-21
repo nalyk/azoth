@@ -73,7 +73,9 @@ fn pre_2_1_symbolkind_tags_deserialize_under_new_binary() {
 
 /// v2.1-new variants round-trip via serde with their documented tags.
 /// Separate test so a failure names "new variant broken" vs.
-/// "pre-2.1 variant broken".
+/// "pre-2.1 variant broken". Asserts **byte-stable round-trip** to
+/// match the pre-2.1 test's discipline: a silent `#[serde(rename)]`
+/// drift on any new tag would be caught here, not downstream.
 #[test]
 fn v2_1_symbolkind_new_variants_round_trip() {
     for (tag, want) in [
@@ -86,5 +88,7 @@ fn v2_1_symbolkind_new_variants_round_trip() {
     ] {
         let got: SymbolKind = serde_json::from_str(tag).expect(tag);
         assert_eq!(got, want);
+        let re = serde_json::to_string(&got).unwrap();
+        assert_eq!(re, tag, "round-trip is byte-stable for {tag}");
     }
 }

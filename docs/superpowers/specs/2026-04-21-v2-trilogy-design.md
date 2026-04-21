@@ -135,7 +135,7 @@ Extend enum; add `Language`; add dispatcher. Existing Rust extractor routes thro
 
 **2.1-B — Python tree-sitter.**
 `code_graph/python.rs` + `queries/python.scm`. Extracts Function, Class, Method, Decorator, Module.
-*Ship:* on 500-LOC fixture ≥90 0eclared functions/classes/methods extracted; <50ms per file <1000 LOC; incremental reindex re-parses only changed files (mtime gate); no panic on malformed syntax.
+*Ship:* on 500-LOC fixture ≥90 declared functions/classes/methods extracted; <50ms per file <1000 LOC; incremental reindex re-parses only changed files (mtime gate); no panic on malformed syntax.
 
 **2.1-C — TypeScript tree-sitter.**
 `code_graph/typescript.rs` + `queries/typescript.scm`. Handles both `.ts` (LANGUAGE_TYPESCRIPT) and `.tsx` (LANGUAGE_TSX). Extracts Function, Class, Method, Interface, TypeAlias, Enum.

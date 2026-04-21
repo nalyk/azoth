@@ -130,6 +130,48 @@ pub fn parser_for(lang: Language, _path: &Path) -> Result<tree_sitter::Parser, E
     }
 }
 
+/// Cache-discriminator for `parser_for`. `Language` alone is NOT a
+/// sufficient cache key because TypeScript is **path-sensitive**:
+/// `.ts` routes to `LANGUAGE_TYPESCRIPT`, `.tsx` to `LANGUAGE_TSX`
+/// (PR 2.1-C). Caching by `Language` means the first TS file touched
+/// decides the flavor and every subsequent TS file reuses that
+/// parser — mixed `.ts`/`.tsx` repos then either panic (grammar
+/// mismatch) or silently drop symbols. See codex P2 on PR #19.
+///
+/// The split from `Language` keeps the public "language concept"
+/// surface stable (Rust / Python / TypeScript / Go) while the
+/// **parser choice** surface — which is what the HashMap keys on —
+/// evolves independently. New path-sensitive languages (e.g. Python
+/// stubs, `.pyi`) would add a `ParserKey` variant without churning
+/// `Language`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ParserKey {
+    Rust,
+    Python,
+    TypeScriptTs,
+    TypeScriptTsx,
+    Go,
+}
+
+/// Compute the `ParserKey` that `parser_for(lang, path)` would yield.
+/// Single source of truth for path-sensitive discrimination — the
+/// indexer uses this to key its parser cache so mixed `.ts`/`.tsx`
+/// repos keep two distinct parsers live after PR 2.1-C wires the
+/// TypeScript grammar. Inputs that `detect_language` would reject
+/// never reach this function; the path extension is only consulted
+/// for the one language that actually needs it.
+pub fn parser_key(lang: Language, path: &Path) -> ParserKey {
+    match lang {
+        Language::Rust => ParserKey::Rust,
+        Language::Python => ParserKey::Python,
+        Language::TypeScript => match path.extension().and_then(|s| s.to_str()) {
+            Some("tsx") => ParserKey::TypeScriptTsx,
+            _ => ParserKey::TypeScriptTs,
+        },
+        Language::Go => ParserKey::Go,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,16 +281,67 @@ mod tests {
         // the parser factory and the extractor share the same error
         // taxonomy so the indexer can treat the two call sites
         // symmetrically. `tree_sitter::Parser` doesn't implement
-        // `Debug`, so we can't `{other:?}` the whole Result — drop
-        // the Ok-payload to an `()` marker before any panic message.
+        // `Debug`, so `{other:?}` on the whole `Result` won't compile;
+        // we match the branches directly and name the unexpected Ok
+        // case in its own arm.
         for lang in [Language::Python, Language::TypeScript, Language::Go] {
-            let err = parser_for(lang, Path::new("x.any"))
-                .map(|_parser_ok| ())
-                .expect_err("expected UnsupportedLanguage");
-            match err {
-                ExtractError::UnsupportedLanguage(got) => assert_eq!(got, lang),
-                other => panic!("lang={lang:?}: expected UnsupportedLanguage, got {other:?}"),
+            match parser_for(lang, Path::new("x.any")) {
+                Err(ExtractError::UnsupportedLanguage(got)) => assert_eq!(got, lang),
+                Ok(_) => panic!("lang={lang:?}: expected UnsupportedLanguage, got Ok"),
+                Err(other) => panic!("lang={lang:?}: expected UnsupportedLanguage, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn parser_key_typescript_discriminates_tsx() {
+        // Codex P2 on PR #19: mixed TS/TSX repos must keep two
+        // distinct parser cache slots live. `.ts` and `.tsx` route to
+        // different `ParserKey` variants so the indexer's
+        // `HashMap<ParserKey, Parser>` holds a parser per flavor once
+        // PR 2.1-C wires the TypeScript grammar.
+        assert_eq!(
+            parser_key(Language::TypeScript, Path::new("app/x.ts")),
+            ParserKey::TypeScriptTs,
+        );
+        assert_eq!(
+            parser_key(Language::TypeScript, Path::new("lib/types.d.ts")),
+            ParserKey::TypeScriptTs,
+        );
+        assert_eq!(
+            parser_key(Language::TypeScript, Path::new("app/Button.tsx")),
+            ParserKey::TypeScriptTsx,
+        );
+        assert_ne!(
+            parser_key(Language::TypeScript, Path::new("a.ts")),
+            parser_key(Language::TypeScript, Path::new("a.tsx")),
+            "TS and TSX must hash to distinct cache slots",
+        );
+    }
+
+    #[test]
+    fn parser_key_non_typescript_ignores_path() {
+        // Rust/Python/Go have a single grammar per language, so the
+        // path extension is irrelevant to the cache slot. Locks the
+        // invariant so future additions of `.pyi` or similar are a
+        // conscious `ParserKey` variant add, not a silent drift.
+        assert_eq!(
+            parser_key(Language::Rust, Path::new("src/foo.rs")),
+            ParserKey::Rust,
+        );
+        assert_eq!(
+            parser_key(Language::Rust, Path::new("whatever.unrelated")),
+            ParserKey::Rust,
+        );
+        assert_eq!(
+            parser_key(Language::Python, Path::new("a.py")),
+            ParserKey::Python,
+        );
+        assert_eq!(
+            parser_key(Language::Python, Path::new("a.pyi")),
+            ParserKey::Python,
+            "stub files share the cache slot until a parser flavor is added",
+        );
+        assert_eq!(parser_key(Language::Go, Path::new("a.go")), ParserKey::Go,);
     }
 }

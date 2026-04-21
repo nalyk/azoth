@@ -55,7 +55,7 @@ use azoth_core::event_store::sqlite::MirrorError;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use thiserror::Error;
 
-use crate::code_graph::Language;
+use crate::code_graph::{Language, ParserKey};
 
 /// Default ceiling on file size. Larger files get skipped — matches the
 /// Sprint 1 "cheap indexer" policy; Sprint 2 tree-sitter extraction may
@@ -348,13 +348,15 @@ fn reindex_blocking(
     // Phase-4 transaction (PR #6 gemini-code-assist MED — prior code
     // re-prepared both per file, burning ~1 sqlite3_prepare_v2 per
     // writer call × files-in-pass). Parsers are lazily built on first
-    // hit per language and reused for every subsequent file of that
-    // language, so we pay `Parser::new` + `set_language` at most once
-    // per language per pass. For PR-A only Rust is wired; PRs 2.1-B/
-    // C/D extend the dispatcher in `code_graph` and the map populates
-    // itself automatically.
+    // hit per `ParserKey` and reused for every subsequent file that
+    // hashes to the same key, so we pay `Parser::new` + `set_language`
+    // at most once per parser flavor per pass. For PR-A only Rust is
+    // wired (one `ParserKey` slot); PRs 2.1-B/C/D extend the dispatcher
+    // in `code_graph` and the map populates itself automatically.
+    // TypeScript is path-sensitive — `.ts` and `.tsx` hash to distinct
+    // `ParserKey` variants (codex P2 on PR #19 + `code_graph::parser_key`).
     let mut symbol_writer = crate::code_graph::SymbolWriter::new(&tx)?;
-    let mut parsers: HashMap<Language, tree_sitter::Parser> = HashMap::new();
+    let mut parsers: HashMap<ParserKey, tree_sitter::Parser> = HashMap::new();
 
     let mut doc_insert = tx.prepare(
         "INSERT INTO documents (path, mtime, language, content) VALUES (?1, ?2, ?3, ?4)",
@@ -493,33 +495,36 @@ fn extract_and_store(
     path: &str,
     content: &str,
     lang: Language,
-    parsers: &mut HashMap<Language, tree_sitter::Parser>,
+    parsers: &mut HashMap<ParserKey, tree_sitter::Parser>,
     symbol_writer: &mut crate::code_graph::SymbolWriter<'_>,
 ) -> Result<u32, IndexerError> {
     let lang_tag = lang.as_str();
+    let key = crate::code_graph::parser_key(lang, Path::new(path));
 
-    let parser = if let std::collections::hash_map::Entry::Vacant(slot) = parsers.entry(lang) {
-        match crate::code_graph::parser_for(lang, Path::new(path)) {
-            Ok(p) => slot.insert(p),
-            Err(crate::code_graph::ExtractError::UnsupportedLanguage(_)) => {
-                // Expected state for non-Rust languages until PRs
-                // 2.1-B/C/D land; silent skip avoids log spam on every
-                // Python/TS/Go file in the repo.
-                return Ok(0);
-            }
-            Err(e) => {
-                tracing::warn!(
-                    language = %lang_tag,
-                    error = %e,
-                    "tree-sitter parser init failed; skipping path"
-                );
-                return Ok(0);
+    // Full `entry(key)` match (gemini MED on PR #19) — the cache is
+    // keyed by `ParserKey` so `.ts` and `.tsx` files keep distinct
+    // parsers once PR 2.1-C lands.
+    let parser = match parsers.entry(key) {
+        std::collections::hash_map::Entry::Occupied(slot) => slot.into_mut(),
+        std::collections::hash_map::Entry::Vacant(slot) => {
+            match crate::code_graph::parser_for(lang, Path::new(path)) {
+                Ok(p) => slot.insert(p),
+                Err(crate::code_graph::ExtractError::UnsupportedLanguage(_)) => {
+                    // Expected state for non-Rust languages until PRs
+                    // 2.1-B/C/D land; silent skip avoids log spam on
+                    // every Python/TS/Go file in the repo.
+                    return Ok(0);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        language = %lang_tag,
+                        error = %e,
+                        "tree-sitter parser init failed; skipping path"
+                    );
+                    return Ok(0);
+                }
             }
         }
-    } else {
-        parsers
-            .get_mut(&lang)
-            .expect("entry present after vacant branch")
     };
 
     match crate::code_graph::extract_for(lang, parser, content) {
