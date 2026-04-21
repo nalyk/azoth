@@ -414,22 +414,39 @@ fn reindex_blocking(
     // The subquery is cheap: `symbols_by_path_line_idx` covers the
     // leading `path` column so the scan is an index lookup per row.
     // On a well-synced DB the outer query returns zero rows.
-    let backfill: Vec<(String, String)> = {
+    let backfill: Vec<(String, String, String)> = {
         let mut stmt = tx.prepare(
-            "SELECT path, content FROM documents
+            "SELECT path, content, language FROM documents
              WHERE language = 'rust'
                AND path NOT IN (SELECT DISTINCT path FROM symbols)",
         )?;
-        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?;
         rows.collect::<Result<Vec<_>, _>>()?
     };
-    for (path, content) in &backfill {
-        // Backfill is Rust-scoped by the query above. PRs 2.1-B/C/D
-        // widen the query (and this call) to cover their language.
+    for (path, content, lang_tag) in &backfill {
+        // Dispatch language is derived from the row's `language`
+        // column (the Phase-3 writer's source-of-truth), not
+        // hardcoded — gemini MED on PR #19 dbb5cdc. Previously
+        // `Language::Rust` was pinned here, which meant PRs 2.1-B/C/D
+        // had to remember to edit **two** places (the `WHERE`
+        // predicate AND this call) in lock-step. Now widening the
+        // predicate is sufficient; dispatch follows automatically.
+        // `from_wire` returning `None` means a row slipped the
+        // predicate (schema drift); skip defensively rather than
+        // unwrap.
+        let Some(lang) = Language::from_wire(lang_tag) else {
+            continue;
+        };
         stats.symbols_extracted = stats.symbols_extracted.saturating_add(extract_and_store(
             path,
             content,
-            Language::Rust,
+            lang,
             &mut parsers,
             &mut symbol_writer,
         )?);

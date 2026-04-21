@@ -166,7 +166,25 @@ pub fn parser_key(lang: Language, path: &Path) -> ParserKey {
         Language::Python => ParserKey::Python,
         Language::TypeScript => match path.extension().and_then(|s| s.to_str()) {
             Some("tsx") => ParserKey::TypeScriptTsx,
-            _ => ParserKey::TypeScriptTs,
+            Some("ts") => ParserKey::TypeScriptTs,
+            // `detect_language` only routes `.ts`/`.tsx` to
+            // `Language::TypeScript` today, so reaching this arm
+            // means detection was widened (e.g. `.mts`, `.cts`)
+            // without a matching conscious choice here. Gemini MED
+            // on PR #19 dbb5cdc: a silent `_ => TypeScriptTs`
+            // default would hide that drift. `.mts` and `.cts`
+            // both parse as `LANGUAGE_TYPESCRIPT` (no JSX), so
+            // `TypeScriptTs` is the safe release-build fallback;
+            // the `debug_assert!` forces the drift to surface in
+            // CI rather than ship silently.
+            other => {
+                debug_assert!(
+                    false,
+                    "parser_key: unhandled TypeScript extension {other:?} — \
+                     widen detect_language and parser_key together"
+                );
+                ParserKey::TypeScriptTs
+            }
         },
         Language::Go => ParserKey::Go,
     }
