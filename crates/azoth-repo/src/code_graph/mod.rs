@@ -172,36 +172,74 @@ pub fn parser_key(lang: Language, path: &Path) -> ParserKey {
             // TypeScript arm must have a conscious landing arm here.
             // Today the former only admits `.ts`/`.tsx`, so reaching
             // this branch is a violation of the paired invariant —
-            // not a graceful-degradation opportunity. `unreachable!()`
-            // (gemini MED on PR #19 b1ddfeb, preferred over the
-            // round-4 `debug_assert!(false, …)` because the branch is
-            // genuinely unreachable under the current contract, and
-            // the idiomatic macro signals that to both reader and
-            // compiler). Widening `detect_language` to `.mts`/`.cts`
-            // in a future PR MUST widen this match in the same
-            // commit; CI tests that exercise the new extension will
-            // hit this panic immediately.
+            // not a graceful-degradation opportunity. I landed
+            // `unreachable!()` here in round-5 (PR #19 b1ddfeb,
+            // gemini MED) after originally shipping `debug_assert!(false, …)`
+            // in round-4; the macro swap was my call and reflects that
+            // the branch is genuinely unreachable from valid state, not
+            // a "maybe in production" concern.
             //
-            // Gemini R6 raised an adjacent concern: the `documents`
-            // table is DURABLE state, so a future binary that
-            // **narrows** `detect_language` (drops an extension) would
-            // leave old rows whose stored `language="typescript"` no
-            // longer round-trips through the current match. We
-            // deliberately prefer panic over `Option`/`Result`
-            // propagation for this scenario: the paired-invariant
-            // contract spans binary versions via a **migration** —
-            // narrowing `detect_language` requires an `m00NN_*.rs`
-            // step that purges `documents` rows for the retired
-            // extension. Reindexing without that migration step is
-            // itself a contract violation; panicking with the
-            // actionable "widen detect_language and parser_key
-            // together" message beats a silent Ok(0)-skip that would
-            // leave retrieval subtly wrong forever. The
-            // manually-edited-DB scenario is user-poisoned state,
-            // out of scope. Tests lock the happy-case mapping
-            // exhaustively (`parser_key_typescript_discriminates_tsx`
-            // + `parser_key_non_typescript_ignores_path`); the
-            // unreachable arm stays as the invariant sentinel.
+            // **Reachability analysis for 2.1-A** (added round-8 after
+            // gemini re-raised the robustness concern). Two call sites
+            // reach `parser_key` from runtime state:
+            //
+            //   (i)  **Phase-4 walker** (indexer.rs:564): feeds
+            //        `parser_key(lang, path)` where `lang` came from
+            //        `Language::from_wire(w.language)` and `w.language`
+            //        came from `indexer::detect_language(path)`. For
+            //        `lang == TypeScript`, `detect_language` only ever
+            //        returned `Some(TypeScript)` if `path.extension()`
+            //        was `"ts"` or `"tsx"` (see `detect_language` above).
+            //        So the `other` arm here is structurally unreachable
+            //        from this path today.
+            //
+            //   (ii) **Backfill loop** (indexer.rs:421): WHERE clause is
+            //        literally `language = 'rust'` in 2.1-A. TypeScript
+            //        rows are not selected; `parser_key(Rust, _)` does
+            //        not touch the TypeScript arm.
+            //
+            // Neither current path can reach this `other` arm from
+            // valid DB state. The arm is only reachable from:
+            //
+            //   (a) A future PR (2.1-C) that widens the backfill query
+            //       to include TypeScript rows. **That PR's job** is to
+            //       re-evaluate whether `parser_key` should switch to
+            //       `Result<ParserKey, _>` at that point — a log-and-
+            //       purge path is reasonable once the arm becomes
+            //       reachable from row state. Until then, adding
+            //       fallibility is complexity without observable value.
+            //
+            //   (b) Manual DB edits (user writes `language='typescript'`
+            //       + `path='foo.go'`). Per CLAUDE.md: *"JSONL is
+            //       authoritative. SQLite mirror is a rebuildable
+            //       secondary index."* The rebuild is `rm
+            //       .azoth/state.sqlite && azoth index --prewarm`.
+            //       Panicking on corrupt mirror state surfaces the
+            //       contract violation loudly; a silent log-and-skip
+            //       would leave wrong-language rows untouched and
+            //       return corrupt retrieval results until the user
+            //       notices a retrieval quality regression.
+            //
+            //   (c) Concurrent writer outside azoth's transaction
+            //       discipline. Same resolution as (b): mirror is
+            //       rebuildable; loud panic > silent corruption.
+            //
+            //   (d) A future binary that **narrows** `detect_language`
+            //       (drops an extension) without shipping a migration
+            //       that purges `documents` rows for the retired
+            //       extension. Same class as (a): the narrowing PR's
+            //       job is to land the migration, and CI on that PR
+            //       must exercise the new schema version.
+            //
+            // My call in round-6 was "reject with docs"; round-7 leaves
+            // that call standing and adds the reachability analysis
+            // I should have written in round-6. Tests lock the
+            // happy-case mapping exhaustively
+            // (`parser_key_typescript_discriminates_tsx` +
+            // `parser_key_non_typescript_ignores_path`); the
+            // unreachable arm stays as the invariant sentinel, and
+            // the re-evaluation gate is scheduled for 2.1-C when the
+            // backfill widens.
             other => unreachable!(
                 "parser_key: unhandled TypeScript extension {other:?} — \
                  widen detect_language and parser_key together, \

@@ -414,6 +414,45 @@ fn reindex_blocking(
     // The subquery is cheap: `symbols_by_path_line_idx` covers the
     // leading `path` column so the scan is an index lookup per row.
     // On a well-synced DB the outer query returns zero rows.
+    //
+    // **Known perf leak (gemini MED on PR #19 f41217f, accepted
+    // advisory, deferred).** This predicate conflates "never
+    // indexed for symbols" with "indexed but produced zero symbols":
+    // a Rust file that parses successfully to `vec![]` (comment-only,
+    // empty, or stub `mod.rs` re-exports) writes zero `symbols` rows
+    // on Phase-4, then re-qualifies for this backfill on every
+    // subsequent reindex pass until its content changes. I'm leaving
+    // it unfixed in 2.1-A for three reasons:
+    //
+    //   - **Scope.** PR 2.1-A is "SymbolKind extension + language
+    //     dispatcher." Schema changes belong in their own PR behind
+    //     a migration step.
+    //   - **Cost.** Each wasted re-extract is one `SELECT content`
+    //     + one tree-sitter parse + one no-op `DELETE FROM symbols
+    //     WHERE path=?`. On typical repos the empty-symbol
+    //     population is small (a handful of re-export `mod.rs`
+    //     files, test stubs) so per-pass waste is single-digit ms.
+    //     The cost scales with that population, not with repo size.
+    //   - **Origin.** I did not introduce this predicate — it shipped
+    //     in PR #6's backfill (codex P2 #4) — but I'm touching this
+    //     function this round, so the defer is mine to own.
+    //
+    // **Reopen condition.** Fix when (a) PR 2.1-B/C/D lands a grammar
+    // whose typical files often produce zero symbols (Go's
+    // `doc.go`, TypeScript `.d.ts`, Python `__init__.py`) so the
+    // empty-symbol population grows, OR (b) user-visible reindex
+    // latency on a real repo surfaces this as a hot path.
+    //
+    // **Fix shape when reopened.** Add `symbols_extracted_at INTEGER
+    // NULL` to `documents` via a new migration (`m00NN_symbols_meta.rs`).
+    // `SymbolWriter::replace` stamps `symbols_extracted_at = ?`
+    // atomically with its DELETE+INSERT. This predicate becomes
+    // `WHERE symbols_extracted_at IS NULL` — once a path is
+    // extracted (even to zero symbols), it's no longer re-fetched
+    // until its content (and thus `documents.content`) changes,
+    // which already forces a Phase-4 Update that re-stamps the
+    // column. Makes backfill idempotent without changing the
+    // healing semantics for scenarios (1) and (2) above.
     let backfill: Vec<(String, String, String)> = {
         let mut stmt = tx.prepare(
             "SELECT path, content, language FROM documents
