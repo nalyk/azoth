@@ -157,97 +157,83 @@ pub enum ParserKey {
 /// Single source of truth for path-sensitive discrimination — the
 /// indexer uses this to key its parser cache so mixed `.ts`/`.tsx`
 /// repos keep two distinct parsers live after PR 2.1-C wires the
-/// TypeScript grammar. Inputs that `detect_language` would reject
-/// never reach this function; the path extension is only consulted
-/// for the one language that actually needs it.
-pub fn parser_key(lang: Language, path: &Path) -> ParserKey {
+/// TypeScript grammar.
+///
+/// **Two invariants are at play here; I originally conflated them.**
+///
+/// 1. **Authorship invariant** (source-level, between siblings):
+///    `detect_language` and `parser_key` must co-evolve. Every
+///    extension admitted by the former MUST have a conscious landing
+///    arm in the latter. This is a programmer contract.
+///
+/// 2. **Data invariant** (runtime, over durable state): the pair
+///    `(documents.language, path.extension)` must be consistent. This
+///    is a property of DB rows, which outlive the current binary's
+///    authorship snapshot — a future binary may write rows 2.1-A
+///    cannot interpret, a user may manually edit the mirror, a
+///    concurrent writer may violate transactional ordering.
+///
+/// Round-6 / round-8 / round-9 rejection thread on PR #19 — gemini
+/// suggested `Result<ParserKey, _>` for the TypeScript path-mismatch
+/// arm; I rejected with paired-invariant rationale TWICE. The 4th
+/// raise forced re-investigation (per
+/// `feedback_reject_with_documentation_when_arch_forbids.md`'s
+/// 3+-raises rule). My reasoning was wrong: I was defending the
+/// authorship invariant with `unreachable!()`, which IS correct for
+/// authorship — but the arm IS reachable from runtime data when the
+/// data invariant breaks, and panicking the whole reindex pass on
+/// one corrupt row is worse UX than log+purge+continue. CLAUDE.md
+/// explicitly treats the SQLite mirror as *"a rebuildable secondary
+/// index"*; a secondary index should be self-healing.
+///
+/// Returns `Err(ExtractError::LanguagePathMismatch { .. })` when the
+/// data invariant is violated. Callers in the indexer translate this
+/// to `tracing::error!` + `SymbolWriter::replace(path, lang, &[])` +
+/// `return Ok(0)` — consistent with the round-7 uniform invariant
+/// ("Ok(0) ⇒ zero rows for path"). Authorship violations (future
+/// binary widens `detect_language` without widening `parser_key`)
+/// still surface: a new test exercising the widened extension will
+/// hit `LanguagePathMismatch` and fail loudly in CI, the same
+/// signal `unreachable!()` used to give.
+pub fn parser_key(lang: Language, path: &Path) -> Result<ParserKey, ExtractError> {
     match lang {
-        Language::Rust => ParserKey::Rust,
-        Language::Python => ParserKey::Python,
+        Language::Rust => Ok(ParserKey::Rust),
+        Language::Python => Ok(ParserKey::Python),
         Language::TypeScript => match path.extension().and_then(|s| s.to_str()) {
-            Some("tsx") => ParserKey::TypeScriptTsx,
-            Some("ts") => ParserKey::TypeScriptTs,
-            // `detect_language` and `parser_key` are a **paired
-            // invariant**: every extension admitted by the former's
-            // TypeScript arm must have a conscious landing arm here.
-            // Today the former only admits `.ts`/`.tsx`, so reaching
-            // this branch is a violation of the paired invariant —
-            // not a graceful-degradation opportunity. I landed
-            // `unreachable!()` here in round-5 (PR #19 b1ddfeb,
-            // gemini MED) after originally shipping `debug_assert!(false, …)`
-            // in round-4; the macro swap was my call and reflects that
-            // the branch is genuinely unreachable from valid state, not
-            // a "maybe in production" concern.
+            Some("tsx") => Ok(ParserKey::TypeScriptTsx),
+            Some("ts") => Ok(ParserKey::TypeScriptTs),
+            // The fallthrough arm is reachable from runtime data
+            // even though `detect_language`'s TypeScript match only
+            // admits `.ts`/`.tsx` today. Reachable paths:
             //
-            // **Reachability analysis for 2.1-A** (added round-8 after
-            // gemini re-raised the robustness concern). Two call sites
-            // reach `parser_key` from runtime state:
+            //   - Future binary (2.2+) wires `.mts`/`.cts` and writes
+            //     rows with `documents.language='typescript'` +
+            //     `path='foo.mts'`; user downgrades to 2.1-A.
+            //   - Manual DB edit sets `language='typescript'` on a row
+            //     whose path has a different extension.
+            //   - Concurrent writer outside azoth's transaction
+            //       discipline corrupts a row's language/path pair.
             //
-            //   (i)  **Phase-4 walker** (indexer.rs:564): feeds
-            //        `parser_key(lang, path)` where `lang` came from
-            //        `Language::from_wire(w.language)` and `w.language`
-            //        came from `indexer::detect_language(path)`. For
-            //        `lang == TypeScript`, `detect_language` only ever
-            //        returned `Some(TypeScript)` if `path.extension()`
-            //        was `"ts"` or `"tsx"` (see `detect_language` above).
-            //        So the `other` arm here is structurally unreachable
-            //        from this path today.
+            // Returning `LanguagePathMismatch` lets the indexer log
+            // the anomaly, purge the path's symbol rows, and continue
+            // with the rest of the reindex — the "secondary index
+            // self-heals" behavior CLAUDE.md prescribes. A panic here
+            // would kill every OTHER file's reindex in the same pass
+            // because of one bad row; the one-line dismissal I wrote
+            // in round-6 ("user-poisoned, out of scope") didn't
+            // acknowledge that blast radius.
             //
-            //   (ii) **Backfill loop** (indexer.rs:421): WHERE clause is
-            //        literally `language = 'rust'` in 2.1-A. TypeScript
-            //        rows are not selected; `parser_key(Rust, _)` does
-            //        not touch the TypeScript arm.
-            //
-            // Neither current path can reach this `other` arm from
-            // valid DB state. The arm is only reachable from:
-            //
-            //   (a) A future PR (2.1-C) that widens the backfill query
-            //       to include TypeScript rows. **That PR's job** is to
-            //       re-evaluate whether `parser_key` should switch to
-            //       `Result<ParserKey, _>` at that point — a log-and-
-            //       purge path is reasonable once the arm becomes
-            //       reachable from row state. Until then, adding
-            //       fallibility is complexity without observable value.
-            //
-            //   (b) Manual DB edits (user writes `language='typescript'`
-            //       + `path='foo.go'`). Per CLAUDE.md: *"JSONL is
-            //       authoritative. SQLite mirror is a rebuildable
-            //       secondary index."* The rebuild is `rm
-            //       .azoth/state.sqlite && azoth index --prewarm`.
-            //       Panicking on corrupt mirror state surfaces the
-            //       contract violation loudly; a silent log-and-skip
-            //       would leave wrong-language rows untouched and
-            //       return corrupt retrieval results until the user
-            //       notices a retrieval quality regression.
-            //
-            //   (c) Concurrent writer outside azoth's transaction
-            //       discipline. Same resolution as (b): mirror is
-            //       rebuildable; loud panic > silent corruption.
-            //
-            //   (d) A future binary that **narrows** `detect_language`
-            //       (drops an extension) without shipping a migration
-            //       that purges `documents` rows for the retired
-            //       extension. Same class as (a): the narrowing PR's
-            //       job is to land the migration, and CI on that PR
-            //       must exercise the new schema version.
-            //
-            // My call in round-6 was "reject with docs"; round-7 leaves
-            // that call standing and adds the reachability analysis
-            // I should have written in round-6. Tests lock the
-            // happy-case mapping exhaustively
-            // (`parser_key_typescript_discriminates_tsx` +
-            // `parser_key_non_typescript_ignores_path`); the
-            // unreachable arm stays as the invariant sentinel, and
-            // the re-evaluation gate is scheduled for 2.1-C when the
-            // backfill widens.
-            other => unreachable!(
-                "parser_key: unhandled TypeScript extension {other:?} — \
-                 widen detect_language and parser_key together, \
-                 and add a migration to purge DB rows for any \
-                 extension removed from detect_language"
-            ),
+            // Authorship drift (future binary widens `detect_language`
+            // without widening this arm) is still caught loudly: a
+            // new test exercising `.mts`/`.cts` will hit this Err and
+            // CI fails. The authorship invariant is now enforced by
+            // TESTS, not by panic on production state.
+            other => Err(ExtractError::LanguagePathMismatch {
+                language: Language::TypeScript,
+                extension: other.map(str::to_owned),
+            }),
         },
-        Language::Go => ParserKey::Go,
+        Language::Go => Ok(ParserKey::Go),
     }
 }
 
@@ -380,20 +366,20 @@ mod tests {
         // `HashMap<ParserKey, Parser>` holds a parser per flavor once
         // PR 2.1-C wires the TypeScript grammar.
         assert_eq!(
-            parser_key(Language::TypeScript, Path::new("app/x.ts")),
+            parser_key(Language::TypeScript, Path::new("app/x.ts")).unwrap(),
             ParserKey::TypeScriptTs,
         );
         assert_eq!(
-            parser_key(Language::TypeScript, Path::new("lib/types.d.ts")),
+            parser_key(Language::TypeScript, Path::new("lib/types.d.ts")).unwrap(),
             ParserKey::TypeScriptTs,
         );
         assert_eq!(
-            parser_key(Language::TypeScript, Path::new("app/Button.tsx")),
+            parser_key(Language::TypeScript, Path::new("app/Button.tsx")).unwrap(),
             ParserKey::TypeScriptTsx,
         );
         assert_ne!(
-            parser_key(Language::TypeScript, Path::new("a.ts")),
-            parser_key(Language::TypeScript, Path::new("a.tsx")),
+            parser_key(Language::TypeScript, Path::new("a.ts")).unwrap(),
+            parser_key(Language::TypeScript, Path::new("a.tsx")).unwrap(),
             "TS and TSX must hash to distinct cache slots",
         );
     }
@@ -405,22 +391,73 @@ mod tests {
         // invariant so future additions of `.pyi` or similar are a
         // conscious `ParserKey` variant add, not a silent drift.
         assert_eq!(
-            parser_key(Language::Rust, Path::new("src/foo.rs")),
+            parser_key(Language::Rust, Path::new("src/foo.rs")).unwrap(),
             ParserKey::Rust,
         );
         assert_eq!(
-            parser_key(Language::Rust, Path::new("whatever.unrelated")),
+            parser_key(Language::Rust, Path::new("whatever.unrelated")).unwrap(),
             ParserKey::Rust,
         );
         assert_eq!(
-            parser_key(Language::Python, Path::new("a.py")),
+            parser_key(Language::Python, Path::new("a.py")).unwrap(),
             ParserKey::Python,
         );
         assert_eq!(
-            parser_key(Language::Python, Path::new("a.pyi")),
+            parser_key(Language::Python, Path::new("a.pyi")).unwrap(),
             ParserKey::Python,
             "stub files share the cache slot until a parser flavor is added",
         );
-        assert_eq!(parser_key(Language::Go, Path::new("a.go")), ParserKey::Go,);
+        assert_eq!(
+            parser_key(Language::Go, Path::new("a.go")).unwrap(),
+            ParserKey::Go,
+        );
+    }
+
+    /// v2.1-A PR #19 round-9 (gemini MED 4th raise, reversal from
+    /// round-6/round-8 reject). `parser_key` now returns
+    /// `Err(LanguagePathMismatch)` instead of `unreachable!()`-panicking
+    /// when the `(Language, path)` pair violates the data invariant.
+    /// Locks: (a) the Err branch fires on the exact shape gemini
+    /// raised (TypeScript + non-`.ts`/`.tsx` extension), (b) the
+    /// payload carries BOTH the language and the observed extension
+    /// so a log message can be actionable, (c) paths with no
+    /// extension at all still produce a structured Err (no panic).
+    ///
+    /// Authorship-invariant enforcement (`detect_language` must
+    /// co-evolve with `parser_key`) still holds: a future binary
+    /// that widens `detect_language` to accept `.mts`/`.cts` without
+    /// widening `parser_key` will hit this Err in CI — the
+    /// authorship contract is now enforced by TESTS (including this
+    /// one), not by runtime panic. That's the crux of the round-9
+    /// reversal: data-invariant violations need graceful recovery,
+    /// authorship-invariant violations need loud CI failures; one
+    /// return type, two enforcement sites.
+    #[test]
+    fn parser_key_typescript_rejects_mismatched_extension() {
+        match parser_key(Language::TypeScript, Path::new("foo.go")) {
+            Err(ExtractError::LanguagePathMismatch {
+                language: Language::TypeScript,
+                extension: Some(ext),
+            }) => assert_eq!(ext, "go"),
+            other => panic!("expected LanguagePathMismatch for foo.go, got {other:?}"),
+        }
+
+        match parser_key(Language::TypeScript, Path::new("foo.mts")) {
+            Err(ExtractError::LanguagePathMismatch {
+                language: Language::TypeScript,
+                extension: Some(ext),
+            }) => assert_eq!(ext, "mts"),
+            other => panic!("expected LanguagePathMismatch for foo.mts, got {other:?}"),
+        }
+
+        match parser_key(Language::TypeScript, Path::new("no_extension_here")) {
+            Err(ExtractError::LanguagePathMismatch {
+                language: Language::TypeScript,
+                extension: None,
+            }) => {}
+            other => panic!(
+                "expected LanguagePathMismatch with extension=None for extensionless path, got {other:?}"
+            ),
+        }
     }
 }

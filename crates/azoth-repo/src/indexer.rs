@@ -600,7 +600,33 @@ fn extract_and_store(
     symbol_writer: &mut crate::code_graph::SymbolWriter<'_>,
 ) -> Result<u32, IndexerError> {
     let lang_tag = lang.as_str();
-    let key = crate::code_graph::parser_key(lang, Path::new(path));
+
+    // `parser_key` may fail if the `(language, path)` pair from the
+    // DB is internally inconsistent (data-invariant violation — see
+    // `code_graph::parser_key` doc). Treat Err the same way as every
+    // other non-success branch in this function: log loudly, purge
+    // this path's symbol rows, and return `Ok(0)`. The reindex
+    // continues for every OTHER file in the pass, which is the
+    // point of flipping from `unreachable!()` to `Result` on the
+    // 4th gemini raise in PR #19 — a corrupt row should not kill
+    // the session's whole reindex (CLAUDE.md: "SQLite mirror is a
+    // rebuildable secondary index"). Uniform invariant: when this
+    // function returns `Ok(0)`, the DB holds zero symbol rows for
+    // `path`.
+    let key = match crate::code_graph::parser_key(lang, Path::new(path)) {
+        Ok(k) => k,
+        Err(e) => {
+            tracing::error!(
+                path = %path,
+                language = %lang_tag,
+                error = %e,
+                "parser_key rejected (language, path) pair as data-invariant violation; \
+                 purging stale rows and skipping this file"
+            );
+            symbol_writer.replace(path, lang_tag, &[])?;
+            return Ok(0);
+        }
+    };
 
     // Full `entry(key)` match (gemini MED on PR #19) — the cache is
     // keyed by `ParserKey` so `.ts` and `.tsx` files keep distinct
@@ -949,6 +975,128 @@ mod tests {
         assert!(
             rs_symbol_rows >= 1,
             "Rust extractor still produces at least one symbol for alpha.rs"
+        );
+    }
+
+    /// v2.1-A PR #19 round-9 (gemini MED 4th raise; reversal of my
+    /// round-6/round-8 rejections). `parser_key` now returns
+    /// `Err(LanguagePathMismatch)` instead of panicking when the
+    /// `(Language, path)` pair violates the data invariant. The
+    /// indexer's call site must translate this to log + purge +
+    /// `Ok(0)` — same uniform invariant as round-7's
+    /// UnsupportedLanguage purge. This test exercises that translation
+    /// directly: set up a minimal SymbolWriter context, call
+    /// `extract_and_store` with a corrupt `(TypeScript, "foo.go")`
+    /// pair, assert the function returns Ok(0) (no panic, reindex
+    /// pass survives) AND that pre-existing symbol rows for the
+    /// corrupt path are purged.
+    ///
+    /// Why a direct `extract_and_store` call instead of an end-to-end
+    /// reindex: in 2.1-A, no code path from `reindex_incremental`
+    /// reaches the LanguagePathMismatch arm because `detect_language`
+    /// is deterministic on path extension (Phase-4 walker can't
+    /// emit a `(TypeScript, foo.go)` pair) and the backfill's WHERE
+    /// clause is `language = 'rust'` (TypeScript rows not selected).
+    /// The Err arm becomes production-reachable in 2.1-C when the
+    /// backfill widens; until then, it's defensive + test-covered.
+    #[tokio::test]
+    async fn parser_key_mismatch_logs_purges_and_returns_ok_zero() {
+        let td = TempDir::new().unwrap();
+        let db = td.path().join("mirror.sqlite");
+        let repo = td.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        // One normal Rust file so the reindex produces a real
+        // symbol row — lets us assert "other files still indexed"
+        // after the corrupt call exercises the new error path.
+        std::fs::write(repo.join("alpha.rs"), "fn alpha() {}\n").unwrap();
+
+        let idx = RepoIndexer::open(&db, &repo).unwrap();
+        let _ = idx.reindex_incremental().await.unwrap();
+
+        // Pre-seed a symbol row for the path we're about to hand
+        // through the corrupt-pair call — simulates a prior-version
+        // binary that indexed this file and left rows behind. The
+        // round-9 purge must wipe it.
+        let corrupt_path = "src/corrupt.go";
+        {
+            let guard = idx.conn.lock().unwrap();
+            guard
+                .execute(
+                    "INSERT INTO documents (path, mtime, language, content)
+                     VALUES (?1, 0, 'typescript', 'whatever')",
+                    [corrupt_path],
+                )
+                .unwrap();
+            guard
+                .execute(
+                    "INSERT INTO symbols (name, kind, path, start_line, end_line, parent_id, language, digest)
+                     VALUES ('stale', 'function', ?1, 1, 2, NULL, 'typescript', 'stale-digest')",
+                    [corrupt_path],
+                )
+                .unwrap();
+            let n: i64 = guard
+                .query_row(
+                    "SELECT COUNT(*) FROM symbols WHERE path = ?1",
+                    [corrupt_path],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1, "pre-seed sanity: one stale row in place");
+        }
+
+        // Open a transaction over the same connection and invoke
+        // `extract_and_store` directly with the corrupt pair. This is
+        // exactly what the 2.1-C backfill will do when a row with
+        // language='typescript' + path='*.go' enters the loop.
+        {
+            let mut guard = idx.conn.lock().unwrap();
+            let tx = guard
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let mut writer = crate::code_graph::SymbolWriter::new(&tx).unwrap();
+            let mut parsers: HashMap<ParserKey, tree_sitter::Parser> = HashMap::new();
+            let out = extract_and_store(
+                corrupt_path,
+                "whatever",
+                Language::TypeScript,
+                &mut parsers,
+                &mut writer,
+            )
+            .expect("corrupt pair must not panic the reindex; it must log + purge + Ok(0)");
+            assert_eq!(
+                out, 0,
+                "Err(LanguagePathMismatch) branch returns zero symbols written"
+            );
+            drop(writer);
+            tx.commit().unwrap();
+        }
+
+        // Post-conditions: (a) corrupt path's symbol rows purged,
+        // (b) the unrelated alpha.rs row is still present (the
+        // reindex pass survived the corrupt pair instead of
+        // panicking and aborting).
+        let guard = idx.conn.lock().unwrap();
+        let corrupt_rows: i64 = guard
+            .query_row(
+                "SELECT COUNT(*) FROM symbols WHERE path = ?1",
+                [corrupt_path],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            corrupt_rows, 0,
+            "LanguagePathMismatch must purge stale rows, same uniform invariant as UnsupportedLanguage"
+        );
+        let alpha_rows: i64 = guard
+            .query_row(
+                "SELECT COUNT(*) FROM symbols WHERE path = 'alpha.rs'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            alpha_rows >= 1,
+            "unrelated files indexed before the corrupt call remain — reindex didn't die"
         );
     }
 

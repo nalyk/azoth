@@ -72,6 +72,26 @@ pub enum ExtractError {
     /// `ExtractError::Language` (which IS log-worthy).
     #[error("no extractor wired for language: {0:?}")]
     UnsupportedLanguage(Language),
+    /// `parser_key` saw a `(Language, path)` pair whose path extension
+    /// is inconsistent with the language. Fires when
+    /// `documents.language` and `documents.path.extension` disagree —
+    /// which can happen only through external corruption (manual DB
+    /// edit, concurrent writer outside our transaction discipline, or
+    /// a future binary that wrote a row format 2.1-A cannot interpret).
+    /// The indexer treats this as **invariant violation on durable
+    /// data** (not authorship): log an error, purge the path's symbol
+    /// rows to restore the "Ok(0) ⇒ zero rows" uniform invariant, and
+    /// continue with the rest of the reindex pass. Gemini raised this
+    /// across PR #19 rounds 4/6/8/9; I rejected twice with docs, then
+    /// re-investigated on the 4th raise (per the 3+-raises rule in
+    /// `feedback_reject_with_documentation_when_arch_forbids.md`) and
+    /// accepted that a secondary index must be self-healing, not
+    /// panic-crashing.
+    #[error("language/path mismatch: language={language:?} extension={extension:?}")]
+    LanguagePathMismatch {
+        language: Language,
+        extension: Option<String>,
+    },
 }
 
 /// Build a tree-sitter `Parser` pre-configured for Rust. The caller
