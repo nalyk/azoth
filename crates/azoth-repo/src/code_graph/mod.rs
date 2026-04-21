@@ -56,13 +56,13 @@ impl Language {
     /// dispatch. Returns `None` for tags outside the grammar-wired
     /// set (markdown, toml, javascript, etc.).
     pub fn from_wire(tag: &str) -> Option<Self> {
-        Some(match tag {
-            "rust" => Language::Rust,
-            "python" => Language::Python,
-            "typescript" => Language::TypeScript,
-            "go" => Language::Go,
-            _ => return None,
-        })
+        match tag {
+            "rust" => Some(Language::Rust),
+            "python" => Some(Language::Python),
+            "typescript" => Some(Language::TypeScript),
+            "go" => Some(Language::Go),
+            _ => None,
+        }
     }
 }
 
