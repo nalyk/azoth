@@ -63,11 +63,14 @@ grep-searcher = "0.1"
 grep-regex = "0.1"
 grep-matcher = "0.1"
 
-# Symbol extraction (Sprint 2 — tree-sitter, Rust-only for v2).
-# Grammar pins must travel together: tree-sitter-rust 0.21 targets the
-# tree-sitter 0.22 ABI; bumping either without the other breaks ABI.
+# Symbol extraction (Sprint 2 base; v2.1 widening).
+# Grammar pins must travel together: every tree-sitter-* grammar
+# is ABI-linked to tree-sitter 0.22; bumping either side without
+# the other breaks the ABI. v2.1 widens the wired grammar set:
+# Python (PR 2.1-B), TypeScript (PR 2.1-C), Go (PR 2.1-D).
 tree-sitter = "0.22"
 tree-sitter-rust = "0.21"
+tree-sitter-python = "0.21"
 
 # Test utils
 tempfile = "3"

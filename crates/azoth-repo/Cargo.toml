@@ -22,10 +22,11 @@ tokio = { workspace = true }
 # Repo walking (scope-parity with ripgrep lexical retrieval).
 ignore = { workspace = true }
 
-# Symbol extraction (Sprint 2). ABI-linked pair — never bump
-# independently. See workspace Cargo.toml note.
+# Symbol extraction (Sprint 2 base + v2.1 widening). ABI-linked
+# set — never bump independently. See workspace Cargo.toml note.
 tree-sitter = { workspace = true }
 tree-sitter-rust = { workspace = true }
+tree-sitter-python = { workspace = true }
 
 # Stable content-addressable hashing for the `symbols.digest` column
 # (PR #6 review — `DefaultHasher` algorithm is not stable across Rust
