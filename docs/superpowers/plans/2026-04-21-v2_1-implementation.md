@@ -202,9 +202,11 @@ pub fn detect_language(path: &Path) -> Option<Language> {
 }
 
 /// Dispatch entry point. Each new grammar adds one arm here and one
-/// `pub mod` line above. Returns `Err(ExtractError::Language)` if the
-/// grammar for `lang` is not wired in (unreachable under detect_language
-/// but defends against callers synthesising a `Language` value).
+/// `pub mod` line above. Returns
+/// `Err(ExtractError::UnsupportedLanguage(lang))` if the grammar for
+/// `lang` is not wired in — distinct from `ExtractError::Language`
+/// (tree-sitter ABI failure) so the indexer can silent-skip pending
+/// languages without log spam.
 pub fn extract_for(
     lang: Language,
     parser: &mut tree_sitter::Parser,
@@ -213,7 +215,9 @@ pub fn extract_for(
     match lang {
         Language::Rust => extract_rust(parser, src),
         // PRs B/C/D replace these `Err` arms with the real extractors.
-        Language::Python | Language::TypeScript | Language::Go => Err(ExtractError::Language),
+        Language::Python | Language::TypeScript | Language::Go => {
+            Err(ExtractError::UnsupportedLanguage(lang))
+        }
     }
 }
 ```
@@ -313,8 +317,10 @@ azoth: 2.1-A — SymbolKind extension + language dispatcher
 Adds Class/Method/Interface/TypeAlias/Decorator/Package to SymbolKind;
 introduces Language enum + detect_language + extract_for in
 code_graph. Rust extraction path routes through dispatcher; Py/TS/Go
-arms return ExtractError::Language pending PRs B/C/D. Pre-2.1 JSONL
-replays clean.
+arms return ExtractError::UnsupportedLanguage(lang) pending PRs
+B/C/D (distinct from ExtractError::Language — ABI failure — so the
+indexer can silent-skip pending grammars without log spam). Pre-2.1
+JSONL replays clean.
 EOF
 )"
 ```
@@ -645,7 +651,7 @@ Edit `crates/azoth-repo/src/code_graph/mod.rs`:
 
 1. Uncomment / add `pub mod python;` next to `pub mod rust;`.
 2. Re-export: append `pub use python::{extract_python, python_parser};`.
-3. In `extract_for`, replace the `Language::Python | ... => Err(ExtractError::Language)` arm with a split:
+3. In `extract_for`, replace the `Language::Python | ... => Err(ExtractError::UnsupportedLanguage(lang))` arm with a split:
 
 ```rust
 pub fn extract_for(
@@ -656,7 +662,9 @@ pub fn extract_for(
     match lang {
         Language::Rust => extract_rust(parser, src),
         Language::Python => extract_python(parser, src),
-        Language::TypeScript | Language::Go => Err(ExtractError::Language),
+        Language::TypeScript | Language::Go => {
+            Err(ExtractError::UnsupportedLanguage(lang))
+        }
     }
 }
 ```
@@ -1122,7 +1130,7 @@ pub fn extract_for(
         Language::Rust => extract_rust(parser, src),
         Language::Python => extract_python(parser, src),
         Language::TypeScript => extract_typescript(parser, src),
-        Language::Go => Err(ExtractError::Language),
+        Language::Go => Err(ExtractError::UnsupportedLanguage(lang)),
     }
 }
 ```
@@ -1138,7 +1146,7 @@ pub fn parser_for(lang: Language, path: &std::path::Path) -> Result<tree_sitter:
             let is_tsx = path.extension().and_then(|s| s.to_str()) == Some("tsx");
             if is_tsx { typescript_parser_tsx() } else { typescript_parser_ts() }
         }
-        Language::Go => Err(ExtractError::Language), // PR-D
+        Language::Go => Err(ExtractError::UnsupportedLanguage(Language::Go)), // PR-D
     }
 }
 ```

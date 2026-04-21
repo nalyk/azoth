@@ -84,10 +84,12 @@ pub fn detect_language(path: &Path) -> Option<Language> {
 }
 
 /// Dispatch entry point. Each new grammar adds one arm. Returns
-/// `Err(ExtractError::Language)` for languages without a grammar
-/// wired in — unreachable under `detect_language`, but defends
-/// against callers synthesising a `Language` value ahead of the
-/// corresponding PR landing.
+/// `Err(ExtractError::UnsupportedLanguage(lang))` for languages
+/// without a grammar wired in — distinct from
+/// `ExtractError::Language` (tree-sitter ABI failure) so callers can
+/// treat the two cases differently. The indexer routes
+/// `UnsupportedLanguage` to a silent skip (expected state until PRs
+/// 2.1-B/C/D land) while `Language` remains a log-worthy failure.
 pub fn extract_for(
     lang: Language,
     parser: &mut tree_sitter::Parser,
@@ -97,7 +99,9 @@ pub fn extract_for(
         Language::Rust => extract_rust(parser, src),
         // PRs 2.1-B / 2.1-C / 2.1-D replace each arm with the real
         // extractor once the grammar lands.
-        Language::Python | Language::TypeScript | Language::Go => Err(ExtractError::Language),
+        Language::Python | Language::TypeScript | Language::Go => {
+            Err(ExtractError::UnsupportedLanguage(lang))
+        }
     }
 }
 
@@ -117,8 +121,12 @@ pub fn parser_for(lang: Language, _path: &Path) -> Result<tree_sitter::Parser, E
         Language::Rust => rust_parser(),
         // PRs 2.1-B / C / D wire their constructors here. TypeScript
         // (PR-C) will use `_path` to choose between TS and TSX parser
-        // constructors.
-        Language::Python | Language::TypeScript | Language::Go => Err(ExtractError::Language),
+        // constructors. Until each grammar lands, callers get
+        // `UnsupportedLanguage` (deliberate) rather than `Language`
+        // (ABI failure).
+        Language::Python | Language::TypeScript | Language::Go => {
+            Err(ExtractError::UnsupportedLanguage(lang))
+        }
     }
 }
 
@@ -206,22 +214,41 @@ mod tests {
 
     #[test]
     fn extract_for_pending_languages_errors() {
-        // Pre-B/C/D guard: Python/TS/Go return ExtractError::Language.
-        // When the grammar lands, this test is updated in that PR.
+        // Pre-B/C/D guard: Python/TS/Go return
+        // `ExtractError::UnsupportedLanguage(<lang>)`, not
+        // `ExtractError::Language` (which is reserved for tree-sitter
+        // ABI failure on an already-wired grammar). When the grammar
+        // lands, the corresponding arm is removed in that PR.
         let mut parser = rust_parser().unwrap();
         for lang in [Language::Python, Language::TypeScript, Language::Go] {
-            assert!(
-                matches!(
-                    extract_for(lang, &mut parser, ""),
-                    Err(ExtractError::Language)
-                ),
-                "lang={lang:?}"
-            );
+            match extract_for(lang, &mut parser, "") {
+                Err(ExtractError::UnsupportedLanguage(got)) => assert_eq!(got, lang),
+                other => panic!("lang={lang:?}: expected UnsupportedLanguage, got {other:?}"),
+            }
         }
     }
 
     #[test]
     fn parser_for_rust_uniform_path() {
         let _ = parser_for(Language::Rust, Path::new("whatever.rs")).expect("rust parser");
+    }
+
+    #[test]
+    fn parser_for_pending_languages_errors() {
+        // Sibling to `extract_for_pending_languages_errors`. Ensures
+        // the parser factory and the extractor share the same error
+        // taxonomy so the indexer can treat the two call sites
+        // symmetrically. `tree_sitter::Parser` doesn't implement
+        // `Debug`, so we can't `{other:?}` the whole Result — drop
+        // the Ok-payload to an `()` marker before any panic message.
+        for lang in [Language::Python, Language::TypeScript, Language::Go] {
+            let err = parser_for(lang, Path::new("x.any"))
+                .map(|_parser_ok| ())
+                .expect_err("expected UnsupportedLanguage");
+            match err {
+                ExtractError::UnsupportedLanguage(got) => assert_eq!(got, lang),
+                other => panic!("lang={lang:?}: expected UnsupportedLanguage, got {other:?}"),
+            }
+        }
     }
 }

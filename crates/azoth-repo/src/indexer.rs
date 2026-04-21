@@ -45,6 +45,7 @@
 //! mirror's own connection and this one coexist. Migrations are
 //! re-run defensively on open; the migrator is idempotent.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::UNIX_EPOCH;
@@ -53,6 +54,8 @@ use azoth_core::event_store::migrations;
 use azoth_core::event_store::sqlite::MirrorError;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use thiserror::Error;
+
+use crate::code_graph::Language;
 
 /// Default ceiling on file size. Larger files get skipped — matches the
 /// Sprint 1 "cheap indexer" policy; Sprint 2 tree-sitter extraction may
@@ -344,11 +347,14 @@ fn reindex_blocking(
     // Prepare the symbol writer's DELETE + INSERT once for the whole
     // Phase-4 transaction (PR #6 gemini-code-assist MED — prior code
     // re-prepared both per file, burning ~1 sqlite3_prepare_v2 per
-    // writer call × files-in-pass). The Rust parser is lazily built
-    // on first Rust hit and reused for every subsequent .rs file so
-    // we pay `Parser::new` + `set_language` at most once per pass.
+    // writer call × files-in-pass). Parsers are lazily built on first
+    // hit per language and reused for every subsequent file of that
+    // language, so we pay `Parser::new` + `set_language` at most once
+    // per language per pass. For PR-A only Rust is wired; PRs 2.1-B/
+    // C/D extend the dispatcher in `code_graph` and the map populates
+    // itself automatically.
     let mut symbol_writer = crate::code_graph::SymbolWriter::new(&tx)?;
-    let mut rust_parser: Option<tree_sitter::Parser> = None;
+    let mut parsers: HashMap<Language, tree_sitter::Parser> = HashMap::new();
 
     let mut doc_insert = tx.prepare(
         "INSERT INTO documents (path, mtime, language, content) VALUES (?1, ?2, ?3, ?4)",
@@ -368,18 +374,22 @@ fn reindex_blocking(
             }
         }
 
-        // Sprint 2 — tree-sitter symbol extraction, Rust only. The
-        // language detector from `detect_language` names the grammar
-        // ("rust"); every other language skips the extractor until
-        // v2.1 lands the Python/TS/Go grammars. Extraction failures
-        // (bad bytes, parser error) never abort the reindex; the file
-        // simply lacks symbols this pass and gets another shot next
-        // pass.
-        if w.language == Some("rust") {
+        // Sprint 2 / v2.1-A — tree-sitter symbol extraction routed
+        // through the central `code_graph` dispatcher. Only languages
+        // recognised by `Language::from_wire` enter the extractor;
+        // non-grammar tags (markdown, toml, javascript, json, yaml,
+        // shell) fall through untouched. Inside the dispatcher,
+        // languages without a wired grammar return
+        // `ExtractError::UnsupportedLanguage` — `extract_and_store`
+        // treats that as a benign skip (no warn log) until PRs
+        // 2.1-B/C/D land. Extraction failures never abort the reindex;
+        // the file simply lacks symbols this pass.
+        if let Some(lang) = w.language.and_then(Language::from_wire) {
             stats.symbols_extracted = stats.symbols_extracted.saturating_add(extract_and_store(
                 &w.path,
                 &w.content,
-                &mut rust_parser,
+                lang,
+                &mut parsers,
                 &mut symbol_writer,
             )?);
         }
@@ -412,10 +422,13 @@ fn reindex_blocking(
         rows.collect::<Result<Vec<_>, _>>()?
     };
     for (path, content) in &backfill {
+        // Backfill is Rust-scoped by the query above. PRs 2.1-B/C/D
+        // widen the query (and this call) to cover their language.
         stats.symbols_extracted = stats.symbols_extracted.saturating_add(extract_and_store(
             path,
             content,
-            &mut rust_parser,
+            Language::Rust,
+            &mut parsers,
             &mut symbol_writer,
         )?);
     }
@@ -449,15 +462,25 @@ fn reindex_blocking(
     Ok(stats)
 }
 
-/// Run the tree-sitter extractor for one Rust file and persist the
-/// result via the shared `SymbolWriter`. Used by both the per-file
-/// write loop and the post-loop backfill pass — the two call sites
-/// share identical extract-then-write-or-purge semantics.
+/// Run the tree-sitter extractor for one file and persist the result
+/// via the shared `SymbolWriter`. Used by both the per-file write
+/// loop and the post-loop backfill pass — the two call sites share
+/// identical extract-then-write-or-purge semantics.
 ///
-/// The lazy `Option<Parser>` stays owned by the caller so a single
-/// parser instance threads through the entire reindex pass. On
-/// parser init failure (ABI mismatch) we skip and return 0; the
-/// caller continues with its next file without the error cascading.
+/// Parser instances are cached per language in the caller-owned
+/// `parsers` map so a single `Parser::new + set_language` per
+/// language threads through the entire reindex pass. On parser init
+/// failure (ABI mismatch) or extraction failure we skip and return 0;
+/// the caller continues with its next file without the error
+/// cascading.
+///
+/// **v2.1-A dispatcher routing (gemini MED-3 on 830eaa5)**: grammar
+/// selection goes through `code_graph::parser_for` and
+/// `code_graph::extract_for`. Languages without a wired grammar
+/// surface as `ExtractError::UnsupportedLanguage` — treated as a
+/// benign skip (no log) because this is the expected state until PRs
+/// 2.1-B/C/D land. The noisier `ExtractError::Language` (ABI
+/// mismatch) and `ExtractError::Parse` still warn.
 ///
 /// **Codex P2 #5 (PR #6)**: on extractor failure we explicitly
 /// replace the path's symbol rows with an empty set. The module doc
@@ -469,39 +492,53 @@ fn reindex_blocking(
 fn extract_and_store(
     path: &str,
     content: &str,
-    rust_parser: &mut Option<tree_sitter::Parser>,
+    lang: Language,
+    parsers: &mut HashMap<Language, tree_sitter::Parser>,
     symbol_writer: &mut crate::code_graph::SymbolWriter<'_>,
 ) -> Result<u32, IndexerError> {
-    let parser = match rust_parser.as_mut() {
-        Some(p) => p,
-        None => match crate::code_graph::rust_parser() {
-            Ok(p) => {
-                *rust_parser = Some(p);
-                rust_parser.as_mut().expect("just set above")
+    let lang_tag = lang.as_str();
+
+    let parser = if let std::collections::hash_map::Entry::Vacant(slot) = parsers.entry(lang) {
+        match crate::code_graph::parser_for(lang, Path::new(path)) {
+            Ok(p) => slot.insert(p),
+            Err(crate::code_graph::ExtractError::UnsupportedLanguage(_)) => {
+                // Expected state for non-Rust languages until PRs
+                // 2.1-B/C/D land; silent skip avoids log spam on every
+                // Python/TS/Go file in the repo.
+                return Ok(0);
             }
             Err(e) => {
-                // set_language failing is catastrophic (grammar ABI
-                // mismatch) — skip this file and let the rest of the
-                // pass continue.
                 tracing::warn!(
+                    language = %lang_tag,
                     error = %e,
-                    "tree-sitter rust parser init failed; skipping path"
+                    "tree-sitter parser init failed; skipping path"
                 );
                 return Ok(0);
             }
-        },
+        }
+    } else {
+        parsers
+            .get_mut(&lang)
+            .expect("entry present after vacant branch")
     };
-    match crate::code_graph::extract_rust(parser, content) {
-        Ok(syms) => Ok(symbol_writer.replace(path, "rust", &syms)?),
+
+    match crate::code_graph::extract_for(lang, parser, content) {
+        Ok(syms) => Ok(symbol_writer.replace(path, lang_tag, &syms)?),
+        Err(crate::code_graph::ExtractError::UnsupportedLanguage(_)) => {
+            // Dispatcher says no grammar wired; equivalent behaviour
+            // to the parser_for branch above. Reachable only if a
+            // future grammar lands parser_for but not extract_for
+            // (defensive against desync between the two arms).
+            Ok(0)
+        }
         Err(e) => {
             tracing::warn!(
                 path = %path,
+                language = %lang_tag,
                 error = %e,
-                "tree-sitter rust extractor failed; purging stale rows for this path"
+                "tree-sitter extractor failed; purging stale rows for this path"
             );
-            // Replace-with-empty deletes every prior row for the path,
-            // matching the "missing until next pass" promise.
-            symbol_writer.replace(path, "rust", &[])?;
+            symbol_writer.replace(path, lang_tag, &[])?;
             Ok(0)
         }
     }
@@ -726,5 +763,65 @@ mod tests {
             )
             .unwrap();
         assert_eq!(n, 0, "ignored.log must be filtered by .ignore");
+    }
+
+    /// v2.1-A gemini MED-3: the indexer routes symbol extraction
+    /// through `code_graph::extract_for`/`parser_for`, so non-Rust
+    /// languages recognised by `Language::from_wire` (Python, TS, Go)
+    /// flow through the dispatcher but silently produce no symbols
+    /// until PRs 2.1-B/C/D wire their grammars. This test locks the
+    /// contract: a `.py` file is indexed as a document with
+    /// `language='python'`, but the `symbols` table carries no rows
+    /// for that path.
+    #[tokio::test]
+    async fn pending_grammar_file_indexed_without_symbols() {
+        let td = TempDir::new().unwrap();
+        let db = td.path().join("mirror.sqlite");
+        let repo = td.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(repo.join("alpha.rs"), "fn alpha() {}\n").unwrap();
+        std::fs::write(repo.join("script.py"), "def beta():\n    pass\n").unwrap();
+
+        let idx = RepoIndexer::open(&db, &repo).unwrap();
+        let stats = idx.reindex_incremental().await.unwrap();
+        assert_eq!(stats.inserted, 2, "both files inserted into documents");
+        assert_eq!(
+            stats.symbols_extracted, 1,
+            "only Rust contributes symbols; Python dispatcher arm returns UnsupportedLanguage"
+        );
+
+        let guard = idx.conn.lock().unwrap();
+        let py_doc_lang: String = guard
+            .query_row(
+                "SELECT language FROM documents WHERE path = 'script.py'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(py_doc_lang, "python");
+
+        let py_symbol_rows: i64 = guard
+            .query_row(
+                "SELECT COUNT(*) FROM symbols WHERE path = 'script.py'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            py_symbol_rows, 0,
+            "Python grammar not wired yet — no symbol rows expected"
+        );
+
+        let rs_symbol_rows: i64 = guard
+            .query_row(
+                "SELECT COUNT(*) FROM symbols WHERE path = 'alpha.rs'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            rs_symbol_rows >= 1,
+            "Rust extractor still produces at least one symbol for alpha.rs"
+        );
     }
 }

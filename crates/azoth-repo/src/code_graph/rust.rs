@@ -28,6 +28,7 @@
 //! it's configured. Tests construct a parser on-demand via
 //! [`rust_parser`].
 
+use super::Language;
 use azoth_core::retrieval::SymbolKind;
 use sha2::{Digest, Sha256};
 use tree_sitter::{Node, Parser, Tree};
@@ -55,10 +56,22 @@ pub struct ExtractedSymbol {
 /// Result for API stability.
 #[derive(Debug, thiserror::Error)]
 pub enum ExtractError {
+    /// Internal tree-sitter failure during `Parser::set_language` —
+    /// signals a grammar-ABI mismatch for an already-wired language.
+    /// Distinct from `UnsupportedLanguage`, which means "we deliberately
+    /// have no extractor for this variant yet."
     #[error("tree-sitter: failed to set language")]
     Language,
     #[error("tree-sitter: parse returned no tree")]
     Parse,
+    /// `code_graph::extract_for` / `parser_for` was called with a
+    /// `Language` whose grammar has not yet been wired (PRs 2.1-B / C /
+    /// D add Python / TypeScript / Go). Callers in the indexer treat
+    /// this as a benign "skip symbols for this file" signal — not a
+    /// log-worthy failure — so it must stay distinct from
+    /// `ExtractError::Language` (which IS log-worthy).
+    #[error("no extractor wired for language: {0:?}")]
+    UnsupportedLanguage(Language),
 }
 
 /// Build a tree-sitter `Parser` pre-configured for Rust. The caller
