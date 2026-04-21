@@ -21,7 +21,7 @@ use crate::schemas::{
 use serde::Serialize;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufRead, BufReader, BufWriter, Seek, SeekFrom, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 use tokio::sync::mpsc::UnboundedSender;
@@ -79,10 +79,22 @@ impl JsonlWriter {
         })
     }
 
-    /// Open an existing session file for resume. Errors with `NotFound` if
-    /// the file does not exist. Runs `recover_dangling_turns` exactly once
-    /// before handing back a writer positioned at EOF — idempotent on a
-    /// fully-recovered file.
+    /// Open an existing session file for resume. Errors with `NotFound`
+    /// if the file does not exist. **Does NOT run crash-recovery** —
+    /// call [`recover_dangling`](Self::recover_dangling) explicitly
+    /// after attaching `set_mirror` + `set_tap` so both observers see
+    /// the synthetic terminal events.
+    ///
+    /// PR #18 round 7 (codex P2 3115635793): the prior behaviour —
+    /// auto-recovery inside `open_existing` — emitted synthetic
+    /// `TurnAborted { reason: Stalled }` / `TurnInterrupted`
+    /// markers by writing directly to the file, bypassing
+    /// [`set_mirror`](Self::set_mirror) and [`set_tap`](Self::set_tap)
+    /// which are attached *after* `open_existing` returns. SQLite
+    /// mirror rows drifted from JSONL on every resume until a full
+    /// rebuild, and `/status` reported stale totals. Splitting open
+    /// from recover lets callers wire mirror/tap first, then fan out
+    /// the recovery events through [`append`](Self::append).
     pub fn open_existing<P: AsRef<Path>>(path: P) -> io::Result<Self> {
         let path = path.as_ref();
         if !path.exists() {
@@ -91,10 +103,43 @@ impl JsonlWriter {
                 format!("session file not found: {}", path.display()),
             ));
         }
-        JsonlReader::open(path)
-            .recover_dangling_turns()
-            .map_err(io::Error::other)?;
         Self::open(path)
+    }
+
+    /// Close any dangling turns in the session file by appending a
+    /// synthetic terminal marker for each. Routes every synthetic
+    /// through [`append`](Self::append) so mirror + tap observers stay
+    /// consistent with the file. Idempotent: a second call on a
+    /// recovered file emits nothing.
+    ///
+    /// Call order: `set_mirror` → `recover_dangling` → `set_tap`. With
+    /// that ordering, the mirror receives the synthetic events (fixing
+    /// codex P2 3115635793) while the tap skips them — the TUI
+    /// hydration path reads them from the JSONL scan instead, so the
+    /// tap replay would otherwise double-insert them into the
+    /// scrollback.
+    pub fn recover_dangling(&mut self) -> io::Result<Vec<TurnId>> {
+        // Make sure any buffered writes from prior `append` calls are
+        // visible to the reader before we classify dangling turns —
+        // otherwise a just-appended TurnStarted could be misread as
+        // dangling. In practice this is defensive: callers only invoke
+        // `recover_dangling` right after `open_existing`, before any
+        // appends.
+        if let Some(f) = self.file.as_mut() {
+            f.flush()?;
+            f.get_ref().sync_data()?;
+        }
+
+        let reader = JsonlReader::open(&self.path);
+        let synthetics = reader
+            .compute_dangling_synthetics()
+            .map_err(io::Error::other)?;
+        let mut ids = Vec::with_capacity(synthetics.len());
+        for (tid, ev) in synthetics {
+            self.append(&ev)?;
+            ids.push(tid);
+        }
+        Ok(ids)
     }
 
     pub fn path(&self) -> &Path {
@@ -122,10 +167,21 @@ impl JsonlWriter {
         let file = match &mut self.file {
             Some(f) => f,
             None => {
-                let f = OpenOptions::new()
+                let mut f = OpenOptions::new()
                     .create(true)
+                    .read(true)
                     .append(true)
                     .open(&self.path)?;
+                // PR #18 round 7 (self-audit sibling to gemini MED
+                // 3115612841): `recover_dangling_turns` guards its
+                // direct-write path against a partial prior write,
+                // but `writer.recover_dangling` routes through this
+                // append path on the first event, which would
+                // concatenate the new line onto the partial tail.
+                // Probe once on lazy-open via the shared helper. Cost:
+                // one metadata() + one seek + one read, exactly once
+                // per writer instance.
+                ensure_newline_at_tail(&mut f)?;
                 self.file = Some(BufWriter::new(f));
                 self.file.as_mut().expect("just set")
             }
@@ -148,6 +204,37 @@ impl JsonlWriter {
 
 fn serialize_line<T: Serialize>(event: &T) -> io::Result<String> {
     serde_json::to_string(event).map_err(io::Error::other)
+}
+
+/// Inject a trailing `\n` at the file tail if one is missing. Used by
+/// both the direct-write recovery path and the writer's lazy-open path
+/// to defend against partial prior writes (kernel persisted line bytes
+/// but not the trailing newline before a crash) or external appenders
+/// that don't terminate their lines.
+///
+/// Expects the file to be opened with both `read(true)` and
+/// `append(true)`. `append` mode on Linux auto-positions writes to EOF
+/// regardless of the seek cursor, so the seek here only affects the
+/// subsequent read.
+///
+/// On any I/O error during the probe this function propagates;
+/// callers that would rather skip the guard on read errors can map
+/// the result. A `read` returning 0 bytes or an empty file short-
+/// circuits cleanly — nothing to merge onto, nothing to fix.
+fn ensure_newline_at_tail(file: &mut File) -> io::Result<()> {
+    let len = file.metadata()?.len();
+    if len == 0 {
+        return Ok(());
+    }
+    file.seek(SeekFrom::Start(len - 1))?;
+    let mut last = [0u8; 1];
+    match file.read(&mut last) {
+        Ok(1) if last[0] != b'\n' => {
+            file.write_all(b"\n")?;
+            Ok(())
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Which terminal marker closed a turn.
@@ -186,7 +273,12 @@ impl JsonlReader {
     /// Scan the file once, grouping events by turn and classifying the
     /// outcome of each turn. Turns without any terminal marker are classified
     /// as `None` (dangling); the caller decides whether to patch them.
-    fn scan(&self) -> Result<Scan, ProjectionError> {
+    ///
+    /// Pub so the TUI resume path can scan once and fold via the
+    /// [`Scan`] projection methods — see PR #18 round 7 (gemini MED
+    /// 3115612857) for context on why this used to be four separate
+    /// scans.
+    pub fn scan(&self) -> Result<Scan, ProjectionError> {
         let file = File::open(&self.path)?;
         let reader = BufReader::new(file);
         let mut events: Vec<SessionEvent> = Vec::new();
@@ -269,7 +361,7 @@ impl JsonlReader {
     /// `turns_at_heartbeats` SQLite index lands so the forensic
     /// projection can ride the mirror instead of the JSONL. Either
     /// trigger flips this to a streaming impl; neither is true today.
-    fn scan_as_of(&self, as_of: &str) -> Result<Scan, ProjectionError> {
+    pub fn scan_as_of(&self, as_of: &str) -> Result<Scan, ProjectionError> {
         // Parse the cutoff once. A malformed `--as-of` is a user-facing
         // error, so surface it loudly rather than silently excluding
         // everything.
@@ -580,6 +672,73 @@ impl JsonlReader {
     /// the runtime literally has no temporal evidence of when the turn
     /// last made progress.
     pub fn recover_dangling_turns(&self) -> Result<Vec<TurnId>, ProjectionError> {
+        let synthetics = self.compute_dangling_synthetics()?;
+        if synthetics.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut file = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(&self.path)?;
+
+        // PR #18 round 7 (gemini MED 3115612841): the prior
+        // `seek(End(0)) + write_all(line) + write_all(b"\n")` sequence
+        // could produce a corrupted JSONL if the prior write ended
+        // without a trailing newline — either because a crash hit
+        // between the two `write_all` calls (kernel pages may flush
+        // the line bytes without the trailing `\n`), or because some
+        // external producer wrote to the file. The first synthetic
+        // marker would concatenate to the partial prior line, giving
+        // `{"type":"x"}{"type":"synthetic"}\n` which `serde_json`
+        // refuses to parse — the NEXT resume crashes at scan(). Guard
+        // once via the shared helper, which reads the last byte and
+        // injects `\n` if missing.
+        ensure_newline_at_tail(&mut file)?;
+        // `append` mode ignores this seek for writes but keeps reads
+        // pointing at EOF for symmetry.
+        file.seek(SeekFrom::End(0))?;
+        for (_, synthetic) in &synthetics {
+            let line = serialize_line(synthetic)?;
+            file.write_all(line.as_bytes())?;
+            file.write_all(b"\n")?;
+        }
+        // PR #18 round 6 (gemini MED 3114298744 — rejected with docs,
+        // NOT a fix): gemini flagged "markers not explicitly flushed or
+        // synced; consider sync_all". Empirically verified: `sync_data`
+        // IS called here, which maps to POSIX `fdatasync(2)`. For
+        // append-only JSONL the on-disk distinction is:
+        //   - `sync_data` / fdatasync → data blocks + essential metadata
+        //     (file size — needed to read the appended bytes back)
+        //   - `sync_all` / fsync → above + all metadata (mtime, atime)
+        // Recovery markers are durable after `sync_data`: a subsequent
+        // process can `File::open` the file, read its full (grown) size,
+        // and scan every appended byte. `sync_all` would add mtime
+        // persistence which we don't depend on for correctness. Keeping
+        // `sync_data` avoids the extra seek on the inode metadata block
+        // on every recovery path. Symmetric with the main-append path
+        // at line ~136 which also uses `sync_data`.
+        file.sync_data()?;
+        Ok(synthetics.into_iter().map(|(tid, _)| tid).collect())
+    }
+
+    /// Pure computation half of [`recover_dangling_turns`](Self::recover_dangling_turns):
+    /// scan the file, classify dangling turns, and return the synthetic
+    /// terminal events they'd be closed with. No I/O beyond `scan()`.
+    ///
+    /// PR #18 round 7 (codex P2 3115635793): the TUI resume path needs
+    /// the *writer* to emit these synthetics through `JsonlWriter::append`
+    /// so that the SQLite mirror and the UI tap see them. Factoring the
+    /// classification out lets [`JsonlWriter::recover_dangling`] reuse
+    /// the same logic while going through `append` for durability +
+    /// side-effect fan-out.
+    ///
+    /// The returned `Vec<(TurnId, SessionEvent)>` is paired so callers
+    /// can report both the recovered turn IDs and the exact events that
+    /// landed on disk.
+    pub fn compute_dangling_synthetics(
+        &self,
+    ) -> Result<Vec<(TurnId, SessionEvent)>, ProjectionError> {
         let scan = self.scan()?;
         // Index the last seen heartbeat per turn. Walk events forward so
         // the final assignment is the most recent heartbeat — same shape
@@ -609,15 +768,10 @@ impl JsonlReader {
                 }
             }
         }
-        if dangling.is_empty() {
-            return Ok(dangling);
-        }
 
-        let mut file = OpenOptions::new().append(true).open(&self.path)?;
-        // Ensure we start on a fresh line.
-        file.seek(SeekFrom::End(0))?;
-        for turn_id in &dangling {
-            let synthetic = match last_heartbeat.get(turn_id) {
+        let mut out: Vec<(TurnId, SessionEvent)> = Vec::with_capacity(dangling.len());
+        for turn_id in dangling {
+            let synthetic = match last_heartbeat.get(&turn_id) {
                 Some((hb_at, hb_tokens)) => {
                     // Heartbeat evidence exists → reclassify as Stalled.
                     // The `at` field carries the last heartbeat, not
@@ -666,33 +820,90 @@ impl JsonlReader {
                     at: None,
                 },
             };
-            let line = serialize_line(&synthetic)?;
-            file.write_all(line.as_bytes())?;
-            file.write_all(b"\n")?;
+            out.push((turn_id, synthetic));
         }
-        // PR #18 round 6 (gemini MED 3114298744 — rejected with docs,
-        // NOT a fix): gemini flagged "markers not explicitly flushed or
-        // synced; consider sync_all". Empirically verified: `sync_data`
-        // IS called here, which maps to POSIX `fdatasync(2)`. For
-        // append-only JSONL the on-disk distinction is:
-        //   - `sync_data` / fdatasync → data blocks + essential metadata
-        //     (file size — needed to read the appended bytes back)
-        //   - `sync_all` / fsync → above + all metadata (mtime, atime)
-        // Recovery markers are durable after `sync_data`: a subsequent
-        // process can `File::open` the file, read its full (grown) size,
-        // and scan every appended byte. `sync_all` would add mtime
-        // persistence which we don't depend on for correctness. Keeping
-        // `sync_data` avoids the extra seek on the inode metadata block
-        // on every recovery path. Symmetric with the main-append path
-        // at line ~136 which also uses `sync_data`.
-        file.sync_data()?;
-        Ok(dangling)
+        Ok(out)
     }
 }
 
-struct Scan {
-    events: Vec<SessionEvent>,
-    outcomes: HashMap<TurnId, TurnOutcomeKind>,
+/// Result of a single file scan, materialised once so callers can derive
+/// multiple projections without re-reading the JSONL.
+///
+/// PR #18 round 7 (gemini MED 3115612857): the TUI resume path used to
+/// call four `*_as_of` methods back-to-back, each of which called
+/// `scan_as_of` internally and re-read the whole file. On a 250MB
+/// session log that quadrupled boot time. The pub type + projection
+/// methods below let the hydration path scan once and fold N times.
+pub struct Scan {
+    pub(crate) events: Vec<SessionEvent>,
+    pub(crate) outcomes: HashMap<TurnId, TurnOutcomeKind>,
+}
+
+impl Scan {
+    /// Replayable projection over the already-materialised events.
+    pub fn replayable(&self) -> Vec<ReplayableEvent> {
+        self.events
+            .iter()
+            .filter(|ev| is_replayable(ev, &self.outcomes))
+            .cloned()
+            .map(ReplayableEvent)
+            .collect()
+    }
+
+    /// Forensic projection over the already-materialised events.
+    pub fn forensic(&self) -> Vec<ForensicEvent> {
+        self.events
+            .iter()
+            .map(|ev| ForensicEvent {
+                event: ev.clone(),
+                non_replayable: !is_replayable(ev, &self.outcomes),
+            })
+            .collect()
+    }
+
+    /// Most recent `ContractAccepted` in the scan, or `None` if the scan
+    /// has never carried one.
+    pub fn last_accepted_contract(&self) -> Option<crate::schemas::Contract> {
+        self.events.iter().rev().find_map(|ev| match ev {
+            SessionEvent::ContractAccepted { contract, .. } => Some(contract.clone()),
+            _ => None,
+        })
+    }
+
+    /// Recompute `(EffectCounter, turns_completed)` from committed turns
+    /// only — same accounting the live driver produced.
+    pub fn committed_run_progress(&self) -> (EffectCounter, u32) {
+        let committed = self
+            .events
+            .iter()
+            .filter(|ev| match ev.turn_id() {
+                None => true,
+                Some(t) => matches!(self.outcomes.get(t), Some(TurnOutcomeKind::Committed)),
+            })
+            .cloned();
+        JsonlReader::fold_progress(committed).unwrap_or_default()
+    }
+
+    /// Rehydrate the cross-turn `Vec<Message>` from committed turns only.
+    pub fn rebuild_history(&self) -> Vec<Message> {
+        let committed = self
+            .events
+            .iter()
+            .filter(|ev| match ev.turn_id() {
+                None => true,
+                Some(t) => matches!(self.outcomes.get(t), Some(TurnOutcomeKind::Committed)),
+            })
+            .cloned();
+        JsonlReader::fold_history(committed)
+    }
+
+    /// True iff a `RunStarted` event has already been recorded in the
+    /// events of this scan. Single-pass over `self.events`.
+    pub fn has_run_started(&self) -> bool {
+        self.events
+            .iter()
+            .any(|e| matches!(e, SessionEvent::RunStarted { .. }))
+    }
 }
 
 /// An event is replayable iff it either has no turn (RunStarted) or it
@@ -989,7 +1200,11 @@ mod tests {
     }
 
     #[test]
-    fn open_existing_runs_recovery_once_then_idempotent() {
+    fn open_existing_is_pure_open_without_recovery() {
+        // PR #18 round 7 (codex P2 3115635793): `open_existing` no
+        // longer auto-runs recovery. Mirror/tap-aware callers must
+        // invoke `recover_dangling` explicitly so both observers see
+        // the synthetic terminal events.
         let dir = tempdir().unwrap();
         let path = dir.path().join("session.jsonl");
         let mut w = JsonlWriter::open(&path).unwrap();
@@ -1017,26 +1232,242 @@ mod tests {
         let err = JsonlWriter::open_existing(&missing).err().unwrap();
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
 
-        // First open_existing: recovery appends exactly one TurnInterrupted.
+        // `open_existing` is pure open now: no recovery, no synthetic
+        // markers on disk.
         let w1 = JsonlWriter::open_existing(&path).unwrap();
         drop(w1);
-        let count_after_first = JsonlReader::open(&path)
+        let count_after_open = JsonlReader::open(&path)
             .forensic()
             .unwrap()
             .iter()
             .filter(|f| matches!(&f.event, SessionEvent::TurnInterrupted { .. }))
             .count();
-        assert_eq!(count_after_first, 1);
+        assert_eq!(count_after_open, 0);
 
-        // Second open_existing on the recovered file: still exactly one.
-        let w2 = JsonlWriter::open_existing(&path).unwrap();
+        // Explicit recovery: first call appends exactly one
+        // TurnInterrupted, second call is idempotent (empty return).
+        let mut w2 = JsonlWriter::open_existing(&path).unwrap();
+        let recovered_first = w2.recover_dangling().unwrap();
+        assert_eq!(recovered_first.len(), 1);
+        let recovered_second = w2.recover_dangling().unwrap();
+        assert!(recovered_second.is_empty());
         drop(w2);
-        let count_after_second = JsonlReader::open(&path)
+
+        let count_after_recovery = JsonlReader::open(&path)
             .forensic()
             .unwrap()
             .iter()
             .filter(|f| matches!(&f.event, SessionEvent::TurnInterrupted { .. }))
             .count();
-        assert_eq!(count_after_second, 1);
+        assert_eq!(count_after_recovery, 1);
+    }
+
+    #[test]
+    fn recover_dangling_through_writer_prepends_newline_if_tail_missing() {
+        // PR #18 round 7 (gemini MED 3115612841): if the last byte of
+        // the file is not `\n` (partial prior write that crashed
+        // between `write_all(line)` and `write_all(b"\n")`, or an
+        // external producer that didn't terminate its line),
+        // appending a synthetic marker must NOT concatenate with the
+        // partial prior line. The pre-fix code produced
+        // `{"type":"turn_started"}{"type":"turn_interrupted"}\n` on
+        // one line — unparseable by `serde_json`, breaking the next
+        // resume.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+
+        // Manually construct a file whose tail lacks a trailing
+        // newline. A simple way: write one line via the writer, then
+        // append a partial line directly.
+        let mut w = JsonlWriter::open(&path).unwrap();
+        let run_id = RunId::from("run_partial".to_string());
+        let contract_id = ContractId::from("ctr_partial".to_string());
+        w.append(&SessionEvent::RunStarted {
+            run_id: run_id.clone(),
+            contract_id,
+            timestamp: ts(),
+        })
+        .unwrap();
+        drop(w);
+
+        // Append a valid TurnStarted line WITHOUT a trailing newline.
+        let t1 = TurnId::from("t_partial".to_string());
+        let partial = SessionEvent::TurnStarted {
+            turn_id: t1,
+            run_id,
+            parent_turn: None,
+            timestamp: ts(),
+        };
+        let partial_line = serialize_line(&partial).unwrap();
+        {
+            let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+            f.write_all(partial_line.as_bytes()).unwrap();
+            // Deliberately no trailing `\n` — simulates crash between
+            // the two `write_all` calls in `append`.
+            f.sync_data().unwrap();
+        }
+
+        // Recovery must inject the missing `\n` before appending the
+        // synthetic marker, so both lines stay parseable.
+        let mut w2 = JsonlWriter::open_existing(&path).unwrap();
+        let recovered = w2.recover_dangling().unwrap();
+        assert_eq!(recovered.len(), 1, "should recover the partial turn");
+        drop(w2);
+
+        // Re-scan: every line must parse. Pre-fix this panicked at
+        // `scan()` because line 2 was `{..}{..}\n` — two concatenated
+        // objects that `serde_json::from_str` rejects.
+        let forensic = JsonlReader::open(&path).forensic().unwrap();
+        assert!(
+            forensic
+                .iter()
+                .any(|f| matches!(&f.event, SessionEvent::TurnStarted { .. })),
+            "TurnStarted must survive the partial-line fix"
+        );
+        assert!(
+            forensic
+                .iter()
+                .any(|f| matches!(&f.event, SessionEvent::TurnInterrupted { .. })),
+            "synthetic TurnInterrupted must be on its own parseable line"
+        );
+    }
+
+    #[test]
+    fn append_first_event_injects_newline_if_file_tail_missing_it() {
+        // PR #18 round 7 (self-audit sibling of gemini MED 3115612841):
+        // if a prior crashed writer left the file with a partial
+        // trailing line (no `\n`), the next `append` must NOT
+        // concatenate — it must inject the missing newline first.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+
+        // Seed: valid line, then a partial trailing line with no `\n`.
+        let run_id = RunId::from("run_probe".to_string());
+        let contract_id = ContractId::from("ctr_probe".to_string());
+        let first = SessionEvent::RunStarted {
+            run_id: run_id.clone(),
+            contract_id,
+            timestamp: ts(),
+        };
+        {
+            let mut f = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .unwrap();
+            f.write_all(serialize_line(&first).unwrap().as_bytes())
+                .unwrap();
+            f.write_all(b"\n").unwrap();
+            // Partial second line, crash simulation.
+            f.write_all(b"{\"type\":\"partial\"").unwrap();
+            f.sync_data().unwrap();
+        }
+
+        // Open writer and append a valid event. The lazy-open probe
+        // must inject a `\n` before our new line, so the file parses
+        // line-by-line cleanly (modulo the partial line, which is
+        // still invalid JSON but at least on its own line).
+        let mut w = JsonlWriter::open(&path).unwrap();
+        let t1 = TurnId::from("t_probe".to_string());
+        w.append(&SessionEvent::TurnStarted {
+            turn_id: t1.clone(),
+            run_id,
+            parent_turn: None,
+            timestamp: ts(),
+        })
+        .unwrap();
+        drop(w);
+
+        // Read the file as raw bytes and assert the new event is on
+        // its own line.
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = raw.lines().collect();
+        assert!(
+            lines.iter().any(|l| l.contains(&t1.0)),
+            "new event must land on its own parseable line"
+        );
+        // The partial line must NOT have been merged with the new
+        // event. Find the line(s) containing `t_probe` and check
+        // neither contains the partial prefix.
+        for line in &lines {
+            if line.contains(&t1.0) {
+                assert!(
+                    !line.contains("partial"),
+                    "append-path newline guard failed — line concatenated: {line}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn recover_dangling_through_writer_fires_mirror() {
+        // PR #18 round 7 (codex P2 3115635793): routing recovery
+        // through `self.append` hits the mirror tap. This test uses a
+        // SqliteMirror and asserts the synthetic TurnInterrupted lands
+        // in the mirror's `turns` table.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let db_path = dir.path().join("state.sqlite");
+
+        // Seed: RunStarted + TurnStarted + Heartbeat, no terminal →
+        // dangling turn with heartbeat evidence. Recovery
+        // reclassifies this as TurnAborted{Stalled} (NOT
+        // TurnInterrupted), which is the mirrored variant —
+        // SqliteMirror::apply is a no-op for TurnInterrupted by
+        // design, so a heartbeat-less dangling turn wouldn't exercise
+        // the mirror path anyway.
+        let mut w = JsonlWriter::open(&path).unwrap();
+        let run_id = RunId::from("run_mirror".to_string());
+        let contract_id = ContractId::from("ctr_mirror".to_string());
+        let t1 = TurnId::from("t_mirror_dangling".to_string());
+        w.append(&SessionEvent::RunStarted {
+            run_id: run_id.clone(),
+            contract_id,
+            timestamp: ts(),
+        })
+        .unwrap();
+        w.append(&SessionEvent::TurnStarted {
+            turn_id: t1.clone(),
+            run_id,
+            parent_turn: None,
+            timestamp: ts(),
+        })
+        .unwrap();
+        w.append(&SessionEvent::TurnHeartbeat {
+            turn_id: t1.clone(),
+            at: ts(),
+            progress: crate::schemas::HeartbeatProgress {
+                content_blocks: 1,
+                tool_calls: 0,
+                tokens_out: 42,
+            },
+        })
+        .unwrap();
+        drop(w);
+
+        // Resume: attach mirror FIRST, then recover. The mirror must
+        // observe the synthetic TurnAborted{Stalled} through
+        // `append`.
+        let mut w2 = JsonlWriter::open_existing(&path).unwrap();
+        let mirror = crate::event_store::sqlite::SqliteMirror::open(&db_path).unwrap();
+        w2.set_mirror(mirror);
+        let recovered = w2.recover_dangling().unwrap();
+        assert_eq!(recovered, vec![t1.clone()]);
+        drop(w2);
+
+        // Direct SQLite probe: the mirror should now have the
+        // recovered turn as an aborted row.
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM turns WHERE turn_id = ?1",
+                [&t1.0],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            exists, 1,
+            "recovery through writer.append must hit the SqliteMirror"
+        );
     }
 }

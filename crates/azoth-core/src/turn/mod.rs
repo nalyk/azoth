@@ -410,9 +410,29 @@ impl<'a> TurnDriver<'a> {
 
         // CP-2: wall-clock deadline. Tokio's timer uses its own monotonic
         // clock; the deadline race survives DST/NTP jumps that would
-        // confuse a SystemTime-based deadline. Forensic replay under
-        // VirtualClock should gate this out via `ExecutionMode::Replay`
-        // (landing in CP-5); for now, live mode only.
+        // confuse a SystemTime-based deadline.
+        //
+        // PR #18 round 7 (gemini MED 3115612853): this path bypasses
+        // the injected `Clock`. Under production `SystemClock` that's
+        // the *correct* behaviour — tokio's monotonic timer is the
+        // canonical deadline source, not wall-clock `SystemTime`.
+        // Under `#[tokio::test(start_paused = true)]` tokio's timer
+        // is itself virtual, so paused-time tests see deterministic
+        // deadline firing already.
+        //
+        // Known limit: a `VirtualClock`-driven replay harness would
+        // NOT be byte-identical on deadline firing, because the
+        // replay clock advances `SystemTime`/`Instant` independently
+        // of tokio's timer. v2.0.2 sidesteps this because the only
+        // replay surface (`azoth resume --as-of`) is read-only TUI
+        // hydration — no turns are driven, no deadline is armed. A
+        // future replay-*driven* harness (tracked for v2.5
+        // deterministic replay) wants `Clock::sleep_until_monotonic`
+        // so the deadline future and the clock share the same source
+        // of virtual time. An earlier revision of this comment
+        // referenced `ExecutionMode::Replay` as "landing in CP-5";
+        // that enum never materialised, so the stale reference was
+        // misleading — this comment is the truthful replacement.
         //
         // Scope: `scope.max_wall_secs` is documented as the budget for
         // the **entire session** (contract.rs Scope::max_wall_secs). A

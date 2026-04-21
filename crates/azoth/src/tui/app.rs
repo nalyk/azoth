@@ -1598,31 +1598,6 @@ pub async fn run_app(resume: Option<String>, as_of: Option<String>) -> io::Resul
                 return;
             }
         };
-        if resuming {
-            let reader = JsonlReader::open(&worker_session_path);
-            // Chronon CP-5: under `--as-of`, hydrate only the replayable
-            // slice up to the cutoff. Everything committed later is
-            // invisible to the rebuilt UI — matches the
-            // contract/progress rehydration below.
-            let events_result = match worker_as_of.as_deref() {
-                Some(t) => reader.replayable_as_of(t),
-                None => reader.replayable(),
-            };
-            match events_result {
-                Ok(events) => {
-                    for ev in events {
-                        let _ = worker_session_tx.send(ev.0);
-                    }
-                }
-                Err(e) => {
-                    let _ = worker_error_tx
-                        .send(format!("hydrate replayable failed: {e}"))
-                        .await;
-                    return;
-                }
-            }
-        }
-        writer.set_tap(worker_session_tx.clone());
         let _ = worker_boot_phase_tx
             .send("opening session log".to_string())
             .await;
@@ -1637,12 +1612,79 @@ pub async fn run_app(resume: Option<String>, as_of: Option<String>) -> io::Resul
         // SQLite mirror: one per repo at `.azoth/state.sqlite` (draft_plan
         // line ~85). JSONL is authoritative — mirror failures log and
         // continue, never block the turn.
+        //
+        // PR #18 round 7 (codex P2 3115635793): mirror attaches BEFORE
+        // `recover_dangling` + the hydration scan so that synthetic
+        // `TurnAborted { reason: Stalled }` / `TurnInterrupted`
+        // markers flow through `writer.append` and land in both
+        // JSONL and SQLite. Prior ordering left the mirror missing
+        // every recovered turn until a full rebuild.
         match SqliteMirror::open(&db_path) {
             Ok(mirror) => writer.set_mirror(mirror),
             Err(e) => {
                 tracing::warn!(error = %e, "sqlite mirror disabled: open failed");
             }
         }
+
+        // Crash recovery: close dangling turns with synthetic terminal
+        // markers. Routes through `self.append` so both mirror and any
+        // future tap see the events. The tap is not yet attached
+        // (deliberate — see `writer.set_tap` below), so the UI pulls
+        // these markers from the hydration scan instead of a duplicate
+        // tap replay.
+        if resuming {
+            match writer.recover_dangling() {
+                Ok(recovered) => {
+                    if !recovered.is_empty() {
+                        tracing::info!(
+                            count = recovered.len(),
+                            "crash recovery appended synthetic terminal markers"
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "recover_dangling failed; continuing resume");
+                }
+            }
+        }
+
+        // Chronon CP-5 / PR #18 round 7 (gemini MED 3115612857): scan
+        // the JSONL once and fold all five projections in memory.
+        // Pre-fix the resume path called four full `*_as_of` scans
+        // back-to-back plus a `replayable()` scan for
+        // `run_started_emitted` — on a large session that was five
+        // full file reads in a row.
+        let resume_scan: Option<azoth_core::event_store::jsonl::Scan> = if resuming {
+            let reader = JsonlReader::open(&worker_session_path);
+            let scan_result = match worker_as_of.as_deref() {
+                Some(t) => reader.scan_as_of(t),
+                None => reader.scan(),
+            };
+            match scan_result {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    let _ = worker_error_tx
+                        .send(format!("resume scan failed: {e}"))
+                        .await;
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+
+        // Hydrate UI from the cached scan. Same replayable-only slice
+        // as before, just folded without a second file read.
+        if let Some(scan) = &resume_scan {
+            for ev in scan.replayable() {
+                let _ = worker_session_tx.send(ev.0);
+            }
+        }
+
+        // Tap attaches AFTER hydration + recovery, so future live
+        // events flow to the UI without double-feeding the hydration
+        // slice.
+        writer.set_tap(worker_session_tx.clone());
 
         let artifacts = match ArtifactStore::open(&worker_artifacts_root) {
             Ok(a) => a,
@@ -1668,29 +1710,17 @@ pub async fn run_app(resume: Option<String>, as_of: Option<String>) -> io::Resul
         // the replayable JSONL projection. Fresh sessions start empty (no
         // TurnCommitted events exist yet, so `rebuild_history` would return
         // an empty Vec anyway — but skipping the read avoids a spurious
-        // file-open on the brand-new path). Any read error falls back to an
-        // empty history so the session at least starts cleanly instead of
-        // aborting the worker.
-        let mut history: Vec<Message> = if resuming {
-            let reader = JsonlReader::open(&worker_session_path);
-            // Chronon CP-5: history rebuild is bounded by `--as-of` so the
-            // model never sees the conversation continuing past the cutoff
-            // even though read_only mode suppresses new sends anyway —
-            // defence in depth.
-            let history_result = match worker_as_of.as_deref() {
-                Some(t) => reader.rebuild_history_as_of(t),
-                None => reader.rebuild_history(),
-            };
-            match history_result {
-                Ok(h) => h,
-                Err(e) => {
-                    tracing::warn!(error = %e, "rebuild history failed, starting empty");
-                    Vec::new()
-                }
-            }
-        } else {
-            Vec::new()
-        };
+        // file-open on the brand-new path).
+        //
+        // PR #18 round 7: folded off `resume_scan` in memory — no
+        // extra file scan. Chronon CP-5 `--as-of` semantics flow
+        // through the scan, so the model never sees past-cutoff
+        // conversation (defence in depth over the TUI's read-only
+        // suppression of new sends).
+        let mut history: Vec<Message> = resume_scan
+            .as_ref()
+            .map(|s| s.rebuild_history())
+            .unwrap_or_default();
         let mut caps = CapabilityStore::new();
 
         // Per-worker ContextKernel. Reused across turns because its fields
@@ -1901,41 +1931,33 @@ pub async fn run_app(resume: Option<String>, as_of: Option<String>) -> io::Resul
         };
         tracing::info!(enabled = impact_cfg.enabled, "impact pipeline resolved");
 
-        // Stash the last accepted contract from JSONL on startup/resume.
-        // The writer tap replays ContractAccepted into the UI, but the
-        // driver needs its own handle — the tap is one-way and never
-        // loops back into the worker.
-        let resume_reader = JsonlReader::open(&worker_session_path);
-        // Chronon CP-5: both contract + progress rehydrate against the
-        // as-of cutoff under `--as-of`. Consequence: the runtime's view
+        // Stash the last accepted contract + committed progress +
+        // run_started_emitted flag from the cached resume scan. Pre-PR
+        // #18 round 7 these were three separate `*_as_of` calls plus a
+        // `replayable()` call — four full JSONL reads. Now they're
+        // folds over `resume_scan` (see the resume setup block above
+        // for where the scan lands).
+        //
+        // Chronon CP-5 semantics are carried in `resume_scan` itself:
+        // under `--as-of` it's a `scan_as_of(t)` so the runtime's view
         // of "which contract is active" and "how much budget is spent"
-        // matches the past-snapshot the scrollback shows.
-        let mut active_contract: Option<Contract> = match worker_as_of.as_deref() {
-            Some(t) => resume_reader.last_accepted_contract_as_of(t).ok().flatten(),
-            None => resume_reader.last_accepted_contract().ok().flatten(),
-        };
-        let (mut effects_consumed, mut turns_completed) = match worker_as_of.as_deref() {
-            Some(t) => resume_reader
-                .committed_run_progress_as_of(t)
-                .unwrap_or_default(),
-            None => resume_reader.committed_run_progress().unwrap_or_default(),
-        };
-
-        // Has a `RunStarted` event already been appended to this session's
-        // JSONL? The TUI worker emits one just before the first
-        // `ContractAccepted` — which is either the user's first
-        // `/contract <goal>` OR an auto-drafted contract on their first
-        // message. Tracked as a single bool so resume doesn't double-emit
-        // and so the auto-draft path shares the same gate as the slash
-        // path.
-        let mut run_started_emitted = resume_reader
-            .replayable()
-            .map(|events| {
-                events
-                    .iter()
-                    .any(|e| matches!(e.0, SessionEvent::RunStarted { .. }))
-            })
+        // matches the past-snapshot the scrollback shows; without
+        // `--as-of` it's a full `scan()`.
+        let mut active_contract: Option<Contract> = resume_scan
+            .as_ref()
+            .and_then(|s| s.last_accepted_contract());
+        let (mut effects_consumed, mut turns_completed) = resume_scan
+            .as_ref()
+            .map(|s| s.committed_run_progress())
+            .unwrap_or_default();
+        let mut run_started_emitted = resume_scan
+            .as_ref()
+            .map(|s| s.has_run_started())
             .unwrap_or(false);
+        // `resume_scan` has served its purpose. Drop it now to free
+        // the event vector before the main turn loop starts pulling
+        // in session state.
+        drop(resume_scan);
 
         // Worker is fully booted — drop the splashscreen.
         let _ = worker_ready_tx.send(()).await;
