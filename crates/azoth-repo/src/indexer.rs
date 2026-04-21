@@ -538,6 +538,78 @@ fn reindex_blocking(
         [],
     )?;
 
+    // Phase 5 reconciliation — gemini MEDs on PR #19 8fc89d5 lines
+    // 389 and 459. The stale-path purge above handles paths that
+    // vanished from the walk; it does NOT handle paths that are
+    // still walked but whose `(documents.language, symbols.language)`
+    // pair is no longer valid under this binary. Two real classes
+    // of drift survive into here:
+    //
+    //   1. **Language transition on mtime-unchanged path.** The
+    //      walker gates Phase-4 on mtime, so a path whose
+    //      `documents.language` flipped from a grammar-wired tag
+    //      ('rust') to a non-grammar tag ('markdown', or NULL) —
+    //      detector drift across binary versions, admin edit of
+    //      the mirror, schema migration corner — never re-enters
+    //      `extract_and_store`, and its stale symbol rows live
+    //      forever. Rounds 6/7's UnsupportedLanguage purge only
+    //      fires when Phase-4 calls extract_and_store; unchanged
+    //      files bypass it.
+    //
+    //   2. **Downgrade from a future extractor-wired binary on
+    //      mtime-unchanged path.** A hypothetical 2.1-B binary
+    //      writes `symbols.language='python'` rows. User downgrades
+    //      to 2.1-A where Python is enumerated (in `Language`) but
+    //      not extractor-wired. An mtime-unchanged .py file never
+    //      triggers Phase-4; the backfill's `language='rust'`
+    //      predicate skips it. Stale Python symbols survive until
+    //      the file is edited.
+    //
+    // Both classes collapse into one predicate when we scope
+    // valid symbol rows to the extractor-wired set AND require a
+    // matching documents row: a symbol row is valid iff
+    //
+    //   (a) `symbols.language` is in `Language::all_extractor_wired()`
+    //       — catches class (2), and
+    //   (b) a `documents` row exists at the same `path` with the
+    //       same `language` — catches class (1).
+    //
+    // The bulk DELETE below fires after the walk-based purges so
+    // it only scans what those didn't already remove. On a
+    // fresh-consistent DB it purges zero rows; the cost is one
+    // index-assisted pass over `symbols` via `documents.path` PK.
+    //
+    // Reconciliation is intentionally a separate statement from the
+    // stale-path DELETE above: the semantics differ (walk-presence
+    // vs language-consistency), and keeping them split makes the
+    // reason each row was purged traceable through logs if we ever
+    // add per-phase counters.
+    let wired = crate::code_graph::Language::all_extractor_wired();
+    let placeholders = std::iter::repeat("?")
+        .take(wired.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "DELETE FROM symbols
+         WHERE language NOT IN ({placeholders})
+            OR NOT EXISTS (
+                SELECT 1 FROM documents d
+                WHERE d.path = symbols.path
+                  AND d.language = symbols.language
+            )"
+    );
+    let wire_params: Vec<&'static str> = wired.iter().map(|l| l.as_str()).collect();
+    let reconciled = tx.execute(
+        &sql,
+        rusqlite::params_from_iter(wire_params.iter().copied()),
+    )?;
+    if reconciled > 0 {
+        tracing::info!(
+            reconciled_rows = reconciled,
+            "indexer: reconcile pass purged stale symbol rows (language transition or downgrade)"
+        );
+    }
+
     tx.commit()?;
     Ok(stats)
 }
@@ -1204,6 +1276,166 @@ mod tests {
         assert_eq!(
             stale_rows, 0,
             "UnsupportedLanguage must purge stale rows on re-index, not leak them"
+        );
+    }
+
+    /// Round-10 gemini MED #1 on 8fc89d5 (line 389). Covers the
+    /// **language-transition on mtime-unchanged path** class bug:
+    ///
+    ///   foo.rs is indexed as Rust → symbol rows exist.
+    ///   Something flips documents.language to 'markdown' without
+    ///   touching the file's mtime — a future binary's detector
+    ///   drift, an admin editing the mirror, or a cross-version
+    ///   re-walk that reclassifies the path.
+    ///   The walker sees mtime-unchanged → Op::Skip → Phase-4 never
+    ///   calls extract_and_store → the UnsupportedLanguage purge
+    ///   path (which is how round-6/7 fixed the *changed-file*
+    ///   downgrade case) is bypassed entirely.
+    ///
+    /// Before the Phase-5 reconciliation: stale Rust symbol rows
+    /// outlive the language transition indefinitely — retrieval
+    /// surfaces a file that no longer looks like code.
+    ///
+    /// After the reconciliation: the predicate "symbols.language
+    /// must be extractor-wired AND match a documents row with the
+    /// same path+language" fails for the transitioned path, so its
+    /// symbol rows are purged in bulk.
+    #[tokio::test]
+    async fn reconcile_purges_symbols_when_language_transitions_on_unchanged_path() {
+        let td = TempDir::new().unwrap();
+        let db = td.path().join("mirror.sqlite");
+        let repo = td.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(repo.join("foo.rs"), "fn alpha() {}\n").unwrap();
+
+        let idx = RepoIndexer::open(&db, &repo).unwrap();
+        let first = idx.reindex_incremental().await.unwrap();
+        assert!(
+            first.symbols_extracted > 0,
+            "first pass must produce Rust symbol rows to stage the transition"
+        );
+
+        // Flip documents.language to 'markdown' without touching the
+        // file — mirrors the detector-drift / admin-edit / cross-
+        // version re-walk scenario. The stored mtime stays the same,
+        // so the next walk's mtime gate will mark foo.rs as
+        // unchanged and Phase-4 will skip it entirely.
+        {
+            let guard = idx.conn.lock().unwrap();
+            guard
+                .execute(
+                    "UPDATE documents SET language = 'markdown' WHERE path = 'foo.rs'",
+                    [],
+                )
+                .unwrap();
+            let pre: i64 = guard
+                .query_row(
+                    "SELECT COUNT(*) FROM symbols WHERE path = 'foo.rs'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(
+                pre > 0,
+                "stale Rust symbol rows must exist before reconcile runs"
+            );
+        }
+
+        let second = idx.reindex_incremental().await.unwrap();
+        assert_eq!(
+            second.updated, 0,
+            "mtime-unchanged path must not re-enter Phase-4 write loop"
+        );
+        assert_eq!(second.inserted, 0, "no new inserts — same file, same mtime");
+
+        let guard = idx.conn.lock().unwrap();
+        let post: i64 = guard
+            .query_row(
+                "SELECT COUNT(*) FROM symbols WHERE path = 'foo.rs'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            post, 0,
+            "reconcile must purge Rust symbol rows after documents.language flips to a non-grammar tag"
+        );
+    }
+
+    /// Round-10 gemini MED #2 on 8fc89d5 (line 459). Covers the
+    /// **downgrade with mtime-unchanged path** class bug:
+    ///
+    ///   A hypothetical 2.1-B binary indexes foo.py into
+    ///   symbols.language='python'. User downgrades to 2.1-A where
+    ///   Python is enumerated but not extractor-wired.
+    ///   Reindex in 2.1-A: walker sees foo.py unchanged → Op::Skip
+    ///   → Phase-4 never touches it. Backfill's WHERE clause is
+    ///   `language = 'rust'` → skips foo.py too. The changed-file
+    ///   UnsupportedLanguage purge (rounds 6/7) never fires.
+    ///
+    /// The stale Python rows survive forever until someone edits
+    /// the file. Phase-5 reconciliation catches this by scoping
+    /// valid symbols to the extractor-wired set — not the broader
+    /// `Language::from_wire` set.
+    ///
+    /// Simulated by inserting a 2.1-B-shaped row directly; the
+    /// injection step is the same pattern used by
+    /// `unsupported_language_purges_stale_symbol_rows_on_downgrade`
+    /// above.
+    #[tokio::test]
+    async fn reconcile_purges_symbols_whose_language_is_not_extractor_wired() {
+        let td = TempDir::new().unwrap();
+        let db = td.path().join("mirror.sqlite");
+        let repo = td.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(repo.join("foo.py"), "def alpha():\n    pass\n").unwrap();
+
+        let idx = RepoIndexer::open(&db, &repo).unwrap();
+        let first = idx.reindex_incremental().await.unwrap();
+        assert_eq!(
+            first.symbols_extracted, 0,
+            "2.1-A: Python grammar not wired → zero symbols on fresh index"
+        );
+
+        // Inject a 2.1-B-shaped stale row on the mtime-unchanged
+        // path. Phase-4 will skip this file next pass; only Phase-5
+        // reconciliation can catch the staleness.
+        {
+            let guard = idx.conn.lock().unwrap();
+            guard
+                .execute(
+                    "INSERT INTO symbols (name, kind, path, start_line, end_line, parent_id, language, digest)
+                     VALUES ('alpha', 'function', 'foo.py', 0, 1, NULL, 'python', 'stale-downgrade')",
+                    [],
+                )
+                .unwrap();
+            let pre: i64 = guard
+                .query_row(
+                    "SELECT COUNT(*) FROM symbols WHERE path = 'foo.py'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(pre, 1, "injected downgrade artifact must be present");
+        }
+
+        let second = idx.reindex_incremental().await.unwrap();
+        assert_eq!(
+            second.updated, 0,
+            "foo.py mtime-unchanged — Phase-4 must skip, reconcile is the only purge path"
+        );
+
+        let guard = idx.conn.lock().unwrap();
+        let post: i64 = guard
+            .query_row(
+                "SELECT COUNT(*) FROM symbols WHERE path = 'foo.py'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            post, 0,
+            "reconcile must purge symbol rows whose language is not extractor-wired in this binary"
         );
     }
 }

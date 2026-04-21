@@ -64,6 +64,39 @@ impl Language {
             _ => None,
         }
     }
+
+    /// Subset of the `Language` enum for which this binary ships a
+    /// real extractor — i.e. `extract_for(lang, ..)` can return
+    /// `Ok(..)` rather than `Err(UnsupportedLanguage)`. The enum
+    /// covers every grammar the dispatcher knows about (so future
+    /// match arms surface as compile errors); this slice covers
+    /// only those with a wired extractor.
+    ///
+    /// PR 2.1-A ships with Rust only. PRs 2.1-B/C/D widen this
+    /// slice in lock-step with the extractor they land — the
+    /// indexer's Phase-5 reconciliation purge uses this set as the
+    /// single source of truth for "which symbol-row languages
+    /// remain valid". Adding a `Language` variant without adding
+    /// it here is deliberate: a freshly enumerated grammar still
+    /// surfaces via `from_wire` (so the dispatcher can flow
+    /// `UnsupportedLanguage` cleanly) but its symbol rows will be
+    /// purged on the next reindex — correct, because the binary
+    /// cannot regenerate them yet.
+    ///
+    /// Raised by gemini MED on PR #19 8fc89d5 (line 459):
+    /// `from_wire` membership is the wrong check for reconcile —
+    /// downgrade from a hypothetical 2.1-B binary leaves
+    /// `symbols.language='python'` rows that pass `from_wire`
+    /// (Python is in the enum) but aren't extractor-wired on
+    /// 2.1-A. The purge predicate needs extractor membership, not
+    /// enum membership.
+    pub fn all_extractor_wired() -> &'static [Language] {
+        // PRs 2.1-B/C/D append their grammar to this slice the
+        // moment they land (same commit as the real `extract_for`
+        // arm). Keep the ordering stable — the indexer's SQL
+        // builder binds these by position.
+        &[Language::Rust]
+    }
 }
 
 /// Extension-driven language detector. Returns `None` for files
