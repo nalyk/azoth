@@ -44,6 +44,13 @@ tracing = { workspace = true }
 # Serde (for future persisted types)
 serde = { workspace = true }
 
+[features]
+# Gate for integration tests that shell out to live toolchains
+# (pytest, jest, go test). Disabled by default so `cargo test` on a
+# stock machine stays green; enabled explicitly by devs with the
+# relevant runtime installed.
+live-tools = []
+
 [dev-dependencies]
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
