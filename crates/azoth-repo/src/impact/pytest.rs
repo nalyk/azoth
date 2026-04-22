@@ -470,26 +470,30 @@ impl TestRunner for PytestRunner {
         // per-test outcomes instead of collapsing every test to
         // the overall exit code (R3 gemini HIGH).
         let mut cmd = Command::new("pytest");
+        // R11 gemini HIGH: user-supplied `extra_args` FIRST, then
+        // the internal infrastructure flags that the parser needs
+        // to work. pytest's argparse follows last-flag-wins
+        // precedence, so putting our mandatory parser flags AFTER
+        // extra_args means a user who supplies `-q` or
+        // `--color=yes` can't silently break our output parsing:
+        // our later `-v` / `--color=no` override theirs.
+        //
+        // The `--` separator at the end tells pytest's argparse
+        // "everything after here is positional, never interpret
+        // as a flag" — defensive against parametrize values that
+        // produce node IDs starting with `-` (R9 gemini HIGH).
+        for a in &self.extra_args {
+            cmd.arg(a);
+        }
         // `--color=no` disables ANSI escape codes that would wrap
         // status tokens (`\x1b[32mPASSED\x1b[0m`) and make the
         // byte-search parser miss them, silently degrading every
-        // outcome to Unknown. R5 codex P2.
+        // outcome to Unknown. R5 codex P2. Placement AFTER
+        // extra_args is load-bearing (R11 gemini HIGH).
         cmd.arg("-v")
             .arg("--no-header")
             .arg("--tb=short")
             .arg("--color=no");
-        // R9 gemini HIGH: user-supplied extra_args first (they may
-        // be flags), then `--` separator, then test IDs as
-        // positional arguments. The `--` tells pytest's argparse
-        // "everything after here is positional, never interpret
-        // as a flag" — defensive against parametrize values that
-        // produce node IDs starting with `-` (e.g.
-        // `test_x[-flag]`). Without `--`, a `-`-leading id would
-        // be read as a pytest CLI flag and fail with "unknown
-        // option".
-        for a in &self.extra_args {
-            cmd.arg(a);
-        }
         cmd.arg("--");
         for t in &plan.tests {
             cmd.arg(t.as_str());
