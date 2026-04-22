@@ -28,9 +28,9 @@
 //! it's configured. Tests construct a parser on-demand via
 //! [`rust_parser`].
 
+use super::common::{line_range, name_via_field, short_digest};
 use super::Language;
 use azoth_core::retrieval::SymbolKind;
-use sha2::{Digest, Sha256};
 use tree_sitter::{Node, Parser, Tree};
 
 /// Raw, flat record produced by the extractor. Lives in `azoth-repo`
@@ -115,37 +115,66 @@ pub fn extract_rust(parser: &mut Parser, src: &str) -> Result<Vec<ExtractedSymbo
 
     let bytes = src.as_bytes();
     let mut out: Vec<ExtractedSymbol> = Vec::new();
-    walk(tree.root_node(), bytes, None, &mut out);
+    walk(tree.root_node(), bytes, &mut out);
     Ok(out)
 }
 
-/// Recursive descent. `parent_idx` is the out-vec index of the enclosing
-/// Symbol, propagated so nested constructs link to their parent.
-fn walk(node: Node<'_>, bytes: &[u8], parent_idx: Option<usize>, out: &mut Vec<ExtractedSymbol>) {
-    // Classify this node. If it's a recognised symbol, push it and
-    // recurse with this symbol as the new parent. If it isn't, recurse
-    // unchanged.
-    let me = classify(node, bytes);
+/// Iterative pre-order traversal. `parent_idx` threads the index of
+/// the enclosing emitted Symbol down to children so nested constructs
+/// (methods inside impls, variants inside enums) resolve to their
+/// parent in one pass.
+///
+/// # Why iterative (PR #20 round 5)
+///
+/// Codex P2 on `482851e` flagged the recursive walkers as
+/// stack-overflow-able on adversarial input: a 1 MiB `.rs` file of
+/// `{` or `(` characters encodes ~1M nodes, needing ≈ 256 MB stack at
+/// ~256 B/frame — 32× over Linux's 8 MB default. This Rust walker
+/// had the same shape as the Python one (PR #20 introduced it);
+/// converting both in one round closes the class. Pre-order is
+/// preserved by pushing children in reverse so pop order matches the
+/// recursive descent that used to live here.
+fn walk(root: Node<'_>, bytes: &[u8], out: &mut Vec<ExtractedSymbol>) {
+    let mut stack: Vec<(Node<'_>, Option<usize>)> = vec![(root, None)];
+    // Reused TreeCursor — see `python.rs::walk` docstring for the
+    // round-7 gemini MED rationale (per-node `node.walk()` allocates
+    // a fresh TSTreeCursor C struct; `cursor.reset(node)` avoids it).
+    let mut cursor = root.walk();
+    while let Some((node, parent_idx)) = stack.pop() {
+        let me = classify(node, bytes);
 
-    let next_parent = if let Some((name, kind)) = me {
-        let (start_line, end_line) = line_range(&node);
-        let digest = short_digest(&node, bytes);
-        out.push(ExtractedSymbol {
-            name,
-            kind,
-            start_line,
-            end_line,
-            parent_idx,
-            digest,
-        });
-        Some(out.len() - 1)
-    } else {
-        parent_idx
-    };
+        let next_parent = if let Some((name, kind)) = me {
+            let (start_line, end_line) = line_range(&node);
+            let digest = short_digest(&node, bytes);
+            out.push(ExtractedSymbol {
+                name,
+                kind,
+                start_line,
+                end_line,
+                parent_idx,
+                digest,
+            });
+            Some(out.len() - 1)
+        } else {
+            parent_idx
+        };
 
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        walk(child, bytes, next_parent, out);
+        // TreeCursor forward walk + in-place reverse of the newly-
+        // added stack tail. O(N) per parent, zero heap allocations.
+        // See `python.rs::walk` for the full rationale (including
+        // why `node.child(i)` in a reverse loop — gemini's suggested
+        // shape — is O(N²) internally and thus not the right fix).
+        let stack_tail_start = stack.len();
+        cursor.reset(node);
+        if cursor.goto_first_child() {
+            loop {
+                stack.push((cursor.node(), next_parent));
+                if !cursor.goto_next_sibling() {
+                    break;
+                }
+            }
+        }
+        stack[stack_tail_start..].reverse();
     }
 }
 
@@ -167,37 +196,6 @@ fn classify(node: Node<'_>, bytes: &[u8]) -> Option<(String, SymbolKind)> {
         "const_item" => name_via_field(&node, "name", bytes).map(|n| (n, SymbolKind::Const)),
         _ => None,
     }
-}
-
-fn name_via_field(node: &Node<'_>, field: &str, bytes: &[u8]) -> Option<String> {
-    node.child_by_field_name(field)
-        .and_then(|c| c.utf8_text(bytes).ok())
-        .map(str::to_owned)
-}
-
-fn line_range(node: &Node<'_>) -> (u32, u32) {
-    let s = node.start_position().row;
-    let e = node.end_position().row;
-    // 1-based lines, matching tools::repo_read and ripgrep output.
-    ((s as u32).saturating_add(1), (e as u32).saturating_add(1))
-}
-
-/// SHA-256 digest of the node's source bytes, truncated to 16 hex
-/// chars. Debug/forensic column — not a security boundary — but must
-/// survive a rustc toolchain bump to be useful for cross-session
-/// diffs. `std::collections::hash_map::DefaultHasher`'s algorithm is
-/// explicitly unspecified across Rust versions (per the std docs), so
-/// we use SHA-256 here for algorithmic stability. Truncating to 16 hex
-/// chars keeps the column narrow while leaving 64 bits of collision
-/// resistance — ample for a "did this body change" check.
-fn short_digest(node: &Node<'_>, bytes: &[u8]) -> String {
-    let start = node.start_byte();
-    let end = node.end_byte().min(bytes.len());
-    let slice = &bytes[start..end];
-    let mut h = Sha256::new();
-    h.update(slice);
-    let digest = h.finalize();
-    hex::encode(&digest[..8])
 }
 
 #[cfg(test)]
