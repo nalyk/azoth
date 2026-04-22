@@ -96,22 +96,29 @@ impl PytestImpact {
     /// recognised pytest config is present; the tag is exposed for
     /// future routing (e.g. "pyproject" configs may want different
     /// defaults than "pytest_ini" ones).
+    ///
+    /// Sync `std::fs` I/O inside an `async fn` caller chain (see
+    /// `discover`) is intentional: these are tiny config files read
+    /// once at selector construction, and the `tokio::fs` surface
+    /// would add runtime complexity for sub-microsecond gain. If a
+    /// future caller needs detection inside a hot async loop, move
+    /// this to `tokio::fs::read_to_string` then. Per R1 review from
+    /// gemini: the behaviour is acceptable for v2.1.
     pub fn detect(repo_root: &Path) -> Option<&'static str> {
         if repo_root.join("pytest.ini").exists() {
             return Some("pytest_ini");
         }
-        if repo_root.join("pyproject.toml").exists() {
-            if let Ok(s) = std::fs::read_to_string(repo_root.join("pyproject.toml")) {
-                if s.contains("[tool.pytest.ini_options]") {
-                    return Some("pyproject");
-                }
+        // `read_to_string` returns `Err` on missing file, so no
+        // preceding `exists()` stat is needed — removing it also
+        // closes a TOCTOU window (R1 gemini MED).
+        if let Ok(s) = std::fs::read_to_string(repo_root.join("pyproject.toml")) {
+            if s.contains("[tool.pytest.ini_options]") {
+                return Some("pyproject");
             }
         }
-        if repo_root.join("setup.cfg").exists() {
-            if let Ok(s) = std::fs::read_to_string(repo_root.join("setup.cfg")) {
-                if s.contains("[tool:pytest]") {
-                    return Some("setup_cfg");
-                }
+        if let Ok(s) = std::fs::read_to_string(repo_root.join("setup.cfg")) {
+            if s.contains("[tool:pytest]") {
+                return Some("setup_cfg");
             }
         }
         None
@@ -141,7 +148,7 @@ impl ImpactSelector for PytestImpact {
             return Ok(TestPlan::empty(self.version()));
         }
         let mut plan = TestPlan::empty(self.version());
-        let mut seen: HashSet<String> = HashSet::new();
+        let mut seen: HashSet<TestId> = HashSet::new();
         for path in &diff.changed_files {
             let stem = Path::new(path)
                 .file_stem()
@@ -151,7 +158,7 @@ impl ImpactSelector for PytestImpact {
                 continue;
             }
             for t in &self.universe.tests {
-                if t.as_str().contains(stem) && seen.insert(t.as_str().to_string()) {
+                if t.as_str().contains(stem) && seen.insert(t.clone()) {
                     plan.tests.push(t.clone());
                     plan.rationale
                         .push(format!("changed file {path} → stem {stem}"));
@@ -257,8 +264,18 @@ impl TestRunner for PytestRunner {
             let mut text = String::from_utf8_lossy(&out.stdout).to_string();
             text.push('\n');
             text.push_str(&stderr);
+            // `String::truncate` panics if the byte index is not a
+            // char boundary. pytest output frequently contains
+            // multi-byte UTF-8 (non-English paths, assertion diffs),
+            // so walk back to the nearest boundary. UTF-8 codepoints
+            // are ≤4 bytes, so this terminates in ≤3 iterations
+            // (R1 gemini HIGH).
             if text.len() > 4096 {
-                text.truncate(4096);
+                let mut cutoff = 4096;
+                while !text.is_char_boundary(cutoff) {
+                    cutoff -= 1;
+                }
+                text.truncate(cutoff);
             }
             Some(text)
         };
