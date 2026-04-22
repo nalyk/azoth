@@ -216,10 +216,10 @@ pub fn select_impacted_tests(
             continue;
         }
         for t in &universe.tests {
-            if !t.0.contains(&stem) {
+            if !t.as_str().contains(&stem) {
                 continue;
             }
-            if !seen.insert(t.0.as_str()) {
+            if !seen.insert(t.as_str()) {
                 continue;
             }
             let (why, confidence) = match rationale.get(idx) {
