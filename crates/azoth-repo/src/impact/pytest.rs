@@ -175,18 +175,91 @@ impl ImpactSelector for PytestImpact {
     }
 }
 
-/// Returns true when either pipe contains an `ImportError` /
-/// `ModuleNotFoundError` marker. pytest's terminal reporter emits
-/// collection-time import failures to **stdout**, not stderr
-/// (stdout is the "test session output" channel; stderr is reserved
-/// for interpreter-level failures). R2 codex P1/P2 — my R1 only
-/// scanned stderr, so dependency errors slipped through as
-/// `Discovery` with an empty message. Check both.
+/// Returns true when either pipe signals a **dependency-level**
+/// failure — an import error that occurred during pytest's
+/// collection phase (missing package) or at interpreter bootstrap
+/// (pytest itself not installed).
+///
+/// Narrower than a bare `ImportError`/`ModuleNotFoundError`
+/// substring scan because R3 codex P2 (`chatgpt-codex-connector`
+/// on PR #24) pointed out that a user test body which references
+/// those exception types — e.g. `with pytest.raises(ImportError):`
+/// or an assertion about `ModuleNotFoundError` messaging — would
+/// misfire the broader helper as `DependenciesUnresolved` instead
+/// of a real test failure, stealing the per-test diagnosis.
+///
+/// The narrow signals are:
+/// - **pytest collection reporter**: literal wrapper
+///   `"ImportError while importing"` appears ONLY in pytest's
+///   collection-error section; it is not syntax a user would emit
+///   from their own code.
+/// - **interpreter bootstrap**: `"No module named 'pytest'"` /
+///   `"No module named pytest"` when pytest itself is missing
+///   from the environment (covers the `python -m pytest` launch
+///   path and direct `pytest` shim failures).
+///
+/// Ordinary test bodies that `pytest.raises(ImportError)` or
+/// fail an assertion about an exception message no longer trip
+/// this helper — they get routed through the per-test outcome
+/// parser (R3 gemini HIGH) and marked `Fail` like any other test
+/// failure.
 fn pytest_output_signals_dependency_error(stdout: &str, stderr: &str) -> bool {
-    stdout.contains("ModuleNotFoundError")
-        || stdout.contains("ImportError")
-        || stderr.contains("ModuleNotFoundError")
-        || stderr.contains("ImportError")
+    let is_collection_import_failure = |s: &str| s.contains("ImportError while importing");
+    let is_pytest_missing =
+        |s: &str| s.contains("No module named 'pytest'") || s.contains("No module named pytest");
+    is_collection_import_failure(stdout)
+        || is_collection_import_failure(stderr)
+        || is_pytest_missing(stdout)
+        || is_pytest_missing(stderr)
+}
+
+/// Per-test outcome parser over `pytest -v` stdout. R3 gemini HIGH
+/// fix for the "one failure sinks all" issue my R2 explicitly
+/// called out as pragmatic — gemini escalated it to HIGH for the
+/// usability gap, which is the right call.
+///
+/// `pytest -v` emits one line per test:
+///
+/// ```text
+/// tests/test_foo.py::test_alpha PASSED                         [ 33%]
+/// tests/test_foo.py::test_beta  FAILED                         [ 66%]
+/// tests/test_foo.py::test_gamma SKIPPED (reason)               [100%]
+/// ```
+///
+/// We tokenise each line, treat the first whitespace-separated
+/// token as the test id (guarded by the `::` substring so we
+/// never match the `============================= FAILURES`
+/// banner lines), and map the second token to `TestOutcome`.
+///
+/// Statuses beyond the v2.1 core four (`PASSED`, `FAILED`,
+/// `SKIPPED`, `ERROR`) map to:
+/// - `XFAIL` → `Pass` (expected failure that did fail — a success
+///   from the user's point of view)
+/// - `XPASS` → `Fail` (expected failure that unexpectedly passed
+///   — the test is stale and should be updated)
+///
+/// Tests that don't appear in the output (pytest didn't schedule
+/// them for some reason — config filter, discovery skip) surface
+/// as `TestOutcome::Unknown`, NOT guessed as Pass or Fail.
+fn parse_pytest_verbose_outcomes(stdout: &str) -> std::collections::HashMap<String, TestOutcome> {
+    let mut out = std::collections::HashMap::new();
+    for line in stdout.lines() {
+        let mut parts = line.split_whitespace();
+        let (Some(id), Some(status)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        if !id.contains("::") {
+            continue;
+        }
+        let outcome = match status {
+            "PASSED" | "XFAIL" => TestOutcome::Pass,
+            "FAILED" | "ERROR" | "XPASS" => TestOutcome::Fail,
+            "SKIPPED" => TestOutcome::Skip,
+            _ => continue,
+        };
+        out.insert(id.to_string(), outcome);
+    }
+    out
 }
 
 /// Shell out to `pytest --collect-only -q` inside `repo_root` and
@@ -280,8 +353,11 @@ impl TestRunner for PytestRunner {
         // `TestRunResult` vectors. Not shipped here to keep v2.1
         // one-invocation semantics; revisit when eval seeds grow past
         // 5k tests OR when a user hits the limit in the wild.
+        // `-v` emits one status line per test so we can parse
+        // per-test outcomes instead of collapsing every test to
+        // the overall exit code (R3 gemini HIGH).
         let mut cmd = Command::new("pytest");
-        cmd.arg("-q").arg("--no-header").arg("--tb=short");
+        cmd.arg("-v").arg("--no-header").arg("--tb=short");
         for t in &plan.tests {
             cmd.arg(t.as_str());
         }
@@ -297,20 +373,25 @@ impl TestRunner for PytestRunner {
             .map_err(|e| ImpactError::Backend(Box::new(PytestError::Io(e))))?;
         let stdout_text = String::from_utf8_lossy(&out.stdout).to_string();
         let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-        // R2 codex P2: check BOTH streams. pytest emits collection
-        // import errors on stdout, so a stderr-only scan loses the
-        // actionable `DependenciesUnresolved` signal and marks
-        // every planned test `Fail` instead.
+        // Check BOTH streams for dependency-level failures (R2
+        // codex P1/P2 + R3 narrowing). The helper is now tight
+        // enough to distinguish a user test body that references
+        // `ImportError` from a real collection-phase import
+        // failure, so a `pytest.raises(ImportError)` test no
+        // longer misfires through this branch.
         if !out.status.success() && pytest_output_signals_dependency_error(&stdout_text, &stderr) {
             return Err(ImpactError::Backend(Box::new(
                 PytestError::DependenciesUnresolved(merge_pipes(&stdout_text, &stderr)),
             )));
         }
-        let all_pass = out.status.success();
+        // Per-test outcomes parsed from `-v` stdout. Tests that
+        // don't appear in pytest's output surface as `Unknown` —
+        // honest gap rather than guessed Pass/Fail.
+        let outcomes = parse_pytest_verbose_outcomes(&stdout_text);
         let detail = {
-            let mut text = stdout_text;
-            text.push('\n');
-            text.push_str(&stderr);
+            // Reuse `merge_pipes` (gemini R2 top-level summary) —
+            // single source of truth for stdout+stderr combination.
+            let mut text = merge_pipes(&stdout_text, &stderr);
             // `String::truncate` panics if the byte index is not a
             // char boundary. pytest output frequently contains
             // multi-byte UTF-8 (non-English paths, assertion diffs),
@@ -331,11 +412,10 @@ impl TestRunner for PytestRunner {
             .iter()
             .map(|t| TestRunResult {
                 id: t.clone(),
-                outcome: if all_pass {
-                    TestOutcome::Pass
-                } else {
-                    TestOutcome::Fail
-                },
+                outcome: outcomes
+                    .get(t.as_str())
+                    .cloned()
+                    .unwrap_or(TestOutcome::Unknown),
                 duration_ms: 0,
                 detail: detail.clone(),
             })
@@ -349,21 +429,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn dependency_signal_detected_on_stdout() {
-        // R2 codex P1: pytest's collection reporter emits
-        // ImportError on stdout. The R1 stderr-only check missed this.
+    fn dependency_signal_detected_on_stdout_collection_error() {
+        // R2 codex P1: pytest's collection reporter emits import
+        // failures on stdout. The canonical wrapper wording is
+        // "ImportError while importing test module '...'" — that's
+        // the signal we tighten to after R3.
         let stdout = "============================= ERRORS =============================\n\
                       _____________________ ERROR collecting test_foo.py ______________________\n\
-                      ImportError while importing test module '.../test_foo.py'.\n\
+                      ImportError while importing test module '/tmp/x/test_foo.py'.\n\
                       ModuleNotFoundError: No module named 'mypackage'\n";
         let stderr = "";
         assert!(pytest_output_signals_dependency_error(stdout, stderr));
     }
 
     #[test]
-    fn dependency_signal_detected_on_stderr() {
-        // Interpreter-level failures do land on stderr. Both paths
-        // must trigger the signal.
+    fn dependency_signal_detected_on_stderr_pytest_missing() {
+        // pytest itself not installed surfaces at interpreter
+        // bootstrap (before the terminal reporter starts) — on
+        // stderr.
         let stdout = "";
         let stderr = "Traceback (most recent call last):\n\
                       ModuleNotFoundError: No module named 'pytest'\n";
@@ -371,7 +454,7 @@ mod tests {
     }
 
     #[test]
-    fn dependency_signal_false_on_unrelated_failure() {
+    fn dependency_signal_false_on_unrelated_assertion_failure() {
         // A test that simply fails (AssertionError) is NOT a
         // dependency problem and must NOT trip the signal.
         let stdout = "FAILED test_foo.py::test_bar - AssertionError: assert 0 == 1\n";
@@ -380,10 +463,114 @@ mod tests {
     }
 
     #[test]
+    fn dependency_signal_false_on_test_body_that_references_importerror() {
+        // R3 codex P2 regression guard: a failing test whose body
+        // asserts on `ImportError` (e.g. `pytest.raises(ImportError)`
+        // that DID NOT raise) produces output that contains the
+        // bare string "ImportError" — but NOT the collection-phase
+        // wrapper "ImportError while importing". The narrowed
+        // helper must let this through as a regular test failure.
+        let stdout = "test_pkg.py::test_import_raises FAILED\n\
+                      \n\
+                      ___________________ test_import_raises ___________________\n\
+                      def test_import_raises():\n\
+                      >       with pytest.raises(ImportError):\n\
+                      E       Failed: DID NOT RAISE <class 'ImportError'>\n";
+        let stderr = "";
+        assert!(
+            !pytest_output_signals_dependency_error(stdout, stderr),
+            "bare `ImportError` in a test body must not misfire as dependency error"
+        );
+    }
+
+    #[test]
+    fn dependency_signal_false_on_test_body_that_references_modulenotfounderror() {
+        // Sibling of the ImportError false-positive guard.
+        let stdout = "test_pkg.py::test_missing_mod FAILED\n\
+                      E   AssertionError: expected ModuleNotFoundError message\n\
+                      E   assert 'No module named' in 'something else'\n";
+        let stderr = "";
+        assert!(
+            !pytest_output_signals_dependency_error(stdout, stderr),
+            "bare `ModuleNotFoundError` in a test body must not misfire"
+        );
+    }
+
+    #[test]
     fn merge_pipes_handles_empty_either_side() {
         assert_eq!(merge_pipes("out", ""), "out");
         assert_eq!(merge_pipes("", "err"), "err");
         assert_eq!(merge_pipes("out", "err"), "out\nerr");
         assert_eq!(merge_pipes("", ""), "");
+    }
+
+    #[test]
+    fn parse_verbose_outcomes_maps_passed_failed_skipped() {
+        let stdout = "tests/test_sample.py::test_alpha PASSED                      [ 25%]\n\
+                      tests/test_sample.py::test_beta FAILED                       [ 50%]\n\
+                      tests/test_sample.py::test_gamma SKIPPED (some reason)       [ 75%]\n\
+                      tests/test_sample.py::test_delta ERROR                       [100%]\n\
+                      =================== 1 failed, 1 passed, 1 skipped, 1 error in 0.05s ===\n";
+        let outcomes = parse_pytest_verbose_outcomes(stdout);
+        assert_eq!(
+            outcomes.get("tests/test_sample.py::test_alpha"),
+            Some(&TestOutcome::Pass)
+        );
+        assert_eq!(
+            outcomes.get("tests/test_sample.py::test_beta"),
+            Some(&TestOutcome::Fail)
+        );
+        assert_eq!(
+            outcomes.get("tests/test_sample.py::test_gamma"),
+            Some(&TestOutcome::Skip)
+        );
+        assert_eq!(
+            outcomes.get("tests/test_sample.py::test_delta"),
+            Some(&TestOutcome::Fail),
+            "pytest ERROR (collection/fixture failure) maps to Fail"
+        );
+    }
+
+    #[test]
+    fn parse_verbose_outcomes_handles_xfail_xpass() {
+        let stdout = "tests/test_x.py::test_expected_fail XFAIL                    [ 50%]\n\
+                      tests/test_x.py::test_unexpected_pass XPASS                  [100%]\n";
+        let outcomes = parse_pytest_verbose_outcomes(stdout);
+        assert_eq!(
+            outcomes.get("tests/test_x.py::test_expected_fail"),
+            Some(&TestOutcome::Pass),
+            "XFAIL = expected-and-did failure = success for the user"
+        );
+        assert_eq!(
+            outcomes.get("tests/test_x.py::test_unexpected_pass"),
+            Some(&TestOutcome::Fail),
+            "XPASS = expected-failure-that-passed = stale test, Fail"
+        );
+    }
+
+    #[test]
+    fn parse_verbose_outcomes_ignores_banner_and_summary_lines() {
+        // Every line WITHOUT `::` must be skipped. The banner
+        // lines and summary line contain other words but no
+        // test id.
+        let stdout = "============================= test session starts =============================\n\
+                      collected 1 items\n\
+                      \n\
+                      tests/test_foo.py::test_bar PASSED                            [100%]\n\
+                      \n\
+                      ============================== 1 passed in 0.01s ==============================\n";
+        let outcomes = parse_pytest_verbose_outcomes(stdout);
+        assert_eq!(outcomes.len(), 1);
+        assert!(outcomes.contains_key("tests/test_foo.py::test_bar"));
+    }
+
+    #[test]
+    fn parse_verbose_outcomes_missing_test_defaults_to_absent_not_pass() {
+        // Tests that don't appear in the output surface as an
+        // absent key — the caller uses `TestOutcome::Unknown` as
+        // the default, which is the honest answer.
+        let stdout = "tests/a.py::test_alpha PASSED  [100%]\n";
+        let outcomes = parse_pytest_verbose_outcomes(stdout);
+        assert!(!outcomes.contains_key("tests/a.py::test_beta"));
     }
 }

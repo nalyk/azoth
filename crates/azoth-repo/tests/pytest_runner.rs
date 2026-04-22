@@ -37,13 +37,27 @@ async fn pytest_runner_agrees_with_pytest_on_mixed_pass_fail_fixture() {
 
     let summary = runner.run(td.path(), &plan).await.unwrap();
     assert_eq!(summary.len(), 3);
-    // v2.1 pragmatic shape — overall exit code maps to every test.
-    // One failure sinks all, so every result must be Fail.
-    assert!(summary
+    // R3 gemini HIGH: per-test granularity. The runner now parses
+    // pytest's `-v` stdout so each test reports its actual
+    // outcome. Previous "one failure sinks all" behaviour is gone.
+    let by_id: std::collections::HashMap<&str, &TestOutcome> = summary
         .results
         .iter()
-        .all(|r| r.outcome == TestOutcome::Fail));
-    // Forensic detail should carry the failing assertion.
+        .map(|r| (r.id.as_str(), &r.outcome))
+        .collect();
+    assert_eq!(
+        by_id.get("test_sample.py::test_pass"),
+        Some(&&TestOutcome::Pass)
+    );
+    assert_eq!(
+        by_id.get("test_sample.py::test_fail"),
+        Some(&&TestOutcome::Fail)
+    );
+    assert_eq!(
+        by_id.get("test_sample.py::test_also_pass"),
+        Some(&&TestOutcome::Pass)
+    );
+    // Forensic detail should still carry the failing assertion.
     assert!(summary.results[0]
         .detail
         .as_ref()
