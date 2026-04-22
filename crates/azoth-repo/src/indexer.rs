@@ -471,10 +471,9 @@ fn reindex_blocking(
              WHERE language IN ({placeholders})
                AND path NOT IN (SELECT DISTINCT path FROM symbols)"
         );
-        let wire_params: Vec<&'static str> = wired.iter().map(|l| l.as_str()).collect();
         let mut stmt = tx.prepare(&sql)?;
         let rows = stmt.query_map(
-            rusqlite::params_from_iter(wire_params.iter().copied()),
+            rusqlite::params_from_iter(wired.iter().map(|l| l.as_str())),
             |r| {
                 Ok((
                     r.get::<_, String>(0)?,
@@ -621,10 +620,9 @@ fn reindex_blocking(
                   AND d.language = symbols.language
             )"
     );
-    let wire_params: Vec<&'static str> = wired.iter().map(|l| l.as_str()).collect();
     let reconciled = tx.execute(
         &sql,
-        rusqlite::params_from_iter(wire_params.iter().copied()),
+        rusqlite::params_from_iter(wired.iter().map(|l| l.as_str())),
     )?;
     if reconciled > 0 {
         tracing::info!(

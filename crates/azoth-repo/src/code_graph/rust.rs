@@ -28,9 +28,9 @@
 //! it's configured. Tests construct a parser on-demand via
 //! [`rust_parser`].
 
+use super::common::{line_range, name_via_field, short_digest};
 use super::Language;
 use azoth_core::retrieval::SymbolKind;
-use sha2::{Digest, Sha256};
 use tree_sitter::{Node, Parser, Tree};
 
 /// Raw, flat record produced by the extractor. Lives in `azoth-repo`
@@ -167,46 +167,6 @@ fn classify(node: Node<'_>, bytes: &[u8]) -> Option<(String, SymbolKind)> {
         "const_item" => name_via_field(&node, "name", bytes).map(|n| (n, SymbolKind::Const)),
         _ => None,
     }
-}
-
-fn name_via_field(node: &Node<'_>, field: &str, bytes: &[u8]) -> Option<String> {
-    node.child_by_field_name(field)
-        .and_then(|c| c.utf8_text(bytes).ok())
-        .map(str::to_owned)
-}
-
-fn line_range(node: &Node<'_>) -> (u32, u32) {
-    let s = node.start_position().row;
-    let e = node.end_position().row;
-    // 1-based lines, matching tools::repo_read and ripgrep output.
-    ((s as u32).saturating_add(1), (e as u32).saturating_add(1))
-}
-
-/// SHA-256 digest of the node's source bytes, truncated to 16 hex
-/// chars. Debug/forensic column — not a security boundary — but must
-/// survive a rustc toolchain bump to be useful for cross-session
-/// diffs. `std::collections::hash_map::DefaultHasher`'s algorithm is
-/// explicitly unspecified across Rust versions (per the std docs), so
-/// we use SHA-256 here for algorithmic stability. Truncating to 16 hex
-/// chars keeps the column narrow while leaving 64 bits of collision
-/// resistance — ample for a "did this body change" check.
-///
-/// Both indices are clamped to `bytes.len()` before slicing. Prior
-/// to PR 2.1-B round 2 only `end` was clamped; if tree-sitter's
-/// error-recovery or a between-parse-and-walk source truncation
-/// yielded a node with `start_byte > bytes.len()`, the slice would
-/// panic. Gemini flagged the sibling pattern in `python.rs` on PR
-/// #20; the audit surfaced this site too (sibling-audit feedback
-/// memory — structural bugs propagate on every copy until
-/// explicitly audited).
-fn short_digest(node: &Node<'_>, bytes: &[u8]) -> String {
-    let start = node.start_byte().min(bytes.len());
-    let end = node.end_byte().min(bytes.len());
-    let slice = &bytes[start..end];
-    let mut h = Sha256::new();
-    h.update(slice);
-    let digest = h.finalize();
-    hex::encode(&digest[..8])
 }
 
 #[cfg(test)]

@@ -48,9 +48,9 @@
 //! `__init_subclass__` tricks) is invisible to tree-sitter. Documented
 //! rather than papered over.
 
-use super::rust::ExtractedSymbol;
+use super::common::{line_range, name_via_field, short_digest};
+use super::ExtractedSymbol;
 use azoth_core::retrieval::SymbolKind;
-use sha2::{Digest, Sha256};
 use tree_sitter::{Node, Parser, Tree};
 
 /// Build a tree-sitter [`Parser`] pre-configured for Python 0.21. The
@@ -145,12 +145,6 @@ fn classify(
     }
 }
 
-fn name_via_field(node: &Node<'_>, field: &str, bytes: &[u8]) -> Option<String> {
-    node.child_by_field_name(field)
-        .and_then(|c| c.utf8_text(bytes).ok())
-        .map(str::to_owned)
-}
-
 /// Descend into a decorator subtree and return the first `identifier`
 /// leaf found in pre-order traversal. Handles every decorator shape
 /// the Python grammar emits uniformly (bare, attribute, call). See
@@ -166,34 +160,4 @@ fn first_leaf_identifier(node: Node<'_>, bytes: &[u8]) -> Option<String> {
         }
     }
     None
-}
-
-fn line_range(node: &Node<'_>) -> (u32, u32) {
-    let s = node.start_position().row;
-    let e = node.end_position().row;
-    // 1-based lines, parity with `rust.rs`.
-    ((s as u32).saturating_add(1), (e as u32).saturating_add(1))
-}
-
-/// SHA-256 digest of the node's source bytes, truncated to 16 hex
-/// chars. Parity with `rust.rs::short_digest` — see that doc for
-/// rationale.
-///
-/// Both indices are clamped to `bytes.len()` before slicing (gemini
-/// MED on PR #20 2c11436). Tree-sitter guarantees `start_byte <=
-/// end_byte` on well-formed trees, so clamping both preserves the
-/// range invariant; the clamp is pure defence against pathological
-/// states (error-recovery, truncated source between parse and walk).
-/// `rust.rs::short_digest` had the same pattern and received the
-/// same fix in this round — see sibling-audit feedback memory for
-/// why inheriting a bug across sibling modules repeats on every
-/// copy until audited.
-fn short_digest(node: &Node<'_>, bytes: &[u8]) -> String {
-    let start = node.start_byte().min(bytes.len());
-    let end = node.end_byte().min(bytes.len());
-    let slice = &bytes[start..end];
-    let mut h = Sha256::new();
-    h.update(slice);
-    let digest = h.finalize();
-    hex::encode(&digest[..8])
 }

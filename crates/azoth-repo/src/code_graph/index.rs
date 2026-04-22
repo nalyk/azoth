@@ -27,7 +27,7 @@ use rusqlite::{params, Connection, OptionalExtension, Statement, Transaction};
 
 use crate::indexer::IndexerError;
 
-use super::rust::ExtractedSymbol;
+use super::ExtractedSymbol;
 
 /// Reader-facing handle. Cheap to clone (Arc inside).
 #[derive(Clone)]

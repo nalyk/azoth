@@ -14,6 +14,7 @@
 //! with parser lifetime drift. The pure `match` on `Language` stays
 //! allocation-free and makes the call-site obvious to the reader.
 
+mod common;
 pub mod index;
 pub mod python;
 pub mod rust;
