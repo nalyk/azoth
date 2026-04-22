@@ -148,7 +148,11 @@ impl ImpactSelector for PytestImpact {
             return Ok(TestPlan::empty(self.version()));
         }
         let mut plan = TestPlan::empty(self.version());
-        let mut seen: HashSet<TestId> = HashSet::new();
+        // `HashSet<&str>` over `HashSet<TestId>` — the test ids are
+        // owned by `self.universe` and live for the whole function,
+        // so we can de-dupe with a borrowed &str and skip the
+        // per-insert `.clone()` allocation entirely (R2 gemini MED).
+        let mut seen: HashSet<&str> = HashSet::new();
         for path in &diff.changed_files {
             let stem = Path::new(path)
                 .file_stem()
@@ -158,7 +162,7 @@ impl ImpactSelector for PytestImpact {
                 continue;
             }
             for t in &self.universe.tests {
-                if t.as_str().contains(stem) && seen.insert(t.clone()) {
+                if t.as_str().contains(stem) && seen.insert(t.as_str()) {
                     plan.tests.push(t.clone());
                     plan.rationale
                         .push(format!("changed file {path} → stem {stem}"));
@@ -171,13 +175,29 @@ impl ImpactSelector for PytestImpact {
     }
 }
 
+/// Returns true when either pipe contains an `ImportError` /
+/// `ModuleNotFoundError` marker. pytest's terminal reporter emits
+/// collection-time import failures to **stdout**, not stderr
+/// (stdout is the "test session output" channel; stderr is reserved
+/// for interpreter-level failures). R2 codex P1/P2 — my R1 only
+/// scanned stderr, so dependency errors slipped through as
+/// `Discovery` with an empty message. Check both.
+fn pytest_output_signals_dependency_error(stdout: &str, stderr: &str) -> bool {
+    stdout.contains("ModuleNotFoundError")
+        || stdout.contains("ImportError")
+        || stderr.contains("ModuleNotFoundError")
+        || stderr.contains("ImportError")
+}
+
 /// Shell out to `pytest --collect-only -q` inside `repo_root` and
 /// parse the emitted test ids. Failure modes:
 ///
-/// - `ModuleNotFoundError` / `ImportError` in stderr →
+/// - `ModuleNotFoundError` / `ImportError` on either stream (pytest
+///   writes collection-time tracebacks to stdout) →
 ///   `PytestError::DependenciesUnresolved` (actionable — user needs
 ///   to `pip install` their package).
-/// - Any other non-zero exit → `PytestError::Discovery` with stderr.
+/// - Any other non-zero exit → `PytestError::Discovery` with both
+///   pipes merged for forensic value.
 ///
 /// `-q` output is one test id per line, followed by a summary line
 /// that does NOT contain `::`; the filter is robust to that.
@@ -192,14 +212,15 @@ pub async fn discover_pytest_tests(repo_root: &Path) -> Result<TestUniverse, Imp
         .await
         .map_err(|e| ImpactError::Backend(Box::new(PytestError::Io(e))))?;
     if !out.status.success() {
+        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
         let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-        if stderr.contains("ModuleNotFoundError") || stderr.contains("ImportError") {
+        if pytest_output_signals_dependency_error(&stdout, &stderr) {
             return Err(ImpactError::Backend(Box::new(
-                PytestError::DependenciesUnresolved(stderr),
+                PytestError::DependenciesUnresolved(merge_pipes(&stdout, &stderr)),
             )));
         }
         return Err(ImpactError::Backend(Box::new(PytestError::Discovery(
-            stderr,
+            merge_pipes(&stdout, &stderr),
         ))));
     }
     let text = String::from_utf8_lossy(&out.stdout);
@@ -210,6 +231,19 @@ pub async fn discover_pytest_tests(repo_root: &Path) -> Result<TestUniverse, Imp
         .map(TestId::new)
         .collect();
     Ok(TestUniverse::from_tests(tests))
+}
+
+/// Concatenate stdout+stderr for forensic rendering. Needed because
+/// pytest splits useful info across both pipes depending on phase
+/// (collection errors → stdout; interpreter crash → stderr).
+fn merge_pipes(stdout: &str, stderr: &str) -> String {
+    if stderr.is_empty() {
+        stdout.to_string()
+    } else if stdout.is_empty() {
+        stderr.to_string()
+    } else {
+        format!("{stdout}\n{stderr}")
+    }
 }
 
 /// Live pytest runner. Guarded behind the `live-tools` feature for
@@ -236,6 +270,16 @@ impl TestRunner for PytestRunner {
         if plan.is_empty() {
             return Ok(TestRunSummary::default());
         }
+        // ARG_MAX caveat (R2 gemini MED, deferred): passing N test ids
+        // as individual argv entries hits Linux's `ARG_MAX` (~2 MiB
+        // typical, ~128 KiB hard-floor) at roughly 20k-40k tests,
+        // given pytest ids are 50-100 bytes each. v2.1 plans are
+        // bounded well under that — real heuristic emits ≤100 ids
+        // per turn. v2.2 batching mitigation: chunk `plan.tests` into
+        // groups of 500 and spawn a `pytest` per chunk, aggregating
+        // `TestRunResult` vectors. Not shipped here to keep v2.1
+        // one-invocation semantics; revisit when eval seeds grow past
+        // 5k tests OR when a user hits the limit in the wild.
         let mut cmd = Command::new("pytest");
         cmd.arg("-q").arg("--no-header").arg("--tb=short");
         for t in &plan.tests {
@@ -251,17 +295,20 @@ impl TestRunner for PytestRunner {
             .output()
             .await
             .map_err(|e| ImpactError::Backend(Box::new(PytestError::Io(e))))?;
+        let stdout_text = String::from_utf8_lossy(&out.stdout).to_string();
         let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-        if !out.status.success()
-            && (stderr.contains("ModuleNotFoundError") || stderr.contains("ImportError"))
-        {
+        // R2 codex P2: check BOTH streams. pytest emits collection
+        // import errors on stdout, so a stderr-only scan loses the
+        // actionable `DependenciesUnresolved` signal and marks
+        // every planned test `Fail` instead.
+        if !out.status.success() && pytest_output_signals_dependency_error(&stdout_text, &stderr) {
             return Err(ImpactError::Backend(Box::new(
-                PytestError::DependenciesUnresolved(stderr),
+                PytestError::DependenciesUnresolved(merge_pipes(&stdout_text, &stderr)),
             )));
         }
         let all_pass = out.status.success();
         let detail = {
-            let mut text = String::from_utf8_lossy(&out.stdout).to_string();
+            let mut text = stdout_text;
             text.push('\n');
             text.push_str(&stderr);
             // `String::truncate` panics if the byte index is not a
@@ -294,5 +341,49 @@ impl TestRunner for PytestRunner {
             })
             .collect();
         Ok(TestRunSummary { results })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dependency_signal_detected_on_stdout() {
+        // R2 codex P1: pytest's collection reporter emits
+        // ImportError on stdout. The R1 stderr-only check missed this.
+        let stdout = "============================= ERRORS =============================\n\
+                      _____________________ ERROR collecting test_foo.py ______________________\n\
+                      ImportError while importing test module '.../test_foo.py'.\n\
+                      ModuleNotFoundError: No module named 'mypackage'\n";
+        let stderr = "";
+        assert!(pytest_output_signals_dependency_error(stdout, stderr));
+    }
+
+    #[test]
+    fn dependency_signal_detected_on_stderr() {
+        // Interpreter-level failures do land on stderr. Both paths
+        // must trigger the signal.
+        let stdout = "";
+        let stderr = "Traceback (most recent call last):\n\
+                      ModuleNotFoundError: No module named 'pytest'\n";
+        assert!(pytest_output_signals_dependency_error(stdout, stderr));
+    }
+
+    #[test]
+    fn dependency_signal_false_on_unrelated_failure() {
+        // A test that simply fails (AssertionError) is NOT a
+        // dependency problem and must NOT trip the signal.
+        let stdout = "FAILED test_foo.py::test_bar - AssertionError: assert 0 == 1\n";
+        let stderr = "";
+        assert!(!pytest_output_signals_dependency_error(stdout, stderr));
+    }
+
+    #[test]
+    fn merge_pipes_handles_empty_either_side() {
+        assert_eq!(merge_pipes("out", ""), "out");
+        assert_eq!(merge_pipes("", "err"), "err");
+        assert_eq!(merge_pipes("out", "err"), "out\nerr");
+        assert_eq!(merge_pipes("", ""), "");
     }
 }

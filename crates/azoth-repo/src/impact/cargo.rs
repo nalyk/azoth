@@ -201,13 +201,14 @@ pub fn select_impacted_tests(
     );
 
     let mut plan = TestPlan::empty(selector_version);
-    // `HashSet<TestId>` over `HashSet<String>` is idiomatic now that
-    // `TestId` derives `Eq + Hash` — avoids the `.0.clone()` →
-    // `String` allocation-round-trip. Same memory footprint because
-    // `TestId` is a newtype over `String`. Mirrors the PR-E
-    // post-review fix in `pytest.rs`; kept in sync so both selectors
-    // share shape (R1 gemini MED, sibling-audit).
-    let mut seen: HashSet<TestId> = HashSet::new();
+    // `HashSet<&str>` — the universe owns every `TestId` for the
+    // whole function, so we de-dupe with borrowed `&str` and skip
+    // the per-insert clone entirely. R2 gemini MED (PR #24) walked
+    // this up from `HashSet<String>` → `HashSet<TestId>` →
+    // `HashSet<&str>`; the last shape is strictly zero-alloc. Kept
+    // in sync with the sibling selector in `pytest.rs` so both
+    // ecosystems share shape (sibling-audit discipline).
+    let mut seen: HashSet<&str> = HashSet::new();
 
     for (idx, path) in widened_paths.iter().enumerate() {
         let stem = file_stem(path);
@@ -218,7 +219,7 @@ pub fn select_impacted_tests(
             if !t.0.contains(&stem) {
                 continue;
             }
-            if !seen.insert(t.clone()) {
+            if !seen.insert(t.0.as_str()) {
                 continue;
             }
             let (why, confidence) = match rationale.get(idx) {
