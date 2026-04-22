@@ -312,18 +312,36 @@ fn parse_pytest_verbose_outcomes(stdout: &str) -> std::collections::HashMap<Stri
             }
             _ => line.trim_end(),
         };
-        // R7 codex P2: also strip a trailing `(reason)` block that
-        // pytest emits after SKIPPED / XFAIL / XPASS. Without this,
-        // a reason text containing a status keyword (e.g.
-        // `SKIPPED (depends on FAILED API)`) would have `FAILED`
-        // win as the rightmost word-boundary match. pytest's
-        // parametrize values use `[...]` not `(...)`, so a
-        // trailing parenthesized block is always a reason — never
-        // part of the test id.
-        let core = if core.ends_with(')') {
-            match core.rfind('(') {
-                Some(open_idx) => core[..open_idx].trim_end(),
-                None => core,
+        // R8 codex P2: strip the BALANCED trailing `(reason)`
+        // block. R7 used `rfind('(')` which only stripped the
+        // INNERMOST paren, so a nested reason like
+        // `SKIPPED (depends on FAILED API (ticket))` left
+        // `... SKIPPED (depends on FAILED API` and `FAILED` still
+        // won the rightmost-status scan. Scan backward from the
+        // trailing `)` tracking paren depth; the OUTERMOST open
+        // paren is where depth returns to 0. pytest's parametrize
+        // uses `[...]` not `(...)`, so trailing parens are
+        // always a reason block — never part of the test id.
+        let core = if core.as_bytes().last() == Some(&b')') {
+            let bytes = core.as_bytes();
+            let mut depth: i32 = 0;
+            let mut outer_open: Option<usize> = None;
+            for (i, &b) in bytes.iter().enumerate().rev() {
+                match b {
+                    b')' => depth += 1,
+                    b'(' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            outer_open = Some(i);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            match outer_open {
+                Some(i) => core[..i].trim_end(),
+                None => core, // unbalanced — leave alone
             }
         } else {
             core
@@ -820,6 +838,37 @@ mod tests {
         assert_eq!(
             outcomes.get("tests/test_q.py::test_q"),
             Some(&TestOutcome::Pass)
+        );
+    }
+
+    #[test]
+    fn parse_verbose_outcomes_strips_balanced_nested_reason_parens() {
+        // R8 codex P2 regression guard: pytest reasons can contain
+        // nested parentheses (e.g. someone references a Jira ticket
+        // in parens within the reason). R7's `rfind('(')` would
+        // strip only the INNERMOST `(ticket)`, leaving the rest of
+        // the reason — including any embedded status keywords —
+        // available for the rightmost-status scan to mis-match.
+        // R8 walks paren depth backward to find the OUTERMOST
+        // opening paren and strips from there.
+        let stdout = "tests/test_x.py::test_a SKIPPED (depends on FAILED API (ticket))    [ 33%]\n\
+             tests/test_x.py::test_b XFAIL (PASSED last release (see PR #42))    [ 66%]\n\
+             tests/test_x.py::test_c SKIPPED (one (two (three)) four)            [100%]\n";
+        let outcomes = parse_pytest_verbose_outcomes(stdout);
+        assert_eq!(
+            outcomes.get("tests/test_x.py::test_a"),
+            Some(&TestOutcome::Skip),
+            "R7 stripped innermost only and FAILED won — R8 must strip the full balanced block"
+        );
+        assert_eq!(
+            outcomes.get("tests/test_x.py::test_b"),
+            Some(&TestOutcome::Pass),
+            "PASSED inside doubly-nested parens must not steal XFAIL"
+        );
+        assert_eq!(
+            outcomes.get("tests/test_x.py::test_c"),
+            Some(&TestOutcome::Skip),
+            "triple-nested reason still parses correctly (no status keywords inside)"
         );
     }
 
