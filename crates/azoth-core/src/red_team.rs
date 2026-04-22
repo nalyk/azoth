@@ -565,28 +565,47 @@ async fn repo_read_file_absolute_path_is_rejected() {
 
 #[tokio::test]
 async fn repo_read_file_symlink_escape_is_rejected() {
-    let mut disp = ToolDispatcher::new();
-    disp.register(crate::tools::RepoReadFileTool);
-    let (ctx, tmp) = build_ctx();
-    // tempdir holds the "sensitive" target; the ctx.repo_root
-    // is also under tmp, but in a distinct subdir via build_ctx() —
-    // which places it at `tmp.path()` directly, so the sensitive file
-    // lives at a sibling path. The symlink inside repo_root points
-    // OUT of repo_root by construction.
-    let sensitive_root = tmp.path().parent().unwrap_or_else(|| tmp.path());
-    let sensitive = sensitive_root.join("red_team_secret.txt");
+    // Layout — everything inside ONE TempDir so cleanup is guaranteed
+    // by Drop even if the test panics mid-body. Gemini round-1 MED
+    // on PR #21 flagged the prior shape which wrote the sensitive
+    // file to `tmp.path().parent()` (i.e. `/tmp` on Linux) and relied
+    // on best-effort `remove_file` that skips on panic, leaking the
+    // secret into a shared directory across test runs.
+    //
+    //   <tmp>/                 — TempDir, owned by this test
+    //   <tmp>/repo/            — repo_root (subdirectory, NOT tmp itself)
+    //   <tmp>/secret.txt       — sensitive file, sibling of repo_root
+    //   <tmp>/repo/sneaky  ->  ../secret.txt   (symlink inside repo)
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo_root = tmp.path().join("repo");
+    std::fs::create_dir_all(&repo_root).expect("create repo subdir");
+    let artifacts_root = tmp.path().join("artifacts");
+    std::fs::create_dir_all(&artifacts_root).expect("create artifacts dir");
+    let artifacts = ArtifactStore::open(&artifacts_root).expect("open artifact store");
+    let ctx = ExecutionContext::builder(
+        RunId::from("run_redteam".to_string()),
+        TurnId::from("t_redteam".to_string()),
+        artifacts,
+        repo_root.clone(),
+    )
+    .build();
+
+    let sensitive = tmp.path().join("secret.txt");
     std::fs::write(&sensitive, "TOKEN\n").expect("write secret");
-    let link = tmp.path().join("sneaky");
+    let link = repo_root.join("sneaky");
     #[cfg(unix)]
     std::os::unix::fs::symlink(&sensitive, &link).expect("symlink");
+
+    let mut disp = ToolDispatcher::new();
+    disp.register(crate::tools::RepoReadFileTool);
     let raw = Tainted::new(Origin::ModelOutput, json!({"path": "sneaky"}));
     let res = dispatch_tool(&disp, "repo_read_file", raw, &ctx).await;
-    // Outcome is either "path escapes repo root" (symlink resolved
-    // AND target lives outside root — the intended case) or
-    // "canonicalize" failure (symlink target does not exist — covers
-    // hosts where the sibling-dir write racing against tempdir cleanup
-    // leaves a dangling link). Both are acceptable; a clean `Ok(..)`
-    // is NOT — that would mean azoth read the secret.
+    // Clean `Ok(..)` means azoth read the secret — that is the
+    // failure mode to reject. `ToolError::Failed` with any of the
+    // three messages below is acceptable: the `starts_with(root)`
+    // guard fires (happy path), canonicalisation refuses the
+    // escaped link, or the host filesystem refuses to follow the
+    // symlink at all.
     match res {
         Err(ToolError::Failed(msg)) => assert!(
             msg.contains("escapes") || msg.contains("canonicalize") || msg.contains("not found"),
@@ -595,8 +614,9 @@ async fn repo_read_file_symlink_escape_is_rejected() {
         Ok(_) => panic!("symlink pointing outside repo root must NOT succeed"),
         Err(other) => panic!("expected Failed, got {other:?}"),
     }
-    // Best-effort cleanup — test isolation is via TempDir drop on _tmp.
-    let _ = std::fs::remove_file(&sensitive);
+    // No manual cleanup — TempDir::drop removes the entire subtree
+    // (repo/, artifacts/, secret.txt, symlink) deterministically on
+    // every exit path including panic.
 }
 
 #[tokio::test]
@@ -917,8 +937,14 @@ fn every_origin_variant_round_trips_via_serde() {
     // corresponding serde handling would break replay of logs that
     // mention it. Keeping an exhaustive round-trip means
     // `#[serde(rename_all = "snake_case")]` stays honest as variants
-    // are added. Note: this match is exhaustive so adding a variant
-    // without a test entry is a compile error, not a silent miss.
+    // are added.
+    //
+    // The array literal alone is NOT exhaustive — gemini round-1 MED
+    // on PR #21 correctly pointed out the claim needed teeth. The
+    // match below IS exhaustive: adding a new variant without adding
+    // it to the array requires a new arm here, which produces a
+    // compile error. A Clippy allow-lint would mask that signal;
+    // keep the explicit list.
     for origin in [
         Origin::User,
         Origin::Contract,
@@ -928,6 +954,18 @@ fn every_origin_variant_round_trips_via_serde() {
         Origin::ModelOutput,
         Origin::Indexer,
     ] {
+        // Compile-time exhaustiveness check. If a new Origin variant
+        // lands without appearing in both this match AND the array
+        // above, the crate won't compile until the test is updated.
+        match origin {
+            Origin::User
+            | Origin::Contract
+            | Origin::ToolOutput
+            | Origin::RepoFile
+            | Origin::WebFetch
+            | Origin::ModelOutput
+            | Origin::Indexer => {}
+        }
         let s = serde_json::to_string(&origin).expect("serialise");
         let back: Origin = serde_json::from_str(&s).expect("deserialise");
         assert_eq!(back, origin, "round-trip for {origin:?} via {s}");
@@ -937,10 +975,26 @@ fn every_origin_variant_round_trips_via_serde() {
 #[test]
 fn web_fetch_and_contract_origins_are_pairwise_distinct_from_every_other() {
     // Cousin to case #2 (`origin_indexer_is_not_equal_to_model_output`)
-    // — but exhaustive. Extends the `assert_ne!` grid so any future
-    // variant merge (e.g. "flatten WebFetch into RepoFile") surfaces
-    // in this test first instead of silently collapsing distinct
-    // trust domains.
+    // — but exhaustive across every pair. Extends the `assert_ne!`
+    // grid so any future variant merge (e.g. "flatten WebFetch into
+    // RepoFile") surfaces in this test first instead of silently
+    // collapsing distinct trust domains.
+    //
+    // Compile-time exhaustiveness (gemini round-1 MED on PR #21):
+    // the match below forces a compile error if a new `Origin`
+    // variant is added without being listed in both the match arms
+    // AND the array below.
+    fn assert_listed(o: Origin) {
+        match o {
+            Origin::User
+            | Origin::Contract
+            | Origin::ToolOutput
+            | Origin::RepoFile
+            | Origin::WebFetch
+            | Origin::ModelOutput
+            | Origin::Indexer => {}
+        }
+    }
     let all = [
         Origin::User,
         Origin::Contract,
@@ -950,6 +1004,9 @@ fn web_fetch_and_contract_origins_are_pairwise_distinct_from_every_other() {
         Origin::ModelOutput,
         Origin::Indexer,
     ];
+    for o in all {
+        assert_listed(o);
+    }
     for (i, a) in all.iter().enumerate() {
         for b in &all[i + 1..] {
             assert_ne!(a, b, "distinct origins must stay distinct: {a:?} vs {b:?}");
@@ -968,7 +1025,13 @@ fn repo_file_origin_does_not_decay_on_clone() {
     let t2 = t.clone();
     assert_eq!(t.origin(), Origin::RepoFile);
     assert_eq!(t2.origin(), Origin::RepoFile);
-    // And across every Origin variant for good measure.
+    // And across every Origin variant. Sibling to
+    // `every_origin_variant_round_trips_via_serde` and
+    // `web_fetch_and_contract_origins_are_pairwise_distinct_from_every_other`
+    // — same "array literal needs match-enforced exhaustiveness"
+    // shape gemini flagged on PR #21 round 1. Applied here
+    // pre-emptively for sibling-audit consistency per
+    // `feedback_audit_sibling_sites_on_class_bugs.md`.
     for origin in [
         Origin::User,
         Origin::Contract,
@@ -978,6 +1041,15 @@ fn repo_file_origin_does_not_decay_on_clone() {
         Origin::ModelOutput,
         Origin::Indexer,
     ] {
+        match origin {
+            Origin::User
+            | Origin::Contract
+            | Origin::ToolOutput
+            | Origin::RepoFile
+            | Origin::WebFetch
+            | Origin::ModelOutput
+            | Origin::Indexer => {}
+        }
         let t = Tainted::new(origin, json!({}));
         assert_eq!(t.clone().origin(), origin);
     }
