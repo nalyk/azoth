@@ -41,6 +41,16 @@ use super::runner::{TestOutcome, TestRunResult, TestRunSummary, TestRunner};
 /// detect plan drift without re-running the selector.
 pub const PYTEST_IMPACT_VERSION: u32 = 1;
 
+/// Forensic-detail truncation cap. `PytestRunner::run` stashes the
+/// combined stdout+stderr into `TestRunResult.detail` so the TUI
+/// can render the tail of a failing run; this cap keeps long
+/// pytest tracebacks from pinning 4+ KiB per test indefinitely.
+/// Matches `MAX_STDERR_BYTES` in `cargo.rs` by value but kept
+/// local so the two runners can diverge independently if a future
+/// ecosystem needs a different cap (R6 gemini MED — no more
+/// magic numbers).
+const MAX_DETAIL_BYTES: usize = 4096;
+
 /// Typed error surface for the pytest backend. Boxed into
 /// `ImpactError::Backend` at the selector boundary so `azoth-core`
 /// stays agnostic to ecosystem-specific failure modes.
@@ -204,16 +214,24 @@ impl ImpactSelector for PytestImpact {
 /// parser (R3 gemini HIGH) and marked `Fail` like any other test
 /// failure.
 fn pytest_output_signals_dependency_error(stdout: &str, stderr: &str) -> bool {
-    let is_collection_import_failure = |s: &str| s.contains("ImportError while importing");
+    // R6 codex P2 further narrowing: "ImportError while importing"
+    // alone STILL appears in user test bodies (e.g.
+    // `assert "ImportError while importing" in str(exc)` or a
+    // string-equality check on exception messaging). Anchor
+    // the signal to pytest's collection-reporter context — the
+    // phrase only fires under an `ERROR collecting` section
+    // header, which is pytest-specific output that no user test
+    // body would emit.
+    let is_collection_import_failure =
+        |s: &str| s.contains("ERROR collecting") && s.contains("ImportError while importing");
     // R5 codex P2 narrowing: "No module named 'pytest'" on STDOUT
     // could be emitted by a legitimate test body that asserts on
-    // the exception message (e.g. a test validating ModuleNotFound
-    // messaging). Bootstrap-level failures where pytest itself
-    // isn't installed ALWAYS land on stderr — the Python
-    // interpreter prints the traceback to stderr before the
-    // terminal reporter even starts. Restricting the missing-
-    // pytest signal to stderr avoids the false-positive on stdout
-    // while preserving detection of the real bootstrap failure.
+    // the exception message. Bootstrap-level failures where
+    // pytest itself isn't installed ALWAYS land on stderr — the
+    // Python interpreter prints the traceback to stderr before
+    // the terminal reporter starts. Restricting to stderr avoids
+    // the stdout false-positive while preserving real-bootstrap
+    // detection.
     let is_pytest_missing_bootstrap =
         |s: &str| s.contains("No module named 'pytest'") || s.contains("No module named pytest");
     is_collection_import_failure(stdout)
@@ -257,60 +275,61 @@ fn pytest_output_signals_dependency_error(stdout: &str, stderr: &str) -> bool {
 /// them for some reason — config filter, discovery skip) surface
 /// as `TestOutcome::Unknown`, NOT guessed as Pass or Fail.
 fn parse_pytest_verbose_outcomes(stdout: &str) -> std::collections::HashMap<String, TestOutcome> {
-    // Ordered canonical status table. The leading space on each
-    // needle is load-bearing: it disqualifies matches embedded in
-    // a parametrize bracket with NO preceding space
-    // (e.g. `[PASSED]`). Combined with the trailing-boundary
-    // check below, this narrows to ` STATUS ` or ` STATUS<EOL>`.
+    // R6 codex P2: parse by finding the RIGHTMOST word-boundary-
+    // aligned status keyword. Naive left-to-right `find(" STATUS")`
+    // mis-matches bracket-embedded occurrences (`test_p[ PASSED ]
+    // FAILED` picks the bracketed `PASSED`); naive rsplit-on-last-
+    // whitespace mis-matches trailing tokens (`SKIPPED (reason)`
+    // picks `reason)`). Right-most word-boundary match solves
+    // both: the REAL status always lives at the highest byte
+    // position where a status keyword sits on clean whitespace
+    // boundaries.
+    //
+    // pytest `-v` line shape:
+    //   `<test_id> <STATUS>[(reason)] [<N>%]`
+    // where `(reason)` appears for SKIPPED / XFAIL / XPASS.
     const STATUS_TABLE: &[(&str, TestOutcome)] = &[
-        (" PASSED", TestOutcome::Pass),
-        (" XFAIL", TestOutcome::Pass),
-        (" FAILED", TestOutcome::Fail),
-        (" ERROR", TestOutcome::Fail),
-        (" XPASS", TestOutcome::Fail),
-        (" SKIPPED", TestOutcome::Skip),
+        ("PASSED", TestOutcome::Pass),
+        ("XFAIL", TestOutcome::Pass),
+        ("FAILED", TestOutcome::Fail),
+        ("ERROR", TestOutcome::Fail),
+        ("XPASS", TestOutcome::Fail),
+        ("SKIPPED", TestOutcome::Skip),
     ];
+    let is_ws_byte = |b: u8| matches!(b, b' ' | b'\t');
     let mut out = std::collections::HashMap::new();
-    'line_loop: for line in stdout.lines() {
-        // Quick guard against banner / summary lines that don't
-        // carry a node id at all. Real test lines always contain
-        // `::` (module separator in pytest node-id format).
+    for line in stdout.lines() {
         if !line.contains("::") {
             continue;
         }
-        for (needle, outcome) in STATUS_TABLE {
-            // Walk the line for every occurrence of the needle so
-            // a status keyword embedded inside a parametrize
-            // bracket doesn't short-circuit the real match at the
-            // end (the needle starts with a space so this only
-            // matters if someone parametrizes with a value that
-            // both starts with a space AND equals a status word).
-            let mut search_start = 0;
-            while let Some(rel_idx) = line[search_start..].find(needle) {
-                let match_idx = search_start + rel_idx;
-                let after = match_idx + needle.len();
-                // Trailing boundary check: status keyword must be
-                // followed by whitespace or end-of-line, otherwise
-                // we matched a substring of a longer token.
-                let is_boundary = after == line.len()
-                    || line.as_bytes()[after] == b' '
-                    || line.as_bytes()[after] == b'\t';
-                if is_boundary {
-                    // `trim` strips both leading and trailing
-                    // whitespace from the sliced id. pytest's
-                    // terminal reporter may right-pad the id for
-                    // column alignment; leading whitespace is
-                    // unusual but defensible. Internal whitespace
-                    // (parametrize brackets like `[hello world]`)
-                    // is preserved because `trim` only touches
-                    // the edges (R5 gemini HIGH).
-                    let id = line[..match_idx].trim();
-                    if id.contains("::") {
-                        out.insert(id.to_string(), outcome.clone());
-                        continue 'line_loop;
-                    }
+        // Strip trailing `[<digits>%]` progress suffix. Only strip
+        // if the bracket content ends with `%]` so a parametrize
+        // value like `test_p[42%]` doesn't get truncated (unlikely
+        // but cheap to guard).
+        let core = match line.rfind('[') {
+            Some(bracket_idx) if line[bracket_idx..].ends_with("%]") => {
+                line[..bracket_idx].trim_end()
+            }
+            _ => line.trim_end(),
+        };
+        let bytes = core.as_bytes();
+        // Scan all status keywords; track the RIGHTMOST
+        // word-boundary-aligned match.
+        let mut best: Option<(usize, TestOutcome)> = None;
+        for (keyword, outcome) in STATUS_TABLE {
+            for (idx, _) in core.match_indices(keyword) {
+                let before_ok = idx == 0 || is_ws_byte(bytes[idx - 1]);
+                let after = idx + keyword.len();
+                let after_ok = after == core.len() || is_ws_byte(bytes[after]);
+                if before_ok && after_ok && best.as_ref().map_or(true, |(i, _)| *i < idx) {
+                    best = Some((idx, outcome.clone()));
                 }
-                search_start = match_idx + 1;
+            }
+        }
+        if let Some((pos, outcome)) = best {
+            let id = core[..pos].trim_end();
+            if id.contains("::") {
+                out.insert(id.to_string(), outcome);
             }
         }
     }
@@ -465,8 +484,8 @@ impl TestRunner for PytestRunner {
             // so walk back to the nearest boundary. UTF-8 codepoints
             // are ≤4 bytes, so this terminates in ≤3 iterations
             // (R1 gemini HIGH).
-            if text.len() > 4096 {
-                let mut cutoff = 4096;
+            if text.len() > MAX_DETAIL_BYTES {
+                let mut cutoff = MAX_DETAIL_BYTES;
                 while !text.is_char_boundary(cutoff) {
                     cutoff -= 1;
                 }
@@ -552,6 +571,38 @@ mod tests {
             !pytest_output_signals_dependency_error(stdout, stderr),
             "bare `ImportError` in a test body must not misfire as dependency error"
         );
+    }
+
+    #[test]
+    fn dependency_signal_false_on_test_body_that_quotes_import_wrapper_phrase() {
+        // R6 codex P2: even the narrowed
+        // `"ImportError while importing"` phrase can appear in
+        // user test output if a test body asserts on that exact
+        // string. Without the `"ERROR collecting"` anchor, this
+        // would misfire as `DependenciesUnresolved` and convert
+        // a real test failure into a misleading env error.
+        let stdout = "tests/test_msgs.py::test_wrapper_msg FAILED\n\
+                      E   AssertionError: expected substring 'ImportError while importing' in exc.args[0]\n\
+                      E   assert 'ImportError while importing' in 'something else entirely'\n";
+        let stderr = "";
+        assert!(
+            !pytest_output_signals_dependency_error(stdout, stderr),
+            "test body asserting on `ImportError while importing` must not trip without the `ERROR collecting` anchor"
+        );
+    }
+
+    #[test]
+    fn dependency_signal_true_when_both_anchors_present_on_stdout() {
+        // Confirm the R6 tightening didn't break the real-trigger
+        // path: pytest's actual collection-error output carries
+        // BOTH `ERROR collecting` AND `ImportError while
+        // importing`, so the helper must still fire.
+        let stdout = "============================= ERRORS =============================\n\
+                      _____________________ ERROR collecting test_foo.py ______________________\n\
+                      ImportError while importing test module '/tmp/x/test_foo.py'.\n\
+                      ModuleNotFoundError: No module named 'mypackage'\n";
+        let stderr = "";
+        assert!(pytest_output_signals_dependency_error(stdout, stderr));
     }
 
     #[test]
@@ -726,6 +777,32 @@ mod tests {
         assert_eq!(
             outcomes.get("tests/test_q.py::test_q"),
             Some(&TestOutcome::Pass)
+        );
+    }
+
+    #[test]
+    fn parse_verbose_outcomes_handles_status_keyword_embedded_in_parametrize_with_spaces() {
+        // R6 codex P2 regression guard: pytest node ids can embed
+        // status-keyword-shaped parametrize values like
+        // `[ PASSED ]` (status-keyword with a leading space INSIDE
+        // the bracket). The R4/R5 left-to-right `find(" PASSED")`
+        // scan would match the bracket content first, boundary
+        // check passes (trailing space before `]`), and the parser
+        // returns the wrong id + wrong outcome. R6 parses from
+        // the tail so the REAL status always wins.
+        let stdout =
+            "tests/test_p.py::test_p[ PASSED ] FAILED                              [ 50%]\n\
+             tests/test_p.py::test_q[ FAILED ] PASSED                              [100%]\n";
+        let outcomes = parse_pytest_verbose_outcomes(stdout);
+        assert_eq!(
+            outcomes.get("tests/test_p.py::test_p[ PASSED ]"),
+            Some(&TestOutcome::Fail),
+            "real trailing status FAILED must win over embedded ` PASSED `"
+        );
+        assert_eq!(
+            outcomes.get("tests/test_p.py::test_q[ FAILED ]"),
+            Some(&TestOutcome::Pass),
+            "real trailing status PASSED must win over embedded ` FAILED `"
         );
     }
 
