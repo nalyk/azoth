@@ -136,6 +136,10 @@ pub fn extract_rust(parser: &mut Parser, src: &str) -> Result<Vec<ExtractedSymbo
 /// recursive descent that used to live here.
 fn walk(root: Node<'_>, bytes: &[u8], out: &mut Vec<ExtractedSymbol>) {
     let mut stack: Vec<(Node<'_>, Option<usize>)> = vec![(root, None)];
+    // Reused TreeCursor — see `python.rs::walk` docstring for the
+    // round-7 gemini MED rationale (per-node `node.walk()` allocates
+    // a fresh TSTreeCursor C struct; `cursor.reset(node)` avoids it).
+    let mut cursor = root.walk();
     while let Some((node, parent_idx)) = stack.pop() {
         let me = classify(node, bytes);
 
@@ -161,7 +165,7 @@ fn walk(root: Node<'_>, bytes: &[u8], out: &mut Vec<ExtractedSymbol>) {
         // why `node.child(i)` in a reverse loop — gemini's suggested
         // shape — is O(N²) internally and thus not the right fix).
         let stack_tail_start = stack.len();
-        let mut cursor = node.walk();
+        cursor.reset(node);
         if cursor.goto_first_child() {
             loop {
                 stack.push((cursor.node(), next_parent));

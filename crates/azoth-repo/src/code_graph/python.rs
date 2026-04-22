@@ -110,6 +110,14 @@ pub fn extract_python(
 /// `{` or `(` would stack-overflow the old recursive walker).
 fn walk(root: Node<'_>, bytes: &[u8], out: &mut Vec<ExtractedSymbol>) {
     let mut stack: Vec<(Node<'_>, Option<usize>, bool)> = vec![(root, None, false)];
+    // Single reused TreeCursor across every node. Gemini round-7 MED
+    // on `cf4c6ac` — `node.walk()` per iteration allocates a fresh
+    // `TSTreeCursor` C struct each call; reusing via `cursor.reset(node)`
+    // avoids that per-node allocation without changing the walk's
+    // O(N) complexity. Cursor is re-initialised at the head of each
+    // iteration's children-push block, so no stale state from the
+    // prior node's sibling walk leaks into the next.
+    let mut cursor = root.walk();
     while let Some((node, parent_idx, enclosing_container_is_class)) = stack.pop() {
         let me = classify(node, bytes, enclosing_container_is_class);
 
@@ -164,7 +172,7 @@ fn walk(root: Node<'_>, bytes: &[u8], out: &mut Vec<ExtractedSymbol>) {
         // variant — `parent_idx` values and digest ordering remain
         // byte-identical to round 5.
         let stack_tail_start = stack.len();
-        let mut cursor = node.walk();
+        cursor.reset(node);
         if cursor.goto_first_child() {
             loop {
                 stack.push((cursor.node(), next_parent, next_container_is_class));
@@ -210,6 +218,8 @@ fn classify(
 /// matches the recursive descent that used to live here).
 fn first_leaf_identifier(root: Node<'_>, bytes: &[u8]) -> Option<String> {
     let mut stack: Vec<Node<'_>> = vec![root];
+    // Reused TreeCursor, same rationale as [`walk`] above.
+    let mut cursor = root.walk();
     while let Some(node) = stack.pop() {
         if node.kind() == "identifier" {
             return node.utf8_text(bytes).ok().map(str::to_owned);
@@ -217,7 +227,7 @@ fn first_leaf_identifier(root: Node<'_>, bytes: &[u8]) -> Option<String> {
         // Same TreeCursor-forward + in-place-reverse pattern as
         // [`walk`] — see that function's children-push rationale.
         let stack_tail_start = stack.len();
-        let mut cursor = node.walk();
+        cursor.reset(node);
         if cursor.goto_first_child() {
             loop {
                 stack.push(cursor.node());
