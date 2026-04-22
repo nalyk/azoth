@@ -3,8 +3,9 @@
 //! v2.0 shipped the Rust-only extractor. **v2.1** introduces the
 //! `Language` enum + `detect_language` + `extract_for` dispatcher so
 //! multi-grammar extraction routes through a single seam. Per-language
-//! modules each expose `extract_<lang>(&mut Parser, &str)`; PR 2.1-B
-//! added `python`, PRs 2.1-C/D add `typescript`/`go`.
+//! modules each expose `extract_<lang>(&mut Parser, &str)`. v2.1
+//! wires `python` (PR 2.1-B), `typescript` (PR 2.1-C), and `go`
+//! (PR 2.1-D) — closing the multi-grammar set for this release.
 //!
 //! ## Why a dispatcher rather than a trait object
 //!
@@ -15,11 +16,13 @@
 //! allocation-free and makes the call-site obvious to the reader.
 
 mod common;
+pub mod go;
 pub mod index;
 pub mod python;
 pub mod rust;
 pub mod typescript;
 
+pub use go::{extract_go, go_parser};
 pub use index::{replace_symbols_for_path, SqliteSymbolIndex, SymbolWriter};
 pub use python::{extract_python, python_parser};
 pub use rust::{extract_rust, rust_parser, ExtractError, ExtractedSymbol};
@@ -77,11 +80,13 @@ impl Language {
     /// match arms surface as compile errors); this slice covers
     /// only those with a wired extractor.
     ///
-    /// PR 2.1-A shipped with Rust only; PR 2.1-B added Python.
-    /// PRs 2.1-C/D widen this slice in lock-step with the extractor
-    /// they land — the indexer's Phase-5 reconciliation purge AND
-    /// the backfill loop both use this set as the single source of
-    /// truth for "which symbol-row languages remain valid".
+    /// PR 2.1-A shipped with Rust only; PR 2.1-B added Python,
+    /// 2.1-C added TypeScript, 2.1-D added Go — v2.1.0 closes the
+    /// multi-grammar set. Future grammar additions (2.2+ widens to
+    /// e.g. JavaScript, Ruby) widen this slice in lock-step with the
+    /// extractor they land — the indexer's Phase-5 reconciliation
+    /// purge AND the backfill loop both use this set as the single
+    /// source of truth for "which symbol-row languages remain valid".
     /// Adding a `Language` variant without adding it here is
     /// deliberate: a freshly enumerated grammar still surfaces via
     /// `from_wire` (so the dispatcher can flow `UnsupportedLanguage`
@@ -97,14 +102,17 @@ impl Language {
     /// 2.1-A. The purge predicate needs extractor membership, not
     /// enum membership.
     pub fn all_extractor_wired() -> &'static [Language] {
-        // PR 2.1-D appends its grammar to this slice the moment
-        // it lands (same commit as the real `extract_for` arm).
         // Keep the ordering stable — the indexer's SQL builder
         // binds these by position, and the backfill loop (see
         // `indexer::reindex_blocking`) iterates over this slice as
         // its source-of-truth for "which `documents.language` tags
         // are worth re-fetching for symbol extraction".
-        &[Language::Rust, Language::Python, Language::TypeScript]
+        &[
+            Language::Rust,
+            Language::Python,
+            Language::TypeScript,
+            Language::Go,
+        ]
     }
 }
 
@@ -130,8 +138,11 @@ pub fn detect_language(path: &Path) -> Option<Language> {
 /// without a grammar wired in — distinct from
 /// `ExtractError::Language` (tree-sitter ABI failure) so callers can
 /// treat the two cases differently. The indexer routes
-/// `UnsupportedLanguage` to a silent skip (expected state until PRs
-/// 2.1-B/C/D land) while `Language` remains a log-worthy failure.
+/// `UnsupportedLanguage` to a silent skip while `Language` remains
+/// a log-worthy failure. v2.1 closes every current `Language`
+/// variant's extractor; the `UnsupportedLanguage` path only fires
+/// for variants added to `Language` in future PRs ahead of their
+/// extractor landing.
 pub fn extract_for(
     lang: Language,
     parser: &mut tree_sitter::Parser,
@@ -141,9 +152,7 @@ pub fn extract_for(
         Language::Rust => extract_rust(parser, src),
         Language::Python => extract_python(parser, src),
         Language::TypeScript => extract_typescript(parser, src),
-        // PR 2.1-D replaces this arm with the real extractor once
-        // the Go grammar lands.
-        Language::Go => Err(ExtractError::UnsupportedLanguage(lang)),
+        Language::Go => extract_go(parser, src),
     }
 }
 
@@ -184,7 +193,7 @@ pub fn parser_for(lang: Language, path: &Path) -> Result<tree_sitter::Parser, Ex
         ParserKey::Python => python_parser(),
         ParserKey::TypeScriptTs => typescript_parser_ts(),
         ParserKey::TypeScriptTsx => typescript_parser_tsx(),
-        ParserKey::Go => Err(ExtractError::UnsupportedLanguage(Language::Go)),
+        ParserKey::Go => go_parser(),
     }
 }
 
@@ -393,23 +402,22 @@ mod tests {
     }
 
     #[test]
-    fn extract_for_pending_languages_errors() {
-        // Pre-D guard: Go still returns
-        // `ExtractError::UnsupportedLanguage(<lang>)`, not
-        // `ExtractError::Language` (which is reserved for tree-sitter
-        // ABI failure on an already-wired grammar). When the Go grammar
-        // lands in PR 2.1-D, the arm is removed in that PR.
-        //
-        // PR 2.1-B flipped Python out of this list; PR 2.1-C flipped
-        // TypeScript out. Each grammar's own pending-error coverage
-        // disappears with its arm.
-        let mut parser = rust_parser().unwrap();
-        for lang in [Language::Go] {
-            match extract_for(lang, &mut parser, "") {
-                Err(ExtractError::UnsupportedLanguage(got)) => assert_eq!(got, lang),
-                other => panic!("lang={lang:?}: expected UnsupportedLanguage, got {other:?}"),
-            }
-        }
+    fn extract_for_go_dispatches_to_go_extractor() {
+        // PR 2.1-D ship gate: the Go arm of the dispatcher must
+        // run the real extractor, not `UnsupportedLanguage`. A
+        // parser initialised for Go must be used — the Rust
+        // parser can't produce Go trees even via the same
+        // dispatcher. Replaces the
+        // `extract_for_pending_languages_errors` sentinel (deleted
+        // in this PR now that every `Language` variant has a wired
+        // extractor).
+        let mut parser = go_parser().expect("parser");
+        let syms =
+            extract_for(Language::Go, &mut parser, "package main\nfunc alpha() {}\n").unwrap();
+        assert!(
+            syms.iter().any(|s| s.name == "alpha"),
+            "go arm did not reach the extractor: {syms:?}",
+        );
     }
 
     #[test]
@@ -418,25 +426,13 @@ mod tests {
     }
 
     #[test]
-    fn parser_for_pending_languages_errors() {
-        // Sibling to `extract_for_pending_languages_errors`. Ensures
-        // the parser factory and the extractor share the same error
-        // taxonomy so the indexer can treat the two call sites
-        // symmetrically. `tree_sitter::Parser` doesn't implement
-        // `Debug`, so `{other:?}` on the whole `Result` won't compile;
-        // we match the branches directly and name the unexpected Ok
-        // case in its own arm.
-        //
-        // PR 2.1-B flipped Python out of this list; PR 2.1-C flipped
-        // TypeScript. Each grammar's pending-error coverage
-        // disappears with its arm.
-        for lang in [Language::Go] {
-            match parser_for(lang, Path::new("x.any")) {
-                Err(ExtractError::UnsupportedLanguage(got)) => assert_eq!(got, lang),
-                Ok(_) => panic!("lang={lang:?}: expected UnsupportedLanguage, got Ok"),
-                Err(other) => panic!("lang={lang:?}: expected UnsupportedLanguage, got {other:?}"),
-            }
-        }
+    fn parser_for_go_returns_real_parser() {
+        // Sibling to `extract_for_go_dispatches_to_go_extractor`.
+        // Replaces the `parser_for_pending_languages_errors` sentinel
+        // deleted in this PR. A real `Ok(Parser)` is enough evidence —
+        // `go_parser` fails only on tree-sitter ABI mismatch, which
+        // would already break the extractor path tested above.
+        let _ = parser_for(Language::Go, Path::new("x.go")).expect("go parser");
     }
 
     #[test]
