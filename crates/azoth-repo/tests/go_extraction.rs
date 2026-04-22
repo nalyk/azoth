@@ -181,6 +181,27 @@ fn const_multi_name_spec() {
     // rather than doing a kind=="identifier" child scan, so we
     // don't accidentally emit identifiers that appear in the
     // `value` subtree (e.g. `const X = someVar`).
+    //
+    // **But `children_by_field_name` returns EVERY direct child
+    // whose grammar field-label is `name` — which in tree-sitter-go
+    // 0.21 includes the unnamed `,` separator tokens** (the grammar
+    // lists `name.types = [identifier, ","]` with `named: false` on
+    // the comma). Without a `.is_named()` filter, the classifier
+    // emits `ExtractedSymbol { name: ",", kind: Const }` rows
+    // interleaved with the real identifiers. This test locks the
+    // fix: assert the garbage rows are absent, not merely that the
+    // real names are present.
+    //
+    // Surfaced during PR #23 round 1 — verifying gemini MED 3123418508
+    // on `package_clause` by running a throwaway patch through the
+    // existing test suite spilled the full extractor output, which
+    // revealed the comma emissions on this fixture. Gemini's
+    // package_clause claim was wrong; the verification accidentally
+    // caught my own bug on an adjacent site. Sibling-audit lesson
+    // (memory: `feedback_audit_sibling_sites_on_class_bugs.md`)
+    // applied reactively here; should have been proactive — the
+    // original test only covered "positive symbols present," not
+    // "negative symbols absent."
     let src = "package main\nconst One, Two, Three = 1, 2, 3\n";
     let syms = extract(src);
     for name in ["One", "Two", "Three"] {
@@ -190,6 +211,17 @@ fn const_multi_name_spec() {
             "multi-name const `{name}` missing: {syms:?}",
         );
     }
+    // Garbage guard: the `,` separators under `const_spec.name`
+    // must NOT classify as Const. Any symbol whose name starts with
+    // punctuation (`,`, `;`, etc.) is a grammar-separator leak.
+    let punctuation_leaks: Vec<&ExtractedSymbol> = syms
+        .iter()
+        .filter(|s| s.name.chars().all(|c| !c.is_alphanumeric() && c != '_'))
+        .collect();
+    assert!(
+        punctuation_leaks.is_empty(),
+        "grammar-separator tokens leaked as symbols: {punctuation_leaks:?}",
+    );
 }
 
 #[test]

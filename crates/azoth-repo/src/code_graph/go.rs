@@ -183,9 +183,29 @@ fn classify_and_emit(
 ) -> Option<usize> {
     match node.kind() {
         "package_clause" => {
-            // `package_clause` has no fields in the grammar; the
-            // `package_identifier` is a plain named child. Walk
-            // direct children looking for the first one.
+            // REJECTED gemini MED 3123418508 (PR #23 review 1,
+            // `398abd6`): "use `name_via_field` instead — the
+            // grammar includes a `name` field." Verified
+            // empirically against `tree-sitter-go 0.21.2`
+            // (Cargo.lock): `name_via_field(node, "name", bytes)`
+            // returns `None` because `package_clause.fields` is the
+            // empty dict `{}` in this version's `node-types.json`.
+            // The `package_identifier` is a plain positional child
+            // under `children`, NOT a field-labeled one. Locked the
+            // reject with a 30 s verification: swapping to the
+            // suggested `name_via_field` patch made
+            // `package_emits_symbol` fail with
+            // "package symbol missing: []".
+            //
+            // Gemini's review body referenced "v0.21.0" — that
+            // version MAY have carried a `name` field, but we're on
+            // 0.21.2 per Cargo.lock and the grammar clearly shipped
+            // `fields: {}` for this node. Cross-version grammar
+            // drift is real; the node-types enumeration before
+            // classifier fire (memory:
+            // `pattern_tree_sitter_classifier_enumerate_node_types.md`)
+            // was the right source of truth. Keeping the manual
+            // children walk.
             let mut cur = node.walk();
             let name = node
                 .children(&mut cur)
@@ -231,9 +251,28 @@ fn classify_and_emit(
             // in the parallel-declaration form (`const A, B = 1, 2`)
             // without accidentally matching identifiers in the
             // `value` expression subtree.
+            //
+            // **`.is_named()` filter is load-bearing.** tree-sitter-go's
+            // grammar marks `const_spec.name.types` as
+            // `[identifier(named), ","(named: false)]` with
+            // `multiple: true`, so `children_by_field_name("name", ..)`
+            // returns the comma separators AS WELL AS the identifier
+            // nodes. Without `is_named()`, `utf8_text` reads ","
+            // successfully and the classifier emits
+            // `ExtractedSymbol { name: ",", kind: Const }` rows
+            // between the real identifiers — surfaced in PR #23 R1
+            // while verifying gemini's (incorrect) `package_clause`
+            // suggestion: the throwaway patch spilled the full
+            // extractor output, revealing the comma leak on an
+            // adjacent site. Regression test:
+            // `const_multi_name_spec` now asserts no punctuation-only
+            // symbols leak.
             let mut cur = node.walk();
             let mut last_idx: Option<usize> = None;
             for child in node.children_by_field_name("name", &mut cur) {
+                if !child.is_named() {
+                    continue;
+                }
                 if let Ok(name) = child.utf8_text(bytes) {
                     let idx = push_symbol(name, SymbolKind::Const, &node, parent_idx, bytes, out);
                     last_idx = Some(idx);
