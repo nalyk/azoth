@@ -226,10 +226,17 @@ fn pytest_output_signals_dependency_error(stdout: &str, stderr: &str) -> bool {
 /// tests/test_foo.py::test_gamma SKIPPED (reason)               [100%]
 /// ```
 ///
-/// We tokenise each line, treat the first whitespace-separated
-/// token as the test id (guarded by the `::` substring so we
-/// never match the `============================= FAILURES`
-/// banner lines), and map the second token to `TestOutcome`.
+/// **Parametrize gotcha** (R4 codex P1): pytest node IDs can
+/// contain whitespace inside `[...]` parametrize values — e.g.
+/// `test_p.py::test_p[hello world] PASSED`. A naive
+/// `split_whitespace()` approach breaks: `test_p[hello` and
+/// `world]` become separate tokens and the status token lands
+/// at index 2, not 1. Instead we byte-search each line for the
+/// canonical ` STATUS` pattern (each status keyword preceded by
+/// a space) with a trailing boundary check (whitespace / EOL),
+/// then slice the id from `[0..match_idx]`. Preserves all
+/// internal whitespace in the test id, including parametrize
+/// spaces.
 ///
 /// Statuses beyond the v2.1 core four (`PASSED`, `FAILED`,
 /// `SKIPPED`, `ERROR`) map to:
@@ -242,22 +249,54 @@ fn pytest_output_signals_dependency_error(stdout: &str, stderr: &str) -> bool {
 /// them for some reason — config filter, discovery skip) surface
 /// as `TestOutcome::Unknown`, NOT guessed as Pass or Fail.
 fn parse_pytest_verbose_outcomes(stdout: &str) -> std::collections::HashMap<String, TestOutcome> {
+    // Ordered canonical status table. The leading space on each
+    // needle is load-bearing: it disqualifies matches embedded in
+    // a parametrize bracket with NO preceding space
+    // (e.g. `[PASSED]`). Combined with the trailing-boundary
+    // check below, this narrows to ` STATUS ` or ` STATUS<EOL>`.
+    const STATUS_TABLE: &[(&str, TestOutcome)] = &[
+        (" PASSED", TestOutcome::Pass),
+        (" XFAIL", TestOutcome::Pass),
+        (" FAILED", TestOutcome::Fail),
+        (" ERROR", TestOutcome::Fail),
+        (" XPASS", TestOutcome::Fail),
+        (" SKIPPED", TestOutcome::Skip),
+    ];
     let mut out = std::collections::HashMap::new();
-    for line in stdout.lines() {
-        let mut parts = line.split_whitespace();
-        let (Some(id), Some(status)) = (parts.next(), parts.next()) else {
-            continue;
-        };
-        if !id.contains("::") {
+    'line_loop: for line in stdout.lines() {
+        // Quick guard against banner / summary lines that don't
+        // carry a node id at all. Real test lines always contain
+        // `::` (module separator in pytest node-id format).
+        if !line.contains("::") {
             continue;
         }
-        let outcome = match status {
-            "PASSED" | "XFAIL" => TestOutcome::Pass,
-            "FAILED" | "ERROR" | "XPASS" => TestOutcome::Fail,
-            "SKIPPED" => TestOutcome::Skip,
-            _ => continue,
-        };
-        out.insert(id.to_string(), outcome);
+        for (needle, outcome) in STATUS_TABLE {
+            // Walk the line for every occurrence of the needle so
+            // a status keyword embedded inside a parametrize
+            // bracket doesn't short-circuit the real match at the
+            // end (the needle starts with a space so this only
+            // matters if someone parametrizes with a value that
+            // both starts with a space AND equals a status word).
+            let mut search_start = 0;
+            while let Some(rel_idx) = line[search_start..].find(needle) {
+                let match_idx = search_start + rel_idx;
+                let after = match_idx + needle.len();
+                // Trailing boundary check: status keyword must be
+                // followed by whitespace or end-of-line, otherwise
+                // we matched a substring of a longer token.
+                let is_boundary = after == line.len()
+                    || line.as_bytes()[after] == b' '
+                    || line.as_bytes()[after] == b'\t';
+                if is_boundary {
+                    let id = &line[..match_idx];
+                    if id.contains("::") {
+                        out.insert(id.to_string(), outcome.clone());
+                        continue 'line_loop;
+                    }
+                }
+                search_start = match_idx + 1;
+            }
+        }
     }
     out
 }
@@ -405,7 +444,11 @@ impl TestRunner for PytestRunner {
                 }
                 text.truncate(cutoff);
             }
-            Some(text)
+            // `Arc::<str>::from(String)` borrows the heap buffer
+            // and wraps it in an atomic refcount. Every per-test
+            // `detail.clone()` below is then an Arc-inc, not a
+            // 4 KiB allocation. R4 gemini MED on PR #24.
+            Some(std::sync::Arc::<str>::from(text))
         };
         let results = plan
             .tests
@@ -572,5 +615,72 @@ mod tests {
         let stdout = "tests/a.py::test_alpha PASSED  [100%]\n";
         let outcomes = parse_pytest_verbose_outcomes(stdout);
         assert!(!outcomes.contains_key("tests/a.py::test_beta"));
+    }
+
+    #[test]
+    fn parse_verbose_outcomes_preserves_spaces_in_parametrize_brackets() {
+        // R4 codex P1 regression guard: pytest parametrize can
+        // embed whitespace in the node id — e.g. `[hello world]`
+        // is a legitimate parametrize value that pytest emits
+        // verbatim in its `-v` output. Naive `split_whitespace()`
+        // would split the id itself into `...[hello` and `world]`,
+        // pushing the status token to index 2 and dropping the line.
+        let stdout =
+            "tests/test_p.py::test_p[hello world] PASSED                          [ 25%]\n\
+             tests/test_p.py::test_p[another case] FAILED                         [ 50%]\n\
+             tests/test_p.py::test_p[just_one] SKIPPED                            [ 75%]\n\
+             tests/test_p.py::test_p[multi word case here] XFAIL                  [100%]\n";
+        let outcomes = parse_pytest_verbose_outcomes(stdout);
+        assert_eq!(
+            outcomes.get("tests/test_p.py::test_p[hello world]"),
+            Some(&TestOutcome::Pass),
+            "parametrize with single internal space must be preserved"
+        );
+        assert_eq!(
+            outcomes.get("tests/test_p.py::test_p[another case]"),
+            Some(&TestOutcome::Fail)
+        );
+        assert_eq!(
+            outcomes.get("tests/test_p.py::test_p[just_one]"),
+            Some(&TestOutcome::Skip),
+            "no-space parametrize still works"
+        );
+        assert_eq!(
+            outcomes.get("tests/test_p.py::test_p[multi word case here]"),
+            Some(&TestOutcome::Pass),
+            "3+ internal spaces must be preserved via byte-slice"
+        );
+    }
+
+    #[test]
+    fn parse_verbose_outcomes_handles_status_token_inside_parametrize_bracket() {
+        // Pathological case: parametrize value that LOOKS like a
+        // status keyword. The leading-space guard in the needle
+        // means `[PASSED]` (no leading space) can't match, and
+        // the boundary check rejects `[PASSEDX]` (no trailing
+        // whitespace). Only the REAL status suffix matches.
+        let stdout =
+            "tests/test_p.py::test_p[PASSED] FAILED                                [100%]\n";
+        let outcomes = parse_pytest_verbose_outcomes(stdout);
+        assert_eq!(
+            outcomes.get("tests/test_p.py::test_p[PASSED]"),
+            Some(&TestOutcome::Fail),
+            "status keyword embedded in bracket must not shadow the real status"
+        );
+    }
+
+    #[test]
+    fn parse_verbose_outcomes_error_boundary_not_matched_by_substring() {
+        // Guard against `ERROR` matching a substring like `ERRORED`
+        // that isn't pytest's status token.
+        let stdout =
+            "tests/test_q.py::test_q PASSED                                       [100%]\n\
+             ============================== 1 ERRORED something else ==============================\n";
+        let outcomes = parse_pytest_verbose_outcomes(stdout);
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(
+            outcomes.get("tests/test_q.py::test_q"),
+            Some(&TestOutcome::Pass)
+        );
     }
 }

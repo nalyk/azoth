@@ -12,6 +12,7 @@
 
 use async_trait::async_trait;
 use std::path::Path;
+use std::sync::Arc;
 
 use azoth_core::impact::ImpactError;
 use azoth_core::schemas::{TestId, TestPlan};
@@ -36,9 +37,14 @@ pub struct TestRunResult {
     pub duration_ms: u64,
     /// Captured stderr/stdout snippet (truncated to 4 KiB) for
     /// forensic rendering. `None` when the runner has no useful
-    /// tail (pragmatic v2.1 shape — per-test granular capture comes
-    /// with the event-stream overhaul tracked in v2.5).
-    pub detail: Option<String>,
+    /// tail.
+    ///
+    /// `Arc<str>` (not `String`) because every `TestRunResult` in
+    /// a single `run()` carries the SAME captured-output buffer
+    /// — a plan with 100 tests × 4 KiB would clone 400 KiB of
+    /// immutable text otherwise. `Arc<str>` makes per-result
+    /// cloning atomic-increment-only. R4 gemini MED on PR #24.
+    pub detail: Option<Arc<str>>,
 }
 
 /// Aggregate outcome of one `TestRunner::run` invocation.
