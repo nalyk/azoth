@@ -1067,71 +1067,6 @@ mod tests {
         assert_eq!(n, 0, "ignored.log must be filtered by .ignore");
     }
 
-    /// v2.1-A gemini MED-3 origin: the indexer routes symbol
-    /// extraction through `code_graph::extract_for`/`parser_for`, so
-    /// languages recognised by `Language::from_wire` but not yet
-    /// extractor-wired flow through the dispatcher silently — no
-    /// panic, no symbols, document row preserved. PR 2.1-B widened
-    /// the wired set to include Python; PR 2.1-C widened it to
-    /// include TypeScript, so this test now uses **Go** as the
-    /// "admitted but pending" sentinel. PR 2.1-D deletes the test
-    /// (no pending grammars left).
-    #[tokio::test]
-    async fn pending_grammar_file_indexed_without_symbols() {
-        let td = TempDir::new().unwrap();
-        let db = td.path().join("mirror.sqlite");
-        let repo = td.path().join("repo");
-        std::fs::create_dir_all(&repo).unwrap();
-        std::fs::write(repo.join("alpha.rs"), "fn alpha() {}\n").unwrap();
-        std::fs::write(
-            repo.join("script.go"),
-            "package main\nfunc beta() int { return 1 }\n",
-        )
-        .unwrap();
-
-        let idx = RepoIndexer::open(&db, &repo).unwrap();
-        let stats = idx.reindex_incremental().await.unwrap();
-        assert_eq!(stats.inserted, 2, "both files inserted into documents");
-        assert_eq!(
-            stats.symbols_extracted, 1,
-            "only Rust contributes symbols; Go dispatcher arm returns UnsupportedLanguage"
-        );
-
-        let guard = idx.conn.lock().unwrap();
-        let go_doc_lang: String = guard
-            .query_row(
-                "SELECT language FROM documents WHERE path = 'script.go'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(go_doc_lang, "go");
-
-        let go_symbol_rows: i64 = guard
-            .query_row(
-                "SELECT COUNT(*) FROM symbols WHERE path = 'script.go'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(
-            go_symbol_rows, 0,
-            "Go grammar not wired yet — no symbol rows expected"
-        );
-
-        let rs_symbol_rows: i64 = guard
-            .query_row(
-                "SELECT COUNT(*) FROM symbols WHERE path = 'alpha.rs'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert!(
-            rs_symbol_rows >= 1,
-            "Rust extractor still produces at least one symbol for alpha.rs"
-        );
-    }
-
     /// v2.1-A PR #19 round-9 (gemini MED 4th raise; reversal of my
     /// round-6/round-8 rejections). `parser_key` now returns
     /// `Err(LanguagePathMismatch)` instead of panicking when the
@@ -1260,112 +1195,17 @@ mod tests {
         );
     }
 
-    /// v2.1-A PR #19 round-7 gemini MED on `0cff561`: the
-    /// `UnsupportedLanguage` branches in `extract_and_store` (parser-init
-    /// site + extractor site) must purge any existing symbol rows for
-    /// the re-indexed path, not silently `return Ok(0)`. Motivating
-    /// scenario: a future binary (one that wires a grammar this binary
-    /// lacks) writes symbol rows; the user downgrades back to a binary
-    /// where the enum variant exists but the grammar is not wired. On
-    /// re-edit, `Language::from_wire(tag)` → `Some(_)` →
-    /// `extract_and_store` → `parser_for(_)` returns
-    /// `UnsupportedLanguage`. Without the purge, the stale rows
-    /// persist and corrupt retrieval until the file is re-edited on a
-    /// binary that wires the grammar again.
-    ///
-    /// PR 2.1-B flipped this sentinel from Python (now wired) to
-    /// TypeScript; PR 2.1-C flipped TypeScript (now wired) to Go
-    /// (pending until PR-D). Class lesson: structural bugs repeat on
-    /// every axis of the same sibling relation (memory:
-    /// `feedback_audit_sibling_sites_on_class_bugs.md`); round-6
-    /// covered the `Err(_)` axis and missed the symmetric
-    /// `UnsupportedLanguage` axis at both parser-init + extractor
-    /// sites.
-    #[tokio::test]
-    async fn unsupported_language_purges_stale_symbol_rows_on_downgrade() {
-        use std::fs::OpenOptions;
-        use std::time::{Duration, SystemTime};
-
-        let td = TempDir::new().unwrap();
-        let db = td.path().join("mirror.sqlite");
-        let repo = td.path().join("repo");
-        std::fs::create_dir_all(&repo).unwrap();
-        let go_path = repo.join("script.go");
-        std::fs::write(&go_path, "package main\nfunc foo() int { return 1 }\n").unwrap();
-
-        // Pin mtime at a known ns-precision value so we can force an
-        // `Op::Update` on the second pass without relying on wall-clock
-        // drift.
-        let t0 = SystemTime::UNIX_EPOCH + Duration::new(1_700_000_000, 111_111_111);
-        OpenOptions::new()
-            .write(true)
-            .open(&go_path)
-            .unwrap()
-            .set_modified(t0)
-            .unwrap();
-
-        let idx = RepoIndexer::open(&db, &repo).unwrap();
-        let first = idx.reindex_incremental().await.unwrap();
-        assert_eq!(first.inserted, 1);
-        assert_eq!(
-            first.symbols_extracted, 0,
-            "Go grammar not wired → no symbols on fresh index"
-        );
-
-        // Simulate a prior-version binary (a hypothetical 2.1-D with
-        // Go wired) having written a symbol row for this path.
-        {
-            let guard = idx.conn.lock().unwrap();
-            guard
-                .execute(
-                    "INSERT INTO symbols (name, kind, path, start_line, end_line, parent_id, language, digest)
-                     VALUES ('foo', 'function', 'script.go', 1, 2, NULL, 'go', 'stale-digest')",
-                    [],
-                )
-                .unwrap();
-            let n: i64 = guard
-                .query_row(
-                    "SELECT COUNT(*) FROM symbols WHERE path = 'script.go'",
-                    [],
-                    |r| r.get(0),
-                )
-                .unwrap();
-            assert_eq!(n, 1, "pre-seeded stale symbol row must be present");
-        }
-
-        // Edit the file + bump mtime so Phase-4 sees Op::Update and
-        // hands the path to `extract_and_store`. Without the
-        // UnsupportedLanguage purge, the stale symbol row survives
-        // because `return Ok(0)` skipped `SymbolWriter::replace`.
-        std::fs::write(&go_path, "package main\nfunc bar() int { return 2 }\n").unwrap();
-        let t1 = SystemTime::UNIX_EPOCH + Duration::new(1_700_000_000, 999_999_999);
-        OpenOptions::new()
-            .write(true)
-            .open(&go_path)
-            .unwrap()
-            .set_modified(t1)
-            .unwrap();
-
-        let second = idx.reindex_incremental().await.unwrap();
-        assert_eq!(second.updated, 1, "second pass must re-touch the file");
-        assert_eq!(
-            second.symbols_extracted, 0,
-            "Go still unwired; no new symbols this pass"
-        );
-
-        let guard = idx.conn.lock().unwrap();
-        let stale_rows: i64 = guard
-            .query_row(
-                "SELECT COUNT(*) FROM symbols WHERE path = 'script.go'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(
-            stale_rows, 0,
-            "UnsupportedLanguage must purge stale rows on re-index, not leak them"
-        );
-    }
+    // `unsupported_language_purges_stale_symbol_rows_on_downgrade`
+    // (rotated sentinel from PR 2.1-B Python → 2.1-C TypeScript →
+    // 2.1-D Go) deleted in PR 2.1-D: v2.1 closes the extractor set
+    // for every `Language` variant, so the "enumerated but unwired"
+    // gap this test required is now empty. The purge code path
+    // itself (parser-init + extractor-site `UnsupportedLanguage`
+    // branches → `SymbolWriter::replace(path, lang, &[])`) stays
+    // live in production and fires the moment a future PR adds a
+    // new `Language` variant ahead of its extractor. That PR
+    // MUST re-introduce a sentinel test against the newly-unwired
+    // grammar — origin: PR #19 round-7 gemini MED on `0cff561`.
 
     /// Round-10 gemini MED #1 on 8fc89d5 (line 389). Covers the
     /// **language-transition on mtime-unchanged path** class bug:
@@ -1450,86 +1290,16 @@ mod tests {
         );
     }
 
-    /// Round-10 gemini MED #2 on 8fc89d5 (line 459). Covers the
-    /// **downgrade with mtime-unchanged path** class bug:
-    ///
-    ///   A hypothetical future binary indexes foo.go into
-    ///   symbols.language='go'. User downgrades to a binary where
-    ///   Go is enumerated but not extractor-wired. Reindex: walker
-    ///   sees foo.go unchanged → Op::Skip → Phase-4 never touches
-    ///   it. Backfill's WHERE clause is bound to
-    ///   `all_extractor_wired()` → skips foo.go too. The changed-file
-    ///   UnsupportedLanguage purge (rounds 6/7) never fires.
-    ///
-    /// The stale Go rows survive forever until someone edits the
-    /// file. Phase-5 reconciliation catches this by scoping valid
-    /// symbols to the extractor-wired set — not the broader
-    /// `Language::from_wire` set.
-    ///
-    /// PR 2.1-B flipped this sentinel from Python (now wired) to
-    /// TypeScript; PR 2.1-C flipped TypeScript (now wired) to Go
-    /// (pending until PR-D). Simulated by inserting a future-binary-
-    /// shaped row directly; the injection step is the same pattern
-    /// used by `unsupported_language_purges_stale_symbol_rows_on_downgrade`
-    /// above.
-    #[tokio::test]
-    async fn reconcile_purges_symbols_whose_language_is_not_extractor_wired() {
-        let td = TempDir::new().unwrap();
-        let db = td.path().join("mirror.sqlite");
-        let repo = td.path().join("repo");
-        std::fs::create_dir_all(&repo).unwrap();
-        std::fs::write(
-            repo.join("foo.go"),
-            "package main\nfunc alpha() int { return 1 }\n",
-        )
-        .unwrap();
-
-        let idx = RepoIndexer::open(&db, &repo).unwrap();
-        let first = idx.reindex_incremental().await.unwrap();
-        assert_eq!(
-            first.symbols_extracted, 0,
-            "Go grammar not wired → zero symbols on fresh index"
-        );
-
-        // Inject a future-binary-shaped stale row on the mtime-unchanged
-        // path. Phase-4 will skip this file next pass; only Phase-5
-        // reconciliation can catch the staleness.
-        {
-            let guard = idx.conn.lock().unwrap();
-            guard
-                .execute(
-                    "INSERT INTO symbols (name, kind, path, start_line, end_line, parent_id, language, digest)
-                     VALUES ('alpha', 'function', 'foo.go', 0, 1, NULL, 'go', 'stale-downgrade')",
-                    [],
-                )
-                .unwrap();
-            let pre: i64 = guard
-                .query_row(
-                    "SELECT COUNT(*) FROM symbols WHERE path = 'foo.go'",
-                    [],
-                    |r| r.get(0),
-                )
-                .unwrap();
-            assert_eq!(pre, 1, "injected downgrade artifact must be present");
-        }
-
-        let second = idx.reindex_incremental().await.unwrap();
-        assert_eq!(
-            second.updated, 0,
-            "foo.go mtime-unchanged — Phase-4 must skip, reconcile is the only purge path"
-        );
-
-        let guard = idx.conn.lock().unwrap();
-        let post: i64 = guard
-            .query_row(
-                "SELECT COUNT(*) FROM symbols WHERE path = 'foo.go'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(
-            post, 0,
-            "reconcile must purge symbol rows whose language is not extractor-wired in this binary"
-        );
-    }
+    // `reconcile_purges_symbols_whose_language_is_not_extractor_wired`
+    // (rotated sentinel from PR 2.1-B Python → 2.1-C TypeScript →
+    // 2.1-D Go) deleted in PR 2.1-D: same reason as
+    // `unsupported_language_purges_stale_symbol_rows_on_downgrade`
+    // above — the "enumerated but unwired" gap is empty on v2.1.
+    // The Phase-5 reconcile purge path itself is still covered by
+    // `reconcile_purges_symbols_when_language_transitions_on_unchanged_path`
+    // (which exercises the same predicate via `from_wire`-returns-None
+    // through `documents.language='markdown'`). A future PR adding a
+    // `Language` variant without wiring must re-introduce this
+    // sentinel against the newly-unwired grammar — origin: round-10
+    // gemini MED #2 on 8fc89d5 (line 459).
 }
