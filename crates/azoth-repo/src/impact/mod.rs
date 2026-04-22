@@ -16,6 +16,12 @@
 
 pub mod cargo;
 pub mod git_status;
+pub mod pytest;
+pub mod runner;
 
 pub use cargo::{discover_cargo_tests, CargoTestImpact, TestUniverse, CARGO_TEST_IMPACT_VERSION};
 pub use git_status::{parse_porcelain_z as parse_porcelain_z_for_tests, GitStatusDiffSource};
+pub use pytest::{
+    discover_pytest_tests, PytestError, PytestImpact, PytestRunner, PYTEST_IMPACT_VERSION,
+};
+pub use runner::{TestOutcome, TestRunResult, TestRunSummary, TestRunner};
