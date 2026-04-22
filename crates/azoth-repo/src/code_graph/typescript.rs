@@ -21,9 +21,11 @@
 //! |--------------------------------------|----------------|
 //! | `function_declaration`               | `Function`     |
 //! | `generator_function_declaration`     | `Function`     |
+//! | `function_signature`                 | `Function`     |
 //! | `class_declaration`                  | `Class`        |
 //! | `abstract_class_declaration`         | `Class`        |
 //! | `method_definition`                  | `Method`       |
+//! | `method_signature`                   | `Method`       |
 //! | `abstract_method_signature`          | `Method`       |
 //! | `interface_declaration`              | `Interface`    |
 //! | `type_alias_declaration`             | `TypeAlias`    |
@@ -33,6 +35,26 @@
 //! classified themselves — the walker descends through them into the
 //! wrapped declaration, so `export function foo() {}` still yields a
 //! `Function` symbol named `foo`.
+//!
+//! `function_signature` and `method_signature` landed in PR #22
+//! review round 1 (codex P1 on `35bd48a`). I shipped the initial
+//! classifier without them and `.d.ts` / interface / `declare class`
+//! members extracted as zero — a retrieval blind spot for
+//! declaration-heavy TypeScript code. The grammar uses `_signature`
+//! variants for bodyless declarations:
+//!
+//! - `function_signature` covers `declare function foo(): void;` AND
+//!   function-overload signature lines (the forward declarations
+//!   above the implementation in `function f(x): T; function f(x, y): T; function f(...) { ... }`).
+//! - `method_signature` covers interface method members
+//!   (`interface I { m(): void; }`) and `declare class` method
+//!   members. `abstract_method_signature` was already handled.
+//!
+//! I verified both node kinds carry required `name` fields in
+//! `node-types.json` before enabling them — structural signatures
+//! without names (`call_signature`, `construct_signature`,
+//! `index_signature`) are intentionally **not** classified because
+//! they have no stable identifier to retrieve on.
 //!
 //! ## Out-of-scope / caveats
 //!
@@ -176,13 +198,25 @@ fn walk(root: Node<'_>, bytes: &[u8], out: &mut Vec<ExtractedSymbol>) {
 
 fn classify(node: Node<'_>, bytes: &[u8]) -> Option<(String, SymbolKind)> {
     match node.kind() {
-        "function_declaration" | "generator_function_declaration" => {
+        // `function_signature` lands here alongside the
+        // body-carrying variants: `declare function foo();` and
+        // function-overload signature lines both parse to
+        // `function_signature`, and retrieval should surface them
+        // identically to a real function_declaration so
+        // `by_name("foo")` finds every overload. See module docs for
+        // the PR #22 review-round-1 rationale.
+        "function_declaration" | "generator_function_declaration" | "function_signature" => {
             name_via_field(&node, "name", bytes).map(|n| (n, SymbolKind::Function))
         }
         "class_declaration" | "abstract_class_declaration" => {
             name_via_field(&node, "name", bytes).map(|n| (n, SymbolKind::Class))
         }
-        "method_definition" | "abstract_method_signature" => {
+        // `method_signature` is the canonical node for bodyless
+        // method declarations inside interfaces and `declare class`
+        // blocks. `abstract_method_signature` (class-level abstract)
+        // was already handled; `method_signature` closes the gap for
+        // interfaces and ambient declarations.
+        "method_definition" | "method_signature" | "abstract_method_signature" => {
             name_via_field(&node, "name", bytes).map(|n| (n, SymbolKind::Method))
         }
         "interface_declaration" => {

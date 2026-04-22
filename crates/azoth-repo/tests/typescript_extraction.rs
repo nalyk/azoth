@@ -197,6 +197,106 @@ fn tsx_class_component_with_methods() {
     assert_eq!(render.parent_idx, Some(class_idx));
 }
 
+// --- PR #22 review round 1 ------------------------------------------
+//
+// codex P1 (typescript.rs:180) flagged `function_signature` missing
+// from the classifier. Body-less functions (`declare function foo();`
+// and overload-signature lines) use that node kind. Without coverage,
+// `.d.ts` files produced near-zero symbols despite being routed
+// through the extractor.
+//
+// codex P1 (typescript.rs:186) flagged `method_signature` missing.
+// Body-less methods inside interfaces and `declare class` blocks use
+// that node kind; classifier previously only admitted
+// `method_definition` and `abstract_method_signature`.
+//
+// Each of the four tests below fails on the pre-fix classifier (the
+// expected symbol simply isn't emitted) and passes after the fix. I
+// verified `function_signature` and `method_signature` exist in
+// tree-sitter-typescript 0.21's `node-types.json` and carry required
+// `name` fields before writing the tests.
+
+#[test]
+fn declare_function_signature_is_extracted() {
+    // `declare function foo(...);` parses as `function_signature`,
+    // not `function_declaration` (the latter requires a body). The
+    // classifier now admits both.
+    let syms = extract_ts("declare function foo(x: number): string;\n");
+    assert!(
+        syms.iter()
+            .any(|s| s.name == "foo" && s.kind == SymbolKind::Function),
+        "declare function not extracted via function_signature: {syms:?}"
+    );
+}
+
+#[test]
+fn function_overload_signatures_are_extracted() {
+    // TypeScript overloads: two `function_signature` lines + one
+    // `function_declaration` implementation. All three should surface
+    // as `Function` symbols named `f` so `by_name("f")` returns every
+    // overload — otherwise an IDE-like retrieval would see only the
+    // impl.
+    let src = "function f(x: string): string;\n\
+               function f(x: number): number;\n\
+               function f(x: string | number): string | number { return x; }\n";
+    let syms = extract_ts(src);
+    let count = syms
+        .iter()
+        .filter(|s| s.name == "f" && s.kind == SymbolKind::Function)
+        .count();
+    assert_eq!(
+        count, 3,
+        "all overload signatures + impl should extract: {syms:?}"
+    );
+}
+
+#[test]
+fn interface_method_signatures_are_extracted_as_methods() {
+    // `method_signature` is the canonical node kind for bodyless
+    // methods inside interfaces. The classifier now admits it and
+    // parent_idx points at the enclosing Interface symbol.
+    let src = "interface Shape {\n  area(): number;\n  perimeter(): number;\n}\n";
+    let syms = extract_ts(src);
+    let shape_idx = syms
+        .iter()
+        .position(|s| s.name == "Shape" && s.kind == SymbolKind::Interface)
+        .expect("Shape extracted");
+    let area = syms
+        .iter()
+        .find(|s| s.name == "area" && s.kind == SymbolKind::Method)
+        .expect("area method_signature extracted");
+    let perim = syms
+        .iter()
+        .find(|s| s.name == "perimeter" && s.kind == SymbolKind::Method)
+        .expect("perimeter method_signature extracted");
+    assert_eq!(area.parent_idx, Some(shape_idx));
+    assert_eq!(perim.parent_idx, Some(shape_idx));
+}
+
+#[test]
+fn declare_class_method_signatures_are_extracted() {
+    // `declare class` bodies contain `method_signature` nodes (no
+    // body) and `public_field_definition` nodes (fields). The
+    // extractor surfaces the methods with `parent_idx` pointing at
+    // the enclosing Class.
+    let src = "declare class Foo {\n  field: number;\n  method(): void;\n  other(x: string): string;\n}\n";
+    let syms = extract_ts(src);
+    let class_idx = syms
+        .iter()
+        .position(|s| s.name == "Foo" && s.kind == SymbolKind::Class)
+        .expect("Foo class extracted");
+    let method = syms
+        .iter()
+        .find(|s| s.name == "method" && s.kind == SymbolKind::Method)
+        .expect("method_signature `method` extracted");
+    assert_eq!(method.parent_idx, Some(class_idx));
+    assert!(
+        syms.iter()
+            .any(|s| s.name == "other" && s.kind == SymbolKind::Method),
+        "method_signature `other` extracted"
+    );
+}
+
 #[test]
 fn malformed_input_does_not_panic() {
     // tree-sitter-typescript recovers around stray tokens. Lock the
@@ -273,10 +373,13 @@ fn fixture_under_50ms_per_file() {
 
 #[test]
 fn fixture_yields_expected_symbol_counts() {
-    // Conservative floors keyed to the shape of `sample.ts`. Recompute
-    // if the fixture is regenerated. Intentionally conservative — the
-    // fixture contains far more declarations than these asserts demand
-    // so grammar-edge-case recovery doesn't fail the gate.
+    // Floors keyed to the shape of `sample.ts` AFTER the PR #22 R1
+    // classifier fix (function_signature + method_signature now
+    // counted). Observed counts on the current fixture:
+    // fns=39 cls=15 met=55 ifs=10 ta=11 en=4. Floors sit just under
+    // observed so a future change that narrows the classifier OR a
+    // fixture regression trips the gate instead of silently dropping
+    // symbols. Recompute if the fixture is regenerated.
     let src =
         std::fs::read_to_string("tests/fixtures/typescript/sample.ts").expect("fixture readable");
     let syms = extract_ts(&src);
@@ -295,12 +398,12 @@ fn fixture_yields_expected_symbol_counts() {
         .filter(|s| s.kind == SymbolKind::TypeAlias)
         .count();
     let en = syms.iter().filter(|s| s.kind == SymbolKind::Enum).count();
-    assert!(fns >= 20, "functions: got {fns}");
-    assert!(cls >= 10, "classes: got {cls}");
-    assert!(met >= 20, "methods: got {met}");
-    assert!(ifs >= 5, "interfaces: got {ifs}");
-    assert!(ta >= 5, "type aliases: got {ta}");
-    assert!(en >= 3, "enums: got {en}");
+    assert!(fns >= 35, "functions: got {fns}");
+    assert!(cls >= 14, "classes: got {cls}");
+    assert!(met >= 50, "methods: got {met}");
+    assert!(ifs >= 8, "interfaces: got {ifs}");
+    assert!(ta >= 9, "type aliases: got {ta}");
+    assert!(en >= 4, "enums: got {en}");
 }
 
 #[test]

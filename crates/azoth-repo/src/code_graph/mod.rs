@@ -159,33 +159,32 @@ pub fn extract_for(
 /// calling `rust_parser()` directly; the signature accepts `path`
 /// uniformly so v2.1 callers don't need a special-case.
 pub fn parser_for(lang: Language, path: &Path) -> Result<tree_sitter::Parser, ExtractError> {
-    match lang {
-        Language::Rust => rust_parser(),
-        Language::Python => python_parser(),
-        Language::TypeScript => {
-            // Co-located with `parser_key`'s `.tsx`/`.ts` discrimination
-            // (which the indexer uses to key the parser cache). Both
-            // sites MUST agree on extension semantics or the cache
-            // returns a parser built from the wrong grammar. Runtime
-            // violations of the (language, path) pair route through
-            // `parser_key`'s `LanguagePathMismatch` before ever
-            // reaching this function; by the time we get here the
-            // extension has been validated as one of {`ts`, `tsx`}.
-            // The `other => Err(..)` arm is defensive — reachable only
-            // if a caller bypasses `parser_key` and feeds a mismatched
-            // pair directly — and uses the same `LanguagePathMismatch`
-            // shape so downstream log/purge plumbing stays uniform.
-            match path.extension().and_then(|s| s.to_str()) {
-                Some("tsx") => typescript_parser_tsx(),
-                Some("ts") => typescript_parser_ts(),
-                other => Err(ExtractError::LanguagePathMismatch {
-                    language: Language::TypeScript,
-                    extension: other.map(str::to_owned),
-                }),
-            }
-        }
-        // PR 2.1-D wires the Go constructor here.
-        Language::Go => Err(ExtractError::UnsupportedLanguage(lang)),
+    // Delegate extension discrimination to `parser_key` so this
+    // function and the indexer's cache-key computation share a single
+    // source of truth. Gemini MED on PR #22 caught the drift risk: my
+    // initial PR-C shipped a second inline `path.extension()` match
+    // here that parallel-tracked `parser_key`'s logic. A future
+    // language addition that touched only one site would cache a
+    // parser under one `ParserKey` while materialising a different
+    // grammar — silent mis-extraction with no compile-time signal.
+    //
+    // With this delegation the two behaviours are structurally
+    // locked: whatever `parser_key` returns for (lang, path), this
+    // function maps exhaustively to the matching parser constructor.
+    // `LanguagePathMismatch` propagates via `?` unchanged so the
+    // indexer's uniform "Ok(0) ⇒ zero rows + log + purge" contract
+    // still holds. `UnsupportedLanguage` for unwired grammars (Go
+    // until PR 2.1-D) surfaces from THIS function rather than
+    // `parser_key` because the concept of "this variant has no
+    // extractor yet" is a property of the parser-constructor
+    // surface, not of the cache-key taxonomy — `ParserKey::Go`
+    // exists as a reserved slot for PR-D.
+    match parser_key(lang, path)? {
+        ParserKey::Rust => rust_parser(),
+        ParserKey::Python => python_parser(),
+        ParserKey::TypeScriptTs => typescript_parser_ts(),
+        ParserKey::TypeScriptTsx => typescript_parser_tsx(),
+        ParserKey::Go => Err(ExtractError::UnsupportedLanguage(Language::Go)),
     }
 }
 
