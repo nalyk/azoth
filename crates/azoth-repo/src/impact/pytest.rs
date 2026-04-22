@@ -478,11 +478,21 @@ impl TestRunner for PytestRunner {
             .arg("--no-header")
             .arg("--tb=short")
             .arg("--color=no");
-        for t in &plan.tests {
-            cmd.arg(t.as_str());
-        }
+        // R9 gemini HIGH: user-supplied extra_args first (they may
+        // be flags), then `--` separator, then test IDs as
+        // positional arguments. The `--` tells pytest's argparse
+        // "everything after here is positional, never interpret
+        // as a flag" — defensive against parametrize values that
+        // produce node IDs starting with `-` (e.g.
+        // `test_x[-flag]`). Without `--`, a `-`-leading id would
+        // be read as a pytest CLI flag and fail with "unknown
+        // option".
         for a in &self.extra_args {
             cmd.arg(a);
+        }
+        cmd.arg("--");
+        for t in &plan.tests {
+            cmd.arg(t.as_str());
         }
         let out = cmd
             .current_dir(repo_root)
