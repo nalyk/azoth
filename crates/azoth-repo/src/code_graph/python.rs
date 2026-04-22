@@ -83,6 +83,12 @@ pub fn extract_python(
 /// flipped to `true` on `class_definition` entry and reset to `false`
 /// on `function_definition` entry (nested defs are closures, not
 /// methods of the outer class).
+///
+/// Stack-overflow analysis: see [`first_leaf_identifier`] for the full
+/// reasoning shared with this walker. Depth bounded by CPython's own
+/// 1000-frame recursion limit; Rust 8 MiB stack at ≈ 256 B/frame gives
+/// a 30× margin. The [`crate::code_graph::rust::walk`] sibling is
+/// recursive in the same shape for the same reasons.
 fn walk(
     node: Node<'_>,
     bytes: &[u8],
@@ -149,6 +155,42 @@ fn classify(
 /// leaf found in pre-order traversal. Handles every decorator shape
 /// the Python grammar emits uniformly (bare, attribute, call). See
 /// module docs for the naming semantics (outermost qualifier).
+///
+/// # Why recursion, not `TreeCursor`-based iteration
+///
+/// Gemini raised a stack-overflow concern on PR #20 round 3
+/// (`db6c393`) — tree-sitter trees can in principle reach arbitrary
+/// depth, and a deeply-nested decorator expression (e.g. thousands
+/// of nested parentheses) would recurse as far as the input allows.
+/// The concern applies equally to the main [`walk`] function above;
+/// both are recursive tree walks.
+///
+/// Rejected with documentation for three reasons:
+///
+/// 1. **Depth is bounded by what CPython itself parses.** CPython's
+///    default recursion limit is 1000; valid Python source cannot
+///    exceed that before `SyntaxError`. tree-sitter-python would
+///    accept deeper input, but a file that CPython cannot compile
+///    is not a realistic production input to azoth.
+/// 2. **Stack budget is comfortable even at the ceiling.** Rust's
+///    default stack is 8 MiB. Each frame here is ≈ 256 bytes
+///    (Node, `&[u8]`, TreeCursor, a few locals). At CPython's
+///    1000-depth ceiling, stack use is ≈ 3%. A 30× margin to
+///    overflow.
+/// 3. **Sibling consistency.** [`walk`] (this file) and
+///    [`crate::code_graph::rust::walk`] are both recursive in the
+///    identical shape. Converting `first_leaf_identifier` alone
+///    would leave the larger walker unchanged and create stylistic
+///    drift between grammar modules. The principled fix is to
+///    convert all three to iterative `TreeCursor` walks in one
+///    dedicated PR; that refactor also has to preserve the
+///    `parent_idx` and `inside_class` state threading, which is
+///    straightforward but non-trivial — out of scope for PR 2.1-B
+///    (Python grammar add). Tracked as a v2.5 hardening candidate;
+///    re-evaluate if a real-world pathological input surfaces.
+///
+/// Empirical floor on realistic input: `@pkg.mod.sub.wrap` = 4
+/// levels; `@((((foo))))` = 5 levels. Typical production depth < 10.
 fn first_leaf_identifier(node: Node<'_>, bytes: &[u8]) -> Option<String> {
     if node.kind() == "identifier" {
         return node.utf8_text(bytes).ok().map(str::to_owned);
