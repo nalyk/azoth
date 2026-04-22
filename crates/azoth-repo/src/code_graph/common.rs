@@ -25,16 +25,24 @@ use tree_sitter::Node;
 /// chars keeps the column narrow while leaving 64 bits of collision
 /// resistance — ample for a "did this body change" check.
 ///
-/// Both indices are clamped to `bytes.len()` before slicing. Gemini
-/// raised the panic risk on PR #20: on a tree-sitter state where
-/// `start_byte > bytes.len()` (error recovery, truncated source
-/// between parse and walk), the unclamped slice panics. The clamp is
-/// pure defence — on well-formed trees tree-sitter guarantees
-/// `start_byte <= end_byte <= bytes.len()` so the clamp is a no-op;
-/// the fix only matters for pathological states.
+/// Defensive range construction (PR #20 rounds 2 + 4):
+///
+/// 1. `start = start_byte.min(bytes.len())` — gemini round 2 caught
+///    that an unclamped `start_byte > bytes.len()` would panic. In a
+///    pathological tree-sitter state (error recovery, truncated
+///    source between parse and walk) this is reachable.
+/// 2. `end = end_byte.clamp(start, bytes.len())` — gemini round 4
+///    extended the guard to `start > end`. tree-sitter *generally*
+///    guarantees `start_byte <= end_byte`, but as a shared defensive
+///    helper this function should not assume the precondition;
+///    `clamp` pins the resulting range to a valid empty-or-forward
+///    slice unconditionally.
+///
+/// On well-formed trees both clamps are no-ops and the digest is
+/// byte-identical to the pre-hardened version.
 pub(super) fn short_digest(node: &Node<'_>, bytes: &[u8]) -> String {
     let start = node.start_byte().min(bytes.len());
-    let end = node.end_byte().min(bytes.len());
+    let end = node.end_byte().clamp(start, bytes.len());
     let slice = &bytes[start..end];
     let mut h = Sha256::new();
     h.update(slice);

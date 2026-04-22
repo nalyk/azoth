@@ -115,37 +115,54 @@ pub fn extract_rust(parser: &mut Parser, src: &str) -> Result<Vec<ExtractedSymbo
 
     let bytes = src.as_bytes();
     let mut out: Vec<ExtractedSymbol> = Vec::new();
-    walk(tree.root_node(), bytes, None, &mut out);
+    walk(tree.root_node(), bytes, &mut out);
     Ok(out)
 }
 
-/// Recursive descent. `parent_idx` is the out-vec index of the enclosing
-/// Symbol, propagated so nested constructs link to their parent.
-fn walk(node: Node<'_>, bytes: &[u8], parent_idx: Option<usize>, out: &mut Vec<ExtractedSymbol>) {
-    // Classify this node. If it's a recognised symbol, push it and
-    // recurse with this symbol as the new parent. If it isn't, recurse
-    // unchanged.
-    let me = classify(node, bytes);
+/// Iterative pre-order traversal. `parent_idx` threads the index of
+/// the enclosing emitted Symbol down to children so nested constructs
+/// (methods inside impls, variants inside enums) resolve to their
+/// parent in one pass.
+///
+/// # Why iterative (PR #20 round 5)
+///
+/// Codex P2 on `482851e` flagged the recursive walkers as
+/// stack-overflow-able on adversarial input: a 1 MiB `.rs` file of
+/// `{` or `(` characters encodes ~1M nodes, needing ≈ 256 MB stack at
+/// ~256 B/frame — 32× over Linux's 8 MB default. This Rust walker
+/// had the same shape as the Python one (PR #20 introduced it);
+/// converting both in one round closes the class. Pre-order is
+/// preserved by pushing children in reverse so pop order matches the
+/// recursive descent that used to live here.
+fn walk(root: Node<'_>, bytes: &[u8], out: &mut Vec<ExtractedSymbol>) {
+    let mut stack: Vec<(Node<'_>, Option<usize>)> = vec![(root, None)];
+    while let Some((node, parent_idx)) = stack.pop() {
+        let me = classify(node, bytes);
 
-    let next_parent = if let Some((name, kind)) = me {
-        let (start_line, end_line) = line_range(&node);
-        let digest = short_digest(&node, bytes);
-        out.push(ExtractedSymbol {
-            name,
-            kind,
-            start_line,
-            end_line,
-            parent_idx,
-            digest,
-        });
-        Some(out.len() - 1)
-    } else {
-        parent_idx
-    };
+        let next_parent = if let Some((name, kind)) = me {
+            let (start_line, end_line) = line_range(&node);
+            let digest = short_digest(&node, bytes);
+            out.push(ExtractedSymbol {
+                name,
+                kind,
+                start_line,
+                end_line,
+                parent_idx,
+                digest,
+            });
+            Some(out.len() - 1)
+        } else {
+            parent_idx
+        };
 
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        walk(child, bytes, next_parent, out);
+        // Push children in REVERSE so pop order preserves pre-order
+        // traversal — byte-identical emission sequence to the prior
+        // recursive implementation.
+        let mut cursor = node.walk();
+        let children: Vec<Node<'_>> = node.children(&mut cursor).collect();
+        for child in children.into_iter().rev() {
+            stack.push((child, next_parent));
+        }
     }
 }
 

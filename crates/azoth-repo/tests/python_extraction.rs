@@ -189,3 +189,84 @@ fn fixture_yields_expected_symbol_counts() {
     assert!(met >= 20, "methods: got {met}");
     assert!(dec >= 4, "decorators: got {dec}");
 }
+
+// PR #20 round 5 — adversarial-depth tests.
+//
+// Codex P2 on `482851e`: `walk` recurses once per tree depth with no
+// explicit depth guard; `DEFAULT_MAX_FILE_BYTES = 1 MiB` allows files
+// that encode nesting depths far beyond an 8 MiB thread stack. My
+// round-4 rejection was wrong — I argued CPython's 1000-frame limit
+// bounded tree depth, but azoth indexes RAW repo bytes, not just
+// CPython-compilable Python. These tests construct inputs that
+// would crash the recursive walker and pass on the iterative one.
+
+#[test]
+fn deeply_nested_parens_does_not_stack_overflow() {
+    // 20 000 nested parens. On default 2 MiB test-thread stack with
+    // ~256 B/frame the recursive walker needs ~5 MiB → overflow.
+    // Iterative walker walks the same tree with O(1) stack.
+    let depth = 20_000usize;
+    let src = format!("x = {}{}{}", "(".repeat(depth), "1", ")".repeat(depth),);
+    let mut p = python_parser().unwrap();
+    // MUST return without panic. Extracted symbols is permitted to be
+    // empty — `x = (((...)))` is an assignment, not a def/class, so
+    // the walker visits every parenthesized_expression node but
+    // emits nothing.
+    let _ = extract_python(&mut p, &src).expect("extract must not crash");
+}
+
+#[test]
+fn deeply_nested_decorator_does_not_stack_overflow() {
+    // Decorator exercise for `first_leaf_identifier`: wrap a real
+    // decorator `wrap` in 10 000 levels of parens so the identifier
+    // leaf sits 10 000 nodes deep in the subtree.
+    let depth = 10_000usize;
+    let src = format!(
+        "@{}wrap{}\ndef f():\n    pass\n",
+        "(".repeat(depth),
+        ")".repeat(depth),
+    );
+    let mut p = python_parser().unwrap();
+    let syms = extract_python(&mut p, &src).expect("extract must not crash");
+    // We don't assert decorator recovery — the grammar's handling of
+    // 10k-nested-parens-in-decorator may produce ERROR nodes and
+    // drop the identifier. The test's job is the no-panic promise.
+    // `f` is not nested inside the parens so it should survive.
+    assert!(
+        syms.iter().any(|s| s.name == "f"),
+        "function `f` outside the paren chain must be extracted",
+    );
+}
+
+#[test]
+fn deeply_nested_class_body_does_not_stack_overflow() {
+    // Stress `walk`'s `inside_class` state threading under
+    // `class ... class ... class ...` nesting. The primary assertion
+    // is no-panic; tree-sitter-python's grammar caps the depth at
+    // which it can recover `class_definition` nodes (empirically
+    // ~62 before parse errors dominate), so we don't assert a
+    // 1:1 count with the generated source. What we DO assert: the
+    // walker does not overflow the thread stack under the
+    // grammar's max-usable depth, and `inside_class` threading
+    // survives the chain (tree-sitter's recovered classes all
+    // reach SymbolKind::Class, proving the state flag flipped
+    // correctly at every level the grammar accepted).
+    let depth = 2_000usize;
+    let mut src = String::new();
+    for i in 0..depth {
+        src.push_str(&"    ".repeat(i));
+        src.push_str(&format!("class C{i}:\n"));
+    }
+    src.push_str(&"    ".repeat(depth));
+    src.push_str("pass\n");
+    let mut p = python_parser().unwrap();
+    let syms = extract_python(&mut p, &src).expect("extract must not crash");
+    let cls = syms.iter().filter(|s| s.kind == SymbolKind::Class).count();
+    // tree-sitter-python accepts a substantial prefix; pin a lower
+    // bound that proves `inside_class` threading actually carried
+    // state across the chain without confusing the walker.
+    assert!(
+        cls >= 32,
+        "walker should classify at least 32 nested classes; got {cls}"
+    );
+}

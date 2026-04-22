@@ -1,8 +1,12 @@
 //! tree-sitter-python 0.21 symbol extractor.
 //!
-//! Walker shape mirrors `rust.rs` for consistency: recurse once,
-//! classify each node, push an [`ExtractedSymbol`] when recognised,
-//! threading `parent_idx` so method → class linkage lands in one pass.
+//! Walker shape mirrors `rust.rs` for consistency: iterative
+//! pre-order traversal over an explicit stack, classify each node,
+//! push an [`ExtractedSymbol`] when recognised, threading
+//! `parent_idx` so method → class linkage lands in one pass. Both
+//! walkers converted to iterative in PR #20 round 5 (see [`walk`]
+//! docstring for the codex P2 stack-overflow analysis that motivated
+//! the change).
 //!
 //! Node types emitted (v2.1 scope):
 //!
@@ -74,59 +78,76 @@ pub fn extract_python(
     let tree: Tree = parser.parse(src, None).ok_or(super::ExtractError::Parse)?;
     let bytes = src.as_bytes();
     let mut out: Vec<ExtractedSymbol> = Vec::new();
-    walk(tree.root_node(), bytes, None, false, &mut out);
+    walk(tree.root_node(), bytes, &mut out);
     Ok(out)
 }
 
-/// Recursive descent. `enclosing_container_is_class` determines whether
-/// a `function_definition` classifies as `Method` or `Function`; it is
-/// flipped to `true` on `class_definition` entry and reset to `false`
-/// on `function_definition` entry (nested defs are closures, not
-/// methods of the outer class).
+/// Iterative pre-order traversal of the parse tree.
 ///
-/// Stack-overflow analysis: see [`first_leaf_identifier`] for the full
-/// reasoning shared with this walker. Depth bounded by CPython's own
-/// 1000-frame recursion limit; Rust 8 MiB stack at ≈ 256 B/frame gives
-/// a 30× margin. The [`crate::code_graph::rust::walk`] sibling is
-/// recursive in the same shape for the same reasons.
-fn walk(
-    node: Node<'_>,
-    bytes: &[u8],
-    parent_idx: Option<usize>,
-    enclosing_container_is_class: bool,
-    out: &mut Vec<ExtractedSymbol>,
-) {
-    let me = classify(node, bytes, enclosing_container_is_class);
+/// `enclosing_container_is_class` determines whether a
+/// `function_definition` classifies as `Method` or `Function`; it flips
+/// to `true` on `class_definition` entry and resets to `false` on any
+/// `function_definition` entry (nested defs are closures, not methods
+/// of the outer class).
+///
+/// # Why iterative (PR #20 round 5)
+///
+/// Round-4 of the review cycle shipped with a recursive walker and a
+/// long docstring arguing recursion was safe because CPython caps its
+/// own recursion at 1000 frames. Codex (P2 on `482851e`) correctly
+/// pointed out that azoth indexes **raw repo text, not
+/// CPython-compilable Python**: a 1 MiB `.py` file filled with `(`
+/// characters encodes ~1M `parenthesized_expression` nodes, and
+/// `DEFAULT_MAX_FILE_BYTES = 1_048_576` is the actual attack budget.
+/// At ≈ 256 B/frame, 1M frames need ≈ 256 MB of stack — 32× over the
+/// 8 MB Linux default, 128× over the 2 MB test-thread default. I was
+/// wrong in round 4; the walker stays O(1) in stack depth from here
+/// on. Pre-order traversal is preserved by pushing children in
+/// reverse (pop order then matches recursive order).
+///
+/// Sibling: [`crate::code_graph::rust::walk`] converted to iterative
+/// in the same round for identical reasoning (malicious `.rs` file of
+/// `{` or `(` would stack-overflow the old recursive walker).
+fn walk(root: Node<'_>, bytes: &[u8], out: &mut Vec<ExtractedSymbol>) {
+    let mut stack: Vec<(Node<'_>, Option<usize>, bool)> = vec![(root, None, false)];
+    while let Some((node, parent_idx, enclosing_container_is_class)) = stack.pop() {
+        let me = classify(node, bytes, enclosing_container_is_class);
 
-    let (next_parent, next_container_is_class) = if let Some((name, kind)) = me {
-        let (s, e) = line_range(&node);
-        out.push(ExtractedSymbol {
-            name,
-            kind,
-            start_line: s,
-            end_line: e,
-            parent_idx,
-            digest: short_digest(&node, bytes),
-        });
-        let idx = out.len() - 1;
-        let child_container = match kind {
-            SymbolKind::Class => true,
-            // Every function body resets the flag — nested `def`s are
-            // closures, not methods. Holds for both `Function` and
-            // `Method` classifications.
-            SymbolKind::Function | SymbolKind::Method => false,
-            // Decorators don't open a new scope; carry the parent's
-            // container flag forward.
-            _ => enclosing_container_is_class,
+        let (next_parent, next_container_is_class) = if let Some((name, kind)) = me {
+            let (s, e) = line_range(&node);
+            out.push(ExtractedSymbol {
+                name,
+                kind,
+                start_line: s,
+                end_line: e,
+                parent_idx,
+                digest: short_digest(&node, bytes),
+            });
+            let idx = out.len() - 1;
+            let child_container = match kind {
+                SymbolKind::Class => true,
+                // Every function body resets the flag — nested
+                // `def`s are closures, not methods. Holds for both
+                // `Function` and `Method` classifications.
+                SymbolKind::Function | SymbolKind::Method => false,
+                // Decorators don't open a new scope; carry the
+                // parent's container flag forward.
+                _ => enclosing_container_is_class,
+            };
+            (Some(idx), child_container)
+        } else {
+            (parent_idx, enclosing_container_is_class)
         };
-        (Some(idx), child_container)
-    } else {
-        (parent_idx, enclosing_container_is_class)
-    };
 
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        walk(child, bytes, next_parent, next_container_is_class, out);
+        // Push children in REVERSE so pop order = pre-order. This
+        // preserves the exact emission order the recursive walker
+        // produced, so `parent_idx` values and digest sequencing stay
+        // byte-identical across the refactor.
+        let mut cursor = node.walk();
+        let children: Vec<Node<'_>> = node.children(&mut cursor).collect();
+        for child in children.into_iter().rev() {
+            stack.push((child, next_parent, next_container_is_class));
+        }
     }
 }
 
@@ -156,49 +177,21 @@ fn classify(
 /// the Python grammar emits uniformly (bare, attribute, call). See
 /// module docs for the naming semantics (outermost qualifier).
 ///
-/// # Why recursion, not `TreeCursor`-based iteration
-///
-/// Gemini raised a stack-overflow concern on PR #20 round 3
-/// (`db6c393`) — tree-sitter trees can in principle reach arbitrary
-/// depth, and a deeply-nested decorator expression (e.g. thousands
-/// of nested parentheses) would recurse as far as the input allows.
-/// The concern applies equally to the main [`walk`] function above;
-/// both are recursive tree walks.
-///
-/// Rejected with documentation for three reasons:
-///
-/// 1. **Depth is bounded by what CPython itself parses.** CPython's
-///    default recursion limit is 1000; valid Python source cannot
-///    exceed that before `SyntaxError`. tree-sitter-python would
-///    accept deeper input, but a file that CPython cannot compile
-///    is not a realistic production input to azoth.
-/// 2. **Stack budget is comfortable even at the ceiling.** Rust's
-///    default stack is 8 MiB. Each frame here is ≈ 256 bytes
-///    (Node, `&[u8]`, TreeCursor, a few locals). At CPython's
-///    1000-depth ceiling, stack use is ≈ 3%. A 30× margin to
-///    overflow.
-/// 3. **Sibling consistency.** [`walk`] (this file) and
-///    [`crate::code_graph::rust::walk`] are both recursive in the
-///    identical shape. Converting `first_leaf_identifier` alone
-///    would leave the larger walker unchanged and create stylistic
-///    drift between grammar modules. The principled fix is to
-///    convert all three to iterative `TreeCursor` walks in one
-///    dedicated PR; that refactor also has to preserve the
-///    `parent_idx` and `inside_class` state threading, which is
-///    straightforward but non-trivial — out of scope for PR 2.1-B
-///    (Python grammar add). Tracked as a v2.5 hardening candidate;
-///    re-evaluate if a real-world pathological input surfaces.
-///
-/// Empirical floor on realistic input: `@pkg.mod.sub.wrap` = 4
-/// levels; `@((((foo))))` = 5 levels. Typical production depth < 10.
-fn first_leaf_identifier(node: Node<'_>, bytes: &[u8]) -> Option<String> {
-    if node.kind() == "identifier" {
-        return node.utf8_text(bytes).ok().map(str::to_owned);
-    }
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        if let Some(name) = first_leaf_identifier(child, bytes) {
-            return Some(name);
+/// Iterative for the same stack-safety reason as [`walk`]: a
+/// `.py` file with a decorator like `@(((((...wrap...)))))` at
+/// 10 000 nesting levels would otherwise overflow the thread stack.
+/// Pre-order is preserved by pushing children in reverse (pop order
+/// matches the recursive descent that used to live here).
+fn first_leaf_identifier(root: Node<'_>, bytes: &[u8]) -> Option<String> {
+    let mut stack: Vec<Node<'_>> = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "identifier" {
+            return node.utf8_text(bytes).ok().map(str::to_owned);
+        }
+        let mut cursor = node.walk();
+        let children: Vec<Node<'_>> = node.children(&mut cursor).collect();
+        for child in children.into_iter().rev() {
+            stack.push(child);
         }
     }
     None
