@@ -312,6 +312,22 @@ fn parse_pytest_verbose_outcomes(stdout: &str) -> std::collections::HashMap<Stri
             }
             _ => line.trim_end(),
         };
+        // R7 codex P2: also strip a trailing `(reason)` block that
+        // pytest emits after SKIPPED / XFAIL / XPASS. Without this,
+        // a reason text containing a status keyword (e.g.
+        // `SKIPPED (depends on FAILED API)`) would have `FAILED`
+        // win as the rightmost word-boundary match. pytest's
+        // parametrize values use `[...]` not `(...)`, so a
+        // trailing parenthesized block is always a reason — never
+        // part of the test id.
+        let core = if core.ends_with(')') {
+            match core.rfind('(') {
+                Some(open_idx) => core[..open_idx].trim_end(),
+                None => core,
+            }
+        } else {
+            core
+        };
         let bytes = core.as_bytes();
         // Scan all status keywords; track the RIGHTMOST
         // word-boundary-aligned match.
@@ -469,6 +485,33 @@ impl TestRunner for PytestRunner {
             return Err(ImpactError::Backend(Box::new(
                 PytestError::DependenciesUnresolved(merge_pipes(&stdout_text, &stderr)),
             )));
+        }
+        // R7 codex P2: pytest exit codes per the docs:
+        //   0 = all tests passed
+        //   1 = some tests failed
+        //   2 = test execution interrupted (Ctrl-C)
+        //   3 = internal error
+        //   4 = pytest command-line usage error
+        //   5 = no tests collected
+        // Only 0 and 1 are meaningful per-test-outcome runs. Other
+        // non-zero codes mean we can't trust the `-v` parser to
+        // produce useful results — pytest may not have emitted any
+        // status lines at all. Surface those as `Discovery` errors
+        // so the caller knows the runner couldn't classify, rather
+        // than silently reporting every test as `Unknown`.
+        match out.status.code() {
+            Some(0) | Some(1) => {} // normal pass/fail run, continue
+            other => {
+                return Err(ImpactError::Backend(Box::new(PytestError::Discovery(
+                    format!(
+                        "pytest exited with code {} (expected 0 or 1):\n{}",
+                        other
+                            .map(|c| c.to_string())
+                            .unwrap_or_else(|| "<signal>".into()),
+                        merge_pipes(&stdout_text, &stderr)
+                    ),
+                ))));
+            }
         }
         // Per-test outcomes parsed from `-v` stdout. Tests that
         // don't appear in pytest's output surface as `Unknown` —
@@ -777,6 +820,38 @@ mod tests {
         assert_eq!(
             outcomes.get("tests/test_q.py::test_q"),
             Some(&TestOutcome::Pass)
+        );
+    }
+
+    #[test]
+    fn parse_verbose_outcomes_ignores_status_keyword_inside_skip_reason() {
+        // R7 codex P2 regression guard: pytest emits a trailing
+        // `(reason)` block after SKIPPED/XFAIL/XPASS. If the
+        // reason text contains a status keyword (e.g.
+        // `SKIPPED (depends on FAILED API)`), the R6 rightmost-
+        // match algorithm would pick the keyword INSIDE the
+        // reason instead of the real status. R7 strips the
+        // trailing `(...)` block before scanning so the reason
+        // text never contributes to the match.
+        let stdout =
+            "tests/test_x.py::test_a SKIPPED (depends on FAILED API)               [ 33%]\n\
+             tests/test_x.py::test_b XFAIL (reason involves PASSED edge case)      [ 66%]\n\
+             tests/test_x.py::test_c SKIPPED (no parens-wrapped status keyword)    [100%]\n";
+        let outcomes = parse_pytest_verbose_outcomes(stdout);
+        assert_eq!(
+            outcomes.get("tests/test_x.py::test_a"),
+            Some(&TestOutcome::Skip),
+            "FAILED inside `(...)` reason must not steal the SKIPPED status"
+        );
+        assert_eq!(
+            outcomes.get("tests/test_x.py::test_b"),
+            Some(&TestOutcome::Pass),
+            "PASSED inside `(...)` reason must not affect XFAIL outcome"
+        );
+        assert_eq!(
+            outcomes.get("tests/test_x.py::test_c"),
+            Some(&TestOutcome::Skip),
+            "reason without status keyword still parses correctly"
         );
     }
 
