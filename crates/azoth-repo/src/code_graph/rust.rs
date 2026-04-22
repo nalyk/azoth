@@ -155,14 +155,22 @@ fn walk(root: Node<'_>, bytes: &[u8], out: &mut Vec<ExtractedSymbol>) {
             parent_idx
         };
 
-        // Push children in REVERSE so pop order preserves pre-order
-        // traversal — byte-identical emission sequence to the prior
-        // recursive implementation.
+        // TreeCursor forward walk + in-place reverse of the newly-
+        // added stack tail. O(N) per parent, zero heap allocations.
+        // See `python.rs::walk` for the full rationale (including
+        // why `node.child(i)` in a reverse loop — gemini's suggested
+        // shape — is O(N²) internally and thus not the right fix).
+        let stack_tail_start = stack.len();
         let mut cursor = node.walk();
-        let children: Vec<Node<'_>> = node.children(&mut cursor).collect();
-        for child in children.into_iter().rev() {
-            stack.push((child, next_parent));
+        if cursor.goto_first_child() {
+            loop {
+                stack.push((cursor.node(), next_parent));
+                if !cursor.goto_next_sibling() {
+                    break;
+                }
+            }
         }
+        stack[stack_tail_start..].reverse();
     }
 }
 

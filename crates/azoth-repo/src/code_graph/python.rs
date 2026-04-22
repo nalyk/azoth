@@ -139,15 +139,41 @@ fn walk(root: Node<'_>, bytes: &[u8], out: &mut Vec<ExtractedSymbol>) {
             (parent_idx, enclosing_container_is_class)
         };
 
-        // Push children in REVERSE so pop order = pre-order. This
-        // preserves the exact emission order the recursive walker
-        // produced, so `parent_idx` values and digest sequencing stay
-        // byte-identical across the refactor.
+        // Push children in REVERSE order so pop order preserves
+        // pre-order traversal. Two allocation-free ways this COULD
+        // be written and one allocation-heavy way to avoid:
+        //
+        //   (a) Collect via `Vec<Node>` + `.rev()` — 1 heap alloc per
+        //       parent (old round-5 shape; gemini MED on `ce414de`
+        //       correctly flagged this overhead on large files).
+        //   (b) `for i in (0..node.child_count()).rev() { node.child(i) }`
+        //       — gemini's suggestion. Looks zero-alloc, but
+        //       `ts_node_child(n, i)` in tree-sitter 0.22.6 is O(i)
+        //       internally (linear sibling walk via
+        //       `ts_node_iterate_children`). Collecting N children
+        //       this way is O(N²) per parent, a regression on files
+        //       with many siblings under one node.
+        //   (c) TreeCursor forward walk + in-place reverse of the
+        //       stack tail. O(N) per parent via cursor, zero heap
+        //       allocations, amortized O(1) Vec growth on the
+        //       shared stack.
+        //
+        // Going with (c). Extends the shared stack directly, then
+        // reverses the newly-added tail so subsequent pops match
+        // pre-order. Same emission sequence as the collect+rev()
+        // variant — `parent_idx` values and digest ordering remain
+        // byte-identical to round 5.
+        let stack_tail_start = stack.len();
         let mut cursor = node.walk();
-        let children: Vec<Node<'_>> = node.children(&mut cursor).collect();
-        for child in children.into_iter().rev() {
-            stack.push((child, next_parent, next_container_is_class));
+        if cursor.goto_first_child() {
+            loop {
+                stack.push((cursor.node(), next_parent, next_container_is_class));
+                if !cursor.goto_next_sibling() {
+                    break;
+                }
+            }
         }
+        stack[stack_tail_start..].reverse();
     }
 }
 
@@ -188,11 +214,19 @@ fn first_leaf_identifier(root: Node<'_>, bytes: &[u8]) -> Option<String> {
         if node.kind() == "identifier" {
             return node.utf8_text(bytes).ok().map(str::to_owned);
         }
+        // Same TreeCursor-forward + in-place-reverse pattern as
+        // [`walk`] — see that function's children-push rationale.
+        let stack_tail_start = stack.len();
         let mut cursor = node.walk();
-        let children: Vec<Node<'_>> = node.children(&mut cursor).collect();
-        for child in children.into_iter().rev() {
-            stack.push(child);
+        if cursor.goto_first_child() {
+            loop {
+                stack.push(cursor.node());
+                if !cursor.goto_next_sibling() {
+                    break;
+                }
+            }
         }
+        stack[stack_tail_start..].reverse();
     }
     None
 }
