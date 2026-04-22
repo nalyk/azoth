@@ -161,6 +161,42 @@ impl RepoIndexer {
     }
 }
 
+/// Build the `IN (...)` / `NOT IN (...)` placeholder string for a
+/// dynamic SQL predicate bound to an `all_extractor_wired()` slice.
+///
+/// Gemini MED on PR #20 round 6 (`4442c65`): if `wired` is empty the
+/// naive `std::iter::repeat("?").take(0).join(",")` returns `""`,
+/// producing invalid SQL (`WHERE language IN ()`). `all_extractor_wired()`
+/// is non-empty today, but keeping the builder fragile against a
+/// future refactor that momentarily empties it is worse than spending
+/// three lines on a guard.
+///
+/// Empty-wired substitution is the literal `''` (empty-string literal
+/// as a one-element set). Downstream semantics:
+///
+///   - `WHERE language IN ('')`  — matches zero `documents` rows
+///     (our writer never stores empty-language documents), so the
+///     backfill loop walks zero rows. Correct: with no extractors
+///     wired, there is nothing to backfill for.
+///   - `WHERE language NOT IN ('')` — TRUE for every non-empty
+///     language, so the Phase-5 reconcile DELETE purges every
+///     symbol row. Correct: with no extractors wired, every existing
+///     symbol row is stale from a prior binary and should go.
+///
+/// The caller still passes `params_from_iter(wired.iter().map(..))`;
+/// on the empty-wired path that yields zero parameters, matching the
+/// zero `?` placeholders in `''`.
+fn wired_sql_placeholders(wired: &[crate::code_graph::Language]) -> String {
+    if wired.is_empty() {
+        "''".to_string()
+    } else {
+        std::iter::repeat("?")
+            .take(wired.len())
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+}
+
 fn reindex_blocking(
     conn: Arc<Mutex<Connection>>,
     root: &Path,
@@ -462,10 +498,7 @@ fn reindex_blocking(
     // wired set as a small SQLite view) replaces both in one pass.
     let backfill: Vec<(String, String, String)> = {
         let wired = crate::code_graph::Language::all_extractor_wired();
-        let placeholders = std::iter::repeat("?")
-            .take(wired.len())
-            .collect::<Vec<_>>()
-            .join(",");
+        let placeholders = wired_sql_placeholders(wired);
         let sql = format!(
             "SELECT path, content, language FROM documents
              WHERE language IN ({placeholders})
@@ -607,10 +640,7 @@ fn reindex_blocking(
     // reason each row was purged traceable through logs if we ever
     // add per-phase counters.
     let wired = crate::code_graph::Language::all_extractor_wired();
-    let placeholders = std::iter::repeat("?")
-        .take(wired.len())
-        .collect::<Vec<_>>()
-        .join(",");
+    let placeholders = wired_sql_placeholders(wired);
     let sql = format!(
         "DELETE FROM symbols
          WHERE language NOT IN ({placeholders})
@@ -815,6 +845,32 @@ fn detect_language(path: &Path) -> Option<&'static str> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn wired_sql_placeholders_empty_returns_literal_empty_string_set() {
+        // Gemini MED on PR #20 round 6 (`4442c65`): naive
+        // `std::iter::repeat("?").take(0).join(",")` returned `""`,
+        // producing invalid `WHERE language IN ()` SQL. Guard
+        // returns `''` (a one-element set containing the empty
+        // string literal) so both the backfill `IN` and the
+        // reconcile `NOT IN` remain syntactically valid and
+        // semantically correct in the empty-wired degenerate case.
+        assert_eq!(wired_sql_placeholders(&[]), "''");
+    }
+
+    #[test]
+    fn wired_sql_placeholders_non_empty_returns_comma_joined_question_marks() {
+        use crate::code_graph::Language;
+        assert_eq!(wired_sql_placeholders(&[Language::Rust]), "?");
+        assert_eq!(
+            wired_sql_placeholders(&[Language::Rust, Language::Python]),
+            "?,?"
+        );
+        assert_eq!(
+            wired_sql_placeholders(&[Language::Rust, Language::Python, Language::TypeScript]),
+            "?,?,?"
+        );
+    }
 
     fn seed(root: &Path) {
         // Use `.ignore` rather than `.gitignore` because the tempdir is
