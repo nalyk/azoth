@@ -205,12 +205,20 @@ impl ImpactSelector for PytestImpact {
 /// failure.
 fn pytest_output_signals_dependency_error(stdout: &str, stderr: &str) -> bool {
     let is_collection_import_failure = |s: &str| s.contains("ImportError while importing");
-    let is_pytest_missing =
+    // R5 codex P2 narrowing: "No module named 'pytest'" on STDOUT
+    // could be emitted by a legitimate test body that asserts on
+    // the exception message (e.g. a test validating ModuleNotFound
+    // messaging). Bootstrap-level failures where pytest itself
+    // isn't installed ALWAYS land on stderr — the Python
+    // interpreter prints the traceback to stderr before the
+    // terminal reporter even starts. Restricting the missing-
+    // pytest signal to stderr avoids the false-positive on stdout
+    // while preserving detection of the real bootstrap failure.
+    let is_pytest_missing_bootstrap =
         |s: &str| s.contains("No module named 'pytest'") || s.contains("No module named pytest");
     is_collection_import_failure(stdout)
         || is_collection_import_failure(stderr)
-        || is_pytest_missing(stdout)
-        || is_pytest_missing(stderr)
+        || is_pytest_missing_bootstrap(stderr)
 }
 
 /// Per-test outcome parser over `pytest -v` stdout. R3 gemini HIGH
@@ -288,7 +296,15 @@ fn parse_pytest_verbose_outcomes(stdout: &str) -> std::collections::HashMap<Stri
                     || line.as_bytes()[after] == b' '
                     || line.as_bytes()[after] == b'\t';
                 if is_boundary {
-                    let id = &line[..match_idx];
+                    // `trim` strips both leading and trailing
+                    // whitespace from the sliced id. pytest's
+                    // terminal reporter may right-pad the id for
+                    // column alignment; leading whitespace is
+                    // unusual but defensible. Internal whitespace
+                    // (parametrize brackets like `[hello world]`)
+                    // is preserved because `trim` only touches
+                    // the edges (R5 gemini HIGH).
+                    let id = line[..match_idx].trim();
                     if id.contains("::") {
                         out.insert(id.to_string(), outcome.clone());
                         continue 'line_loop;
@@ -314,9 +330,14 @@ fn parse_pytest_verbose_outcomes(stdout: &str) -> std::collections::HashMap<Stri
 /// `-q` output is one test id per line, followed by a summary line
 /// that does NOT contain `::`; the filter is robust to that.
 pub async fn discover_pytest_tests(repo_root: &Path) -> Result<TestUniverse, ImpactError> {
+    // `--color=no` disables ANSI escape codes that would otherwise
+    // wrap tokens and break substring-based signal detection. The
+    // runner uses the same flag for symmetric reasons (R5 codex P2
+    // sibling site).
     let out = Command::new("pytest")
         .arg("--collect-only")
         .arg("-q")
+        .arg("--color=no")
         .current_dir(repo_root)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -396,7 +417,14 @@ impl TestRunner for PytestRunner {
         // per-test outcomes instead of collapsing every test to
         // the overall exit code (R3 gemini HIGH).
         let mut cmd = Command::new("pytest");
-        cmd.arg("-v").arg("--no-header").arg("--tb=short");
+        // `--color=no` disables ANSI escape codes that would wrap
+        // status tokens (`\x1b[32mPASSED\x1b[0m`) and make the
+        // byte-search parser miss them, silently degrading every
+        // outcome to Unknown. R5 codex P2.
+        cmd.arg("-v")
+            .arg("--no-header")
+            .arg("--tb=short")
+            .arg("--color=no");
         for t in &plan.tests {
             cmd.arg(t.as_str());
         }
@@ -523,6 +551,23 @@ mod tests {
         assert!(
             !pytest_output_signals_dependency_error(stdout, stderr),
             "bare `ImportError` in a test body must not misfire as dependency error"
+        );
+    }
+
+    #[test]
+    fn dependency_signal_false_on_test_body_referencing_pytest_missing_on_stdout() {
+        // R5 codex P2: a test body that asserts on the string
+        // "No module named 'pytest'" (e.g. validating exception
+        // messaging for a sandboxed import) emits that literal on
+        // stdout. The R3/R4 helper would misfire; the R5 narrow
+        // restricts the missing-pytest signal to stderr only, so
+        // this test-body stdout must NOT trip it.
+        let stdout = "tests/test_msgs.py::test_pytest_missing_msg FAILED\n\
+                      E   AssertionError: expected 'No module named \\'pytest\\'' in exc.args[0]\n";
+        let stderr = "";
+        assert!(
+            !pytest_output_signals_dependency_error(stdout, stderr),
+            "stdout reference to `No module named 'pytest'` must not trip the bootstrap signal"
         );
     }
 
@@ -682,5 +727,39 @@ mod tests {
             outcomes.get("tests/test_q.py::test_q"),
             Some(&TestOutcome::Pass)
         );
+    }
+
+    #[test]
+    fn parse_verbose_outcomes_trims_trailing_whitespace_from_test_id() {
+        // R5 gemini HIGH regression guard: pytest's terminal
+        // reporter may right-pad the test id with spaces to align
+        // the status column across adjacent lines. A naive
+        // `&line[..match_idx]` slice would capture those trailing
+        // spaces into the map key, and subsequent lookups against
+        // `plan.tests` (which hold un-padded TestId strings) would
+        // miss, silently degrading every test to
+        // `TestOutcome::Unknown`. The `trim()` on the sliced id
+        // preserves internal whitespace (parametrize brackets)
+        // while stripping alignment padding.
+        let stdout =
+            "tests/a.py::test_short        PASSED                                  [ 50%]\n\
+             tests/a.py::test_longer_name  FAILED                                  [100%]\n";
+        let outcomes = parse_pytest_verbose_outcomes(stdout);
+        assert_eq!(
+            outcomes.get("tests/a.py::test_short"),
+            Some(&TestOutcome::Pass),
+            "trailing whitespace must be trimmed so plan lookups succeed"
+        );
+        assert_eq!(
+            outcomes.get("tests/a.py::test_longer_name"),
+            Some(&TestOutcome::Fail)
+        );
+        // Invariant: no map key contains a trailing space.
+        for key in outcomes.keys() {
+            assert!(
+                !key.ends_with(' '),
+                "test id '{key}' has trailing whitespace — plan lookup would fail"
+            );
+        }
     }
 }
