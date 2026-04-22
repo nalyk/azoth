@@ -563,6 +563,7 @@ async fn repo_read_file_absolute_path_is_rejected() {
     );
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn repo_read_file_symlink_escape_is_rejected() {
     // Layout — everything inside ONE TempDir so cleanup is guaranteed
@@ -912,6 +913,48 @@ async fn symbol_name_redirect_and_ampersand_survives() {
 // coverage to each Origin variant's round-trip integrity and the
 // specific "content-claims-authoritative-origin" attack shape.
 
+/// Single-source enumeration of every `Origin` variant, used by the
+/// three tests below that must stay exhaustive as new variants are
+/// added. The macro expands its `$variant` arguments to BOTH an
+/// exhaustive `match` arm list (compile-time check) AND an array
+/// literal (runtime iteration), so the two cannot drift — adding a
+/// variant to `Origin` without updating this macro's invocation
+/// leaves the match non-exhaustive, producing a compile error. Fixing
+/// that error by adding the variant here automatically updates the
+/// array the tests iterate over.
+///
+/// Codex P2 on PR #21 round 2 (`57184b9`) correctly flagged that my
+/// previous round-2 shape (separate match + separate array) left an
+/// "update match, forget array" failure mode. This macro closes the
+/// seam: match and array derive from one variant list.
+macro_rules! every_origin_variant {
+    () => {
+        every_origin_variant_inner!(
+            User,
+            Contract,
+            ToolOutput,
+            RepoFile,
+            WebFetch,
+            ModelOutput,
+            Indexer
+        )
+    };
+}
+
+macro_rules! every_origin_variant_inner {
+    ($($variant:ident),+ $(,)?) => {{
+        // Exhaustive match — non-exhaustive on new Origin variant.
+        #[allow(dead_code)]
+        fn _ensure_every_origin_listed(o: Origin) {
+            match o {
+                $( Origin::$variant )|+ => {}
+            }
+        }
+        // Iteration array derived from the SAME variant list.
+        [ $( Origin::$variant ),+ ]
+    }};
+}
+
 #[test]
 fn model_output_claiming_user_role_in_content_still_taints_as_model() {
     // Prompt-injection classic: a model emits `{"role": "user",
@@ -935,37 +978,13 @@ fn model_output_claiming_user_role_in_content_still_taints_as_model() {
 fn every_origin_variant_round_trips_via_serde() {
     // Regression guard: adding a new Origin variant without
     // corresponding serde handling would break replay of logs that
-    // mention it. Keeping an exhaustive round-trip means
-    // `#[serde(rename_all = "snake_case")]` stays honest as variants
-    // are added.
-    //
-    // The array literal alone is NOT exhaustive — gemini round-1 MED
-    // on PR #21 correctly pointed out the claim needed teeth. The
-    // match below IS exhaustive: adding a new variant without adding
-    // it to the array requires a new arm here, which produces a
-    // compile error. A Clippy allow-lint would mask that signal;
-    // keep the explicit list.
-    for origin in [
-        Origin::User,
-        Origin::Contract,
-        Origin::ToolOutput,
-        Origin::RepoFile,
-        Origin::WebFetch,
-        Origin::ModelOutput,
-        Origin::Indexer,
-    ] {
-        // Compile-time exhaustiveness check. If a new Origin variant
-        // lands without appearing in both this match AND the array
-        // above, the crate won't compile until the test is updated.
-        match origin {
-            Origin::User
-            | Origin::Contract
-            | Origin::ToolOutput
-            | Origin::RepoFile
-            | Origin::WebFetch
-            | Origin::ModelOutput
-            | Origin::Indexer => {}
-        }
+    // mention it. The `every_origin_variant!` macro ensures the
+    // match-arm exhaustiveness check AND the iteration array derive
+    // from the SAME variant list — adding a new variant to Origin
+    // forces an update to the macro's invocation (non-exhaustive
+    // match compile error), which automatically extends both the
+    // check and the iteration.
+    for origin in every_origin_variant!() {
         let s = serde_json::to_string(&origin).expect("serialise");
         let back: Origin = serde_json::from_str(&s).expect("deserialise");
         assert_eq!(back, origin, "round-trip for {origin:?} via {s}");
@@ -978,35 +997,9 @@ fn web_fetch_and_contract_origins_are_pairwise_distinct_from_every_other() {
     // — but exhaustive across every pair. Extends the `assert_ne!`
     // grid so any future variant merge (e.g. "flatten WebFetch into
     // RepoFile") surfaces in this test first instead of silently
-    // collapsing distinct trust domains.
-    //
-    // Compile-time exhaustiveness (gemini round-1 MED on PR #21):
-    // the match below forces a compile error if a new `Origin`
-    // variant is added without being listed in both the match arms
-    // AND the array below.
-    fn assert_listed(o: Origin) {
-        match o {
-            Origin::User
-            | Origin::Contract
-            | Origin::ToolOutput
-            | Origin::RepoFile
-            | Origin::WebFetch
-            | Origin::ModelOutput
-            | Origin::Indexer => {}
-        }
-    }
-    let all = [
-        Origin::User,
-        Origin::Contract,
-        Origin::ToolOutput,
-        Origin::RepoFile,
-        Origin::WebFetch,
-        Origin::ModelOutput,
-        Origin::Indexer,
-    ];
-    for o in all {
-        assert_listed(o);
-    }
+    // collapsing distinct trust domains. `every_origin_variant!`
+    // sources the list (see macro doc for compile-time exhaustiveness).
+    let all = every_origin_variant!();
     for (i, a) in all.iter().enumerate() {
         for b in &all[i + 1..] {
             assert_ne!(a, b, "distinct origins must stay distinct: {a:?} vs {b:?}");
@@ -1025,31 +1018,10 @@ fn repo_file_origin_does_not_decay_on_clone() {
     let t2 = t.clone();
     assert_eq!(t.origin(), Origin::RepoFile);
     assert_eq!(t2.origin(), Origin::RepoFile);
-    // And across every Origin variant. Sibling to
-    // `every_origin_variant_round_trips_via_serde` and
-    // `web_fetch_and_contract_origins_are_pairwise_distinct_from_every_other`
-    // — same "array literal needs match-enforced exhaustiveness"
-    // shape gemini flagged on PR #21 round 1. Applied here
-    // pre-emptively for sibling-audit consistency per
-    // `feedback_audit_sibling_sites_on_class_bugs.md`.
-    for origin in [
-        Origin::User,
-        Origin::Contract,
-        Origin::ToolOutput,
-        Origin::RepoFile,
-        Origin::WebFetch,
-        Origin::ModelOutput,
-        Origin::Indexer,
-    ] {
-        match origin {
-            Origin::User
-            | Origin::Contract
-            | Origin::ToolOutput
-            | Origin::RepoFile
-            | Origin::WebFetch
-            | Origin::ModelOutput
-            | Origin::Indexer => {}
-        }
+    // And across every Origin variant via the single-source macro
+    // (see `every_origin_variant!` doc above). Adding a new Origin
+    // variant automatically extends this test.
+    for origin in every_origin_variant!() {
         let t = Tainted::new(origin, json!({}));
         assert_eq!(t.clone().origin(), origin);
     }
