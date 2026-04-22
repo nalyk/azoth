@@ -18,10 +18,12 @@ mod common;
 pub mod index;
 pub mod python;
 pub mod rust;
+pub mod typescript;
 
 pub use index::{replace_symbols_for_path, SqliteSymbolIndex, SymbolWriter};
 pub use python::{extract_python, python_parser};
 pub use rust::{extract_rust, rust_parser, ExtractError, ExtractedSymbol};
+pub use typescript::{extract_typescript, typescript_parser_ts, typescript_parser_tsx};
 
 use std::path::Path;
 
@@ -95,14 +97,14 @@ impl Language {
     /// 2.1-A. The purge predicate needs extractor membership, not
     /// enum membership.
     pub fn all_extractor_wired() -> &'static [Language] {
-        // PRs 2.1-C/D append their grammar to this slice the
-        // moment they land (same commit as the real `extract_for`
-        // arm). Keep the ordering stable — the indexer's SQL
-        // builder binds these by position, and the backfill loop
-        // (see `indexer::reindex_blocking`) iterates over this
-        // slice as its source-of-truth for "which `documents.language`
-        // tags are worth re-fetching for symbol extraction".
-        &[Language::Rust, Language::Python]
+        // PR 2.1-D appends its grammar to this slice the moment
+        // it lands (same commit as the real `extract_for` arm).
+        // Keep the ordering stable — the indexer's SQL builder
+        // binds these by position, and the backfill loop (see
+        // `indexer::reindex_blocking`) iterates over this slice as
+        // its source-of-truth for "which `documents.language` tags
+        // are worth re-fetching for symbol extraction".
+        &[Language::Rust, Language::Python, Language::TypeScript]
     }
 }
 
@@ -138,9 +140,10 @@ pub fn extract_for(
     match lang {
         Language::Rust => extract_rust(parser, src),
         Language::Python => extract_python(parser, src),
-        // PRs 2.1-C / 2.1-D replace each arm with the real
-        // extractor once the grammar lands.
-        Language::TypeScript | Language::Go => Err(ExtractError::UnsupportedLanguage(lang)),
+        Language::TypeScript => extract_typescript(parser, src),
+        // PR 2.1-D replaces this arm with the real extractor once
+        // the Go grammar lands.
+        Language::Go => Err(ExtractError::UnsupportedLanguage(lang)),
     }
 }
 
@@ -155,16 +158,33 @@ pub fn extract_for(
 /// v2.0-level parity: for `Language::Rust` this is identical to
 /// calling `rust_parser()` directly; the signature accepts `path`
 /// uniformly so v2.1 callers don't need a special-case.
-pub fn parser_for(lang: Language, _path: &Path) -> Result<tree_sitter::Parser, ExtractError> {
-    match lang {
-        Language::Rust => rust_parser(),
-        Language::Python => python_parser(),
-        // PRs 2.1-C / D wire their constructors here. TypeScript
-        // (PR-C) will use `_path` to choose between TS and TSX parser
-        // constructors. Until each grammar lands, callers get
-        // `UnsupportedLanguage` (deliberate) rather than `Language`
-        // (ABI failure).
-        Language::TypeScript | Language::Go => Err(ExtractError::UnsupportedLanguage(lang)),
+pub fn parser_for(lang: Language, path: &Path) -> Result<tree_sitter::Parser, ExtractError> {
+    // Delegate extension discrimination to `parser_key` so this
+    // function and the indexer's cache-key computation share a single
+    // source of truth. Gemini MED on PR #22 caught the drift risk: my
+    // initial PR-C shipped a second inline `path.extension()` match
+    // here that parallel-tracked `parser_key`'s logic. A future
+    // language addition that touched only one site would cache a
+    // parser under one `ParserKey` while materialising a different
+    // grammar — silent mis-extraction with no compile-time signal.
+    //
+    // With this delegation the two behaviours are structurally
+    // locked: whatever `parser_key` returns for (lang, path), this
+    // function maps exhaustively to the matching parser constructor.
+    // `LanguagePathMismatch` propagates via `?` unchanged so the
+    // indexer's uniform "Ok(0) ⇒ zero rows + log + purge" contract
+    // still holds. `UnsupportedLanguage` for unwired grammars (Go
+    // until PR 2.1-D) surfaces from THIS function rather than
+    // `parser_key` because the concept of "this variant has no
+    // extractor yet" is a property of the parser-constructor
+    // surface, not of the cache-key taxonomy — `ParserKey::Go`
+    // exists as a reserved slot for PR-D.
+    match parser_key(lang, path)? {
+        ParserKey::Rust => rust_parser(),
+        ParserKey::Python => python_parser(),
+        ParserKey::TypeScriptTs => typescript_parser_ts(),
+        ParserKey::TypeScriptTsx => typescript_parser_tsx(),
+        ParserKey::Go => Err(ExtractError::UnsupportedLanguage(Language::Go)),
     }
 }
 
@@ -374,17 +394,17 @@ mod tests {
 
     #[test]
     fn extract_for_pending_languages_errors() {
-        // Pre-C/D guard: TS/Go still return
+        // Pre-D guard: Go still returns
         // `ExtractError::UnsupportedLanguage(<lang>)`, not
         // `ExtractError::Language` (which is reserved for tree-sitter
-        // ABI failure on an already-wired grammar). When the grammar
-        // lands, the corresponding arm is removed in that PR.
+        // ABI failure on an already-wired grammar). When the Go grammar
+        // lands in PR 2.1-D, the arm is removed in that PR.
         //
-        // PR 2.1-B flipped Python out of this list — Python now
-        // dispatches through the real extractor. Python's own
-        // pending-error test disappeared with the arm.
+        // PR 2.1-B flipped Python out of this list; PR 2.1-C flipped
+        // TypeScript out. Each grammar's own pending-error coverage
+        // disappears with its arm.
         let mut parser = rust_parser().unwrap();
-        for lang in [Language::TypeScript, Language::Go] {
+        for lang in [Language::Go] {
             match extract_for(lang, &mut parser, "") {
                 Err(ExtractError::UnsupportedLanguage(got)) => assert_eq!(got, lang),
                 other => panic!("lang={lang:?}: expected UnsupportedLanguage, got {other:?}"),
@@ -407,10 +427,10 @@ mod tests {
         // we match the branches directly and name the unexpected Ok
         // case in its own arm.
         //
-        // PR 2.1-B flipped Python out of this list — Python now
-        // has a real parser factory. Python's own pending-error
-        // coverage disappeared with the arm.
-        for lang in [Language::TypeScript, Language::Go] {
+        // PR 2.1-B flipped Python out of this list; PR 2.1-C flipped
+        // TypeScript. Each grammar's pending-error coverage
+        // disappears with its arm.
+        for lang in [Language::Go] {
             match parser_for(lang, Path::new("x.any")) {
                 Err(ExtractError::UnsupportedLanguage(got)) => assert_eq!(got, lang),
                 Ok(_) => panic!("lang={lang:?}: expected UnsupportedLanguage, got Ok"),
