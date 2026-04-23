@@ -19,9 +19,13 @@ use azoth_core::eval::{mean_precision, score_tasks, SeedTask};
 fn v2_1_seed_loads_ships_50_tasks_and_meets_localization_at_5_floor() {
     // Walk up two levels from the crate's CARGO_MANIFEST_DIR to reach the
     // workspace root. Sibling `tests/eval_localization.rs::seed_file_loads_and_scores`
-    // uses the identical pattern — do not drift from it without a matching
-    // update there. Descriptive `expect` messages (per gemini PR #28 MED) make
-    // CI failures actionable if the workspace layout moves.
+    // uses the identical pattern. Gemini's PR #28 MED asked about a
+    // workspace-relative path helper — no such helper exists in
+    // `azoth-core` today, and extracting one for two call sites is below
+    // the `pattern_extract_helper_over_inline_reviewer_patch.md` bar
+    // (n ≥ 3 sibling sites). If PR-K or a later sprint adds a third
+    // site, extract then. Descriptive `expect` messages make CI failures
+    // actionable if the workspace layout moves.
     let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let seed_path = manifest_dir
         .parent()
@@ -63,7 +67,9 @@ fn v2_1_seed_loads_ships_50_tasks_and_meets_localization_at_5_floor() {
     assert_eq!(count_with_prefix("go_"), 10, "10 Go tasks");
 
     let scores = score_tasks(&tasks, 5);
-    let mean = mean_precision(&scores).expect("non-empty seed");
+    let mean = mean_precision(&scores).expect(
+        "mean_precision returned None — scores vector is empty, which contradicts the tasks.len() == 50 assertion above",
+    );
     assert!(
         mean >= 0.45,
         "v2.1 plan §J gate: localization@5 {mean:.4} below 0.45 floor"
