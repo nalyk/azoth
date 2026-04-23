@@ -17,15 +17,22 @@ use azoth_core::eval::{mean_precision, score_tasks, SeedTask};
 
 #[test]
 fn v2_1_seed_loads_ships_50_tasks_and_meets_localization_at_5_floor() {
+    // Walk up two levels from the crate's CARGO_MANIFEST_DIR to reach the
+    // workspace root. Sibling `tests/eval_localization.rs::seed_file_loads_and_scores`
+    // uses the identical pattern — do not drift from it without a matching
+    // update there. Descriptive `expect` messages (per gemini PR #28 MED) make
+    // CI failures actionable if the workspace layout moves.
     let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let seed_path = manifest_dir
-        .parent() // crates/azoth-core → crates
-        .unwrap()
-        .parent() // crates → repo root
-        .unwrap()
+        .parent()
+        .expect("CARGO_MANIFEST_DIR (crates/azoth-core) must have a parent (crates/)")
+        .parent()
+        .expect("crates/ must have a parent (workspace root)")
         .join("docs/eval/v2.1_seed_tasks.json");
-    let bytes = std::fs::read(&seed_path).expect("v2.1_seed_tasks.json present");
-    let tasks: Vec<SeedTask> = serde_json::from_slice(&bytes).expect("seed parses");
+    let bytes = std::fs::read(&seed_path)
+        .unwrap_or_else(|e| panic!("failed to read v2.1 seed at {}: {e}", seed_path.display()));
+    let tasks: Vec<SeedTask> = serde_json::from_slice(&bytes)
+        .unwrap_or_else(|e| panic!("failed to parse v2.1 seed as Vec<SeedTask>: {e}"));
     assert_eq!(
         tasks.len(),
         50,

@@ -67,10 +67,10 @@
     "relevant_files": [
       "crates/azoth-core/src/authority/tainted.rs",
       "crates/azoth-core/src/execution/dispatcher.rs",
-      "crates/azoth-core/src/tools"
+      "crates/azoth-core/src/tools/mod.rs"
     ],
     "predicted_files": [
-      "crates/azoth-core/src/tools",
+      "crates/azoth-core/src/tools/mod.rs",
       "crates/azoth-core/src/execution/dispatcher.rs",
       "crates/azoth-core/src/schemas/content.rs",
       "crates/azoth-core/src/authority/tainted.rs"
@@ -143,10 +143,10 @@
     "id": "loc10",
     "prompt": "Tier B sandbox can't probe fuse-overlayfs on boot. Add a startup probe and a degraded-mode warning.",
     "relevant_files": [
-      "crates/azoth-core/src/sandbox"
+      "crates/azoth-core/src/sandbox/tier_b.rs"
     ],
     "predicted_files": [
-      "crates/azoth-core/src/sandbox",
+      "crates/azoth-core/src/sandbox/tier_b.rs",
       "crates/azoth-core/src/execution/context.rs",
       "crates/azoth-core/tests/sandbox_tier_a_smoke.rs",
       "CLAUDE.md"
@@ -157,11 +157,11 @@
     "id": "loc11",
     "prompt": "Symbol index doesn't deduplicate symbols across re-indexes; writes grow unbounded. Fix invalidation.",
     "relevant_files": [
-      "crates/azoth-repo/src/code_graph",
+      "crates/azoth-repo/src/code_graph/index.rs",
       "crates/azoth-repo/src/indexer.rs"
     ],
     "predicted_files": [
-      "crates/azoth-repo/src/code_graph",
+      "crates/azoth-repo/src/code_graph/index.rs",
       "crates/azoth-repo/src/indexer.rs",
       "crates/azoth-core/src/retrieval/symbol.rs",
       "crates/azoth-core/src/event_store/migrations/m0003_symbols.rs"
@@ -173,10 +173,10 @@
     "prompt": "Co-edit graph returns bogus neighbors on squash-merge repos. Add the skip_large_commits config knob.",
     "relevant_files": [
       "crates/azoth-repo/src/history/co_edit.rs",
-      "crates/azoth-repo/src/history"
+      "crates/azoth-repo/src/history/graph_retrieval.rs"
     ],
     "predicted_files": [
-      "crates/azoth-repo/src/history",
+      "crates/azoth-repo/src/history/graph_retrieval.rs",
       "crates/azoth-repo/src/history/git_cli.rs",
       "crates/azoth-repo/src/history/co_edit.rs",
       "crates/azoth-core/src/retrieval/mod.rs"
@@ -216,13 +216,13 @@
     "id": "loc15",
     "prompt": "TUI slash-command `/context` crashes on an empty session. Add a guard.",
     "relevant_files": [
-      "crates/azoth/src/tui/input",
+      "crates/azoth/src/tui/input/mod.rs",
       "crates/azoth/src/tui/app.rs"
     ],
     "predicted_files": [
-      "crates/azoth/src/tui/input",
+      "crates/azoth/src/tui/input/mod.rs",
       "crates/azoth/src/tui/app.rs",
-      "crates/azoth/src/tui/widgets",
+      "crates/azoth/src/tui/card.rs",
       "crates/azoth/src/tui/render.rs"
     ],
     "notes": "TUI lives in azoth bin crate."
@@ -247,11 +247,11 @@
     "prompt": "A newly-added provider profile needs an entry in the config registry and a constructor in the adapter profile module.",
     "relevant_files": [
       "crates/azoth-core/src/adapter/mod.rs",
-      "crates/azoth/src/tui"
+      "crates/azoth/src/tui/config.rs"
     ],
     "predicted_files": [
       "crates/azoth-core/src/adapter/mod.rs",
-      "crates/azoth/src/tui",
+      "crates/azoth/src/tui/config.rs",
       "crates/azoth-core/src/adapter/anthropic_messages.rs",
       "crates/azoth-core/src/adapter/openai_chat_completions.rs",
       "CLAUDE.md"
