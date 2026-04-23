@@ -8,14 +8,25 @@
 //! child until `_exit` / `execve`, and glibc locks held by other
 //! parent threads are inherited dead in the child. `probe_unprivileged_userns`
 //! therefore carries a SAFETY precondition that it runs from a
-//! single-threaded context. Callers inside the tokio runtime MUST go
-//! through [`probe_unprivileged_userns_cached`], which pays the fork
-//! once from whichever thread calls first. Binaries pre-warm the
-//! cache from `fn main()` before spawning tokio via [`warm_userns_cache`]
-//! so the first cache fill happens single-threaded; every subsequent
-//! call is a plain atomic load.
+//! single-threaded context.
+//!
+//! Callers inside any multi-threaded context — tokio multi-thread
+//! runtime, `std::thread`, Rayon, another async runtime — MUST go
+//! through [`probe_unprivileged_userns_cached`]. The cached form
+//! enforces the contract by thread-identity: [`warm_userns_cache`]
+//! records the thread it was called from as the "startup thread"
+//! (expected to be single-threaded). Any subsequent cold-cache call
+//! from a different thread fails closed (returns `false` with a
+//! one-shot `tracing::error`) rather than forking from a worker.
+//!
+//! Binaries therefore pre-warm from `fn main()` before spawning any
+//! runtime; library embedders pre-warm from their single-threaded
+//! startup the same way. After warm, every subsequent call site —
+//! `SandboxPolicy::from_env()`, `bash::build_bash_command`, tests —
+//! is a lock-free atomic load.
 
 use std::sync::OnceLock;
+use std::thread::ThreadId;
 
 /// Returns `true` iff this host supports unprivileged `CLONE_NEWUSER`.
 ///
@@ -55,76 +66,95 @@ pub fn probe_unprivileged_userns() -> bool {
 /// call; subsequent calls return the cached value without forking.
 static USERNS_CACHE: OnceLock<bool> = OnceLock::new();
 
+/// Thread recorded by the first [`warm_userns_cache`] call.
+/// Cold-cache calls to [`probe_unprivileged_userns_cached`] must
+/// run on THIS thread to be allowed to fork — from any other thread
+/// we have no way to know whether the process is still
+/// single-threaded, so we fail closed.
+static WARM_THREAD: OnceLock<ThreadId> = OnceLock::new();
+
 /// Cached variant of [`probe_unprivileged_userns`] safe for callers
-/// inside the tokio runtime. The actual fork happens **once** per
-/// process. Subsequent calls are lock-free atomic loads.
+/// inside ANY multi-threaded context. The actual fork happens
+/// **once** per process, from the thread that called
+/// [`warm_userns_cache`]. Subsequent calls are lock-free atomic
+/// loads.
 ///
 /// ## First-call enforcement
 ///
-/// The cache initializer still forks. If the first call to this
-/// function happens from inside a **multi-thread** tokio runtime
-/// (`RuntimeFlavor::MultiThread`), the fork would violate the raw
-/// probe's SAFETY precondition. To enforce the contract without
-/// deadlocking the caller, this function checks
-/// `Handle::try_current().runtime_flavor()` on a cold cache: if the
-/// caller is inside a multi-thread runtime, the function returns
-/// `false` (conservative — "no user-ns, sandbox will degrade to
-/// Off") and emits a single `tracing::error` pointing the embedder
-/// at [`warm_userns_cache`]. Single-thread tokio (`CurrentThread`,
-/// the default `#[tokio::test]` flavor) and non-tokio contexts are
-/// allowed to fork because the child only invokes the async-signal-
-/// safe `unshare` + `_exit` sequence.
+/// The cache initializer still forks, but only when the embedder
+/// has registered a warming thread via [`warm_userns_cache`] AND
+/// the current call is on that same thread. Any other cold-cache
+/// call — from a tokio worker, a `std::thread::spawn` child, a
+/// Rayon job, or another async runtime's worker — returns `false`
+/// (conservative: "no user-ns, sandbox will degrade to Off") and
+/// emits a single `tracing::error` naming the fix. This enforces
+/// the probe's SAFETY precondition by thread-identity rather than
+/// runtime-flavor, so it catches multi-threaded contexts the
+/// runtime-flavor check missed (codex P1 bot-progression).
 ///
 /// ## Embedder contract
 ///
-/// Binaries and embedders should pre-warm the cache from
-/// single-threaded startup via [`warm_userns_cache`] before spawning
-/// the multi-thread tokio runtime; after that point every call site
-/// — `SandboxPolicy::from_env()`, `bash::build_bash_command`, tests
-/// — hits the cache as a plain atomic load.
+/// Binaries and library embedders must pre-warm from single-
+/// threaded startup via [`warm_userns_cache`] before spawning ANY
+/// multi-threaded runtime (tokio, std::thread, Rayon, etc). After
+/// warm, every subsequent call is a plain atomic load.
 pub fn probe_unprivileged_userns_cached() -> bool {
     if let Some(cached) = USERNS_CACHE.get() {
         return *cached;
     }
-    // Cold cache. Refuse to fork from multi-thread tokio; fallback
-    // to Off with a one-shot error so the embedder sees exactly
-    // what to fix.
-    if cold_call_from_multi_thread_runtime() {
-        static WARNED: OnceLock<()> = OnceLock::new();
-        WARNED.get_or_init(|| {
-            tracing::error!(
-                "probe_unprivileged_userns_cached called with cold cache from a multi-thread \
-                 tokio runtime; embedders must call sandbox::warm_userns_cache() before \
-                 spawning the runtime. Returning false; sandbox defaults will degrade to Off."
-            );
-        });
-        return false;
-    }
-    *USERNS_CACHE.get_or_init(probe_unprivileged_userns)
-}
-
-/// True iff we're inside a **multi-thread** tokio runtime. Single-
-/// thread tokio is safe to fork from (no sibling worker threads
-/// hold glibc locks); non-tokio contexts are trivially safe.
-fn cold_call_from_multi_thread_runtime() -> bool {
-    use tokio::runtime::{Handle, RuntimeFlavor};
-    match Handle::try_current() {
-        Err(_) => false, // not inside any tokio runtime
-        Ok(h) => !matches!(h.runtime_flavor(), RuntimeFlavor::CurrentThread),
+    // Cold cache. Fork is only safe from the thread that warmed.
+    let current = std::thread::current().id();
+    match WARM_THREAD.get() {
+        Some(warm) if *warm == current => *USERNS_CACHE.get_or_init(probe_unprivileged_userns),
+        _ => {
+            static WARNED: OnceLock<()> = OnceLock::new();
+            WARNED.get_or_init(|| {
+                tracing::error!(
+                    "probe_unprivileged_userns_cached called with cold cache from a thread \
+                     that is not the one that called sandbox::warm_userns_cache(); embedders \
+                     must warm from single-threaded startup before spawning any runtime. \
+                     Returning false; sandbox defaults will degrade to Off."
+                );
+            });
+            false
+        }
     }
 }
 
 /// Pre-warm the user-ns probe cache from a single-threaded context.
-/// Idempotent. Intended for `fn main()` before the tokio runtime
-/// starts. Cheap enough (one fork on first call, atomic load
-/// thereafter) to call unconditionally.
+/// Records the calling thread as the "warming thread" so the cached
+/// probe can tell future cold-cache callers apart from the startup
+/// path. Idempotent — subsequent calls on any thread are no-ops
+/// once the cache is populated.
+///
+/// Intended for `fn main()` (or equivalent library startup) before
+/// spawning any multi-threaded runtime. Cheap: one fork on first
+/// call, atomic load thereafter.
 pub fn warm_userns_cache() {
-    let _ = probe_unprivileged_userns_cached();
+    // `set` succeeds on first caller; later warms are no-ops.
+    let _ = WARM_THREAD.set(std::thread::current().id());
+    let _ = USERNS_CACHE.get_or_init(probe_unprivileged_userns);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// Module-level guard: `cargo test` runs under `--test-threads=1`
+    /// (repo convention, see `CLAUDE.md` Test Patterns), so every
+    /// `#[test]` fn runs on the same harness worker thread. The
+    /// first test that calls [`warm_userns_cache`] registers that
+    /// thread as the warming thread for the rest of the process.
+    /// Subsequent tests on the same harness worker hit the cache
+    /// through the warm path.
+    static WARMED_FOR_TESTS: AtomicBool = AtomicBool::new(false);
+
+    fn ensure_warmed() {
+        if !WARMED_FOR_TESTS.swap(true, Ordering::SeqCst) {
+            warm_userns_cache();
+        }
+    }
 
     /// The cache either returns the same value across two reads, or
     /// never executes the probe body at all on the second call. This
@@ -132,6 +162,7 @@ mod tests {
     /// consistency, not a specific tier.
     #[test]
     fn cache_is_consistent_across_calls() {
+        ensure_warmed();
         let a = probe_unprivileged_userns_cached();
         let b = probe_unprivileged_userns_cached();
         assert_eq!(a, b, "cache returned different values across calls");
@@ -139,42 +170,51 @@ mod tests {
 
     #[test]
     fn warm_userns_cache_is_idempotent() {
+        ensure_warmed();
+        // Second + third warms must be no-ops — the first set
+        // populates both WARM_THREAD and USERNS_CACHE, later
+        // warms see `set` fail silently and `get_or_init` hit.
         warm_userns_cache();
         warm_userns_cache();
-        // If warming was not idempotent, the second call would panic
-        // or produce a different value — neither happens here.
         let _ = probe_unprivileged_userns_cached();
     }
 
-    /// Detector-only unit test: outside tokio, the guard says "safe".
+    /// Cold cache on the warming thread — cache populates, returns
+    /// the host's actual capability.
     #[test]
-    fn cold_call_guard_is_false_outside_tokio() {
-        assert!(!cold_call_from_multi_thread_runtime());
+    fn cold_call_from_warming_thread_populates_cache() {
+        ensure_warmed();
+        // Even if some earlier test already warmed, the contract is
+        // that a cached-cache call on the warming thread never
+        // fails closed. Assert idempotent determinism, not a value.
+        let got = probe_unprivileged_userns_cached();
+        let again = probe_unprivileged_userns_cached();
+        assert_eq!(got, again);
     }
 
-    /// Under current-thread tokio the guard still says "safe" —
-    /// matches `#[tokio::test]` default flavor, which is what the
-    /// existing bash.rs suite relies on.
+    /// Cold cache from a DIFFERENT thread must NOT fork (fail-
+    /// closed with `false`) — this is the load-bearing guard for
+    /// library embedders who forget to warm (codex R2 P1).
+    /// Warming happens implicitly from the test-harness thread via
+    /// `ensure_warmed`, so a freshly-spawned `std::thread` is never
+    /// the warming thread.
+    ///
+    /// If the cache happens to be already populated from an earlier
+    /// test, this test is a tautology (both calls return the cached
+    /// value). To exercise the cold-cache path deterministically we
+    /// would need to reset `USERNS_CACHE`, which `OnceLock` doesn't
+    /// allow — so this test is a best-effort assertion that calling
+    /// the cached probe from another thread is at minimum
+    /// deterministic and never panics.
     #[test]
-    fn cold_call_guard_is_false_under_current_thread_tokio() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .build()
-            .unwrap();
-        let inside = rt.block_on(async { cold_call_from_multi_thread_runtime() });
-        assert!(!inside, "current-thread runtime must not trigger the guard");
-    }
-
-    /// Under multi-thread tokio the guard says "unsafe to fork".
-    /// A process-isolated subtest prevents leaking the spawned
-    /// runtime into the rest of the suite.
-    #[test]
-    fn cold_call_guard_is_true_under_multi_thread_tokio() {
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .unwrap();
-        let inside = rt.block_on(async { cold_call_from_multi_thread_runtime() });
-        assert!(inside, "multi-thread runtime must trigger the guard");
+    fn cached_probe_call_from_other_thread_is_deterministic() {
+        ensure_warmed();
+        let from_main = probe_unprivileged_userns_cached();
+        let handle = std::thread::spawn(probe_unprivileged_userns_cached);
+        let from_child = handle.join().unwrap();
+        assert_eq!(
+            from_main, from_child,
+            "cached value must be consistent across threads once warmed"
+        );
     }
 }

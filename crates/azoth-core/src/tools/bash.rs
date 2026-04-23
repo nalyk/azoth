@@ -885,7 +885,18 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     fn sandbox_skip() -> bool {
-        use crate::sandbox::probe_unprivileged_userns;
+        use crate::sandbox::{probe_unprivileged_userns, warm_userns_cache};
+        // v2.1-H R3: warm the cached-probe lane AND register the
+        // current test-harness thread as the warming thread. Without
+        // this, BashTool's internal call to
+        // `probe_unprivileged_userns_cached()` during Tier A/B
+        // dispatch would fail-closed from the test-harness thread
+        // (the thread-id guard added to catch library embedders who
+        // forgot to warm). Because `cargo test --test-threads=1` is
+        // the repo convention, this call from the first test that
+        // touches sandbox paths registers the same thread that every
+        // subsequent test runs on — idempotent across the suite.
+        warm_userns_cache();
         if std::env::var_os("AZOTH_SKIP_TIER_A").is_some() {
             eprintln!("skip: AZOTH_SKIP_TIER_A set");
             return true;

@@ -131,8 +131,10 @@ mod tests {
     fn from_env_defaults_to_tier_a_when_userns_available() {
         // v2.1-H: default flipped Off → TierA (with graceful Off
         // fallback on hosts that can't `unshare(CLONE_NEWUSER)`).
-        // We can't force-disable user-ns for the "else" branch in a
-        // unit test, so the assertion is probe-conditional.
+        // R3: warm the cache first so the cached-probe can run —
+        // the thread-id guard otherwise fail-closes from this
+        // test-harness thread.
+        crate::sandbox::warm_userns_cache();
         std::env::remove_var("AZOTH_SANDBOX");
         let got = SandboxPolicy::from_env();
         let want = if crate::sandbox::probe_unprivileged_userns() {
