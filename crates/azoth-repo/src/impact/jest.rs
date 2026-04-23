@@ -470,9 +470,11 @@ impl TestRunner for JestRunner {
         // Detail buffer: merge stderr into the forensic tail. stdout
         // is jest's JSON (already parsed), so we intentionally carry
         // only stderr — the failing assertion output lives there in
-        // `--silent` mode.
+        // `--silent` mode. `stderr_text` is only borrowed above, in
+        // the `None` arm of the `outcomes` match (which already
+        // returned), so move it instead of cloning (R2 gemini MED).
         let detail = {
-            let mut text = stderr_text.clone();
+            let mut text = stderr_text;
             // `String::truncate` panics on non-char-boundary indices;
             // walk back to the nearest boundary. UTF-8 codepoints
             // are ≤4 bytes, so this terminates in ≤3 iterations
