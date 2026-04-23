@@ -103,3 +103,59 @@ async fn gotest_runner_empty_plan_short_circuits() {
         .unwrap();
     assert!(summary.is_empty());
 }
+
+#[tokio::test]
+#[cfg_attr(
+    not(feature = "live-tools"),
+    ignore = "requires the `go` toolchain on PATH"
+)]
+async fn gotest_discover_respects_extra_args_for_build_tags() {
+    // R4 gemini HIGH on PR #26: build-tagged tests are invisible to
+    // `go test -list` unless `-tags` is passed. Discovery must
+    // forward caller-provided `extra_args` so projects using
+    // `//go:build integration` gates are reachable.
+    //
+    // Verified empirically with go 1.25.6 before coding: without
+    // `-tags integration`, `TestIntegration` does NOT appear;
+    // with it, `TestIntegration` + `TestAlpha` both appear.
+    use azoth_repo::impact::discover_go_tests;
+
+    let td = TempDir::new().unwrap();
+    std::fs::write(
+        td.path().join("go.mod"),
+        "module example.com/probe\n\ngo 1.21\n",
+    )
+    .unwrap();
+    std::fs::write(
+        td.path().join("plain_test.go"),
+        "package probe\n\nimport \"testing\"\n\nfunc TestAlpha(t *testing.T) { _ = t }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        td.path().join("gated_test.go"),
+        "//go:build integration\n\npackage probe\n\nimport \"testing\"\n\nfunc TestIntegration(t *testing.T) { _ = t }\n",
+    )
+    .unwrap();
+
+    // Without extra_args — gated test must be INVISIBLE.
+    let uni_no_tags = discover_go_tests(td.path(), &[]).await.unwrap();
+    let ids_no_tags: Vec<&str> = uni_no_tags.tests.iter().map(|t| t.as_str()).collect();
+    assert!(
+        ids_no_tags.iter().any(|s| s.contains("TestAlpha")),
+        "TestAlpha must be discovered without tags: {ids_no_tags:?}"
+    );
+    assert!(
+        !ids_no_tags.iter().any(|s| s.contains("TestIntegration")),
+        "gated test must NOT appear without -tags: {ids_no_tags:?}"
+    );
+
+    // With `-tags integration` — gated test must now be VISIBLE.
+    let uni_tags = discover_go_tests(td.path(), &["-tags".to_string(), "integration".to_string()])
+        .await
+        .unwrap();
+    let ids_tags: Vec<&str> = uni_tags.tests.iter().map(|t| t.as_str()).collect();
+    assert!(
+        ids_tags.iter().any(|s| s.contains("TestIntegration")),
+        "gated test must be discovered with -tags integration: {ids_tags:?}"
+    );
+}

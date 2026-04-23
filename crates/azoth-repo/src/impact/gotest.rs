@@ -111,10 +111,19 @@ impl GoTestImpact {
 
     /// Production entry point: detect `go.mod`, shell out to
     /// `go test -json -list .* ./...`, build the universe.
-    pub async fn discover(repo_root: PathBuf) -> Result<Self, ImpactError> {
+    ///
+    /// `extra_args` are forwarded verbatim to the `go test -list`
+    /// command between `test` and the internal flags. R4 gemini HIGH
+    /// on PR #26: Go projects often gate tests behind build tags
+    /// (`//go:build integration`); without a way to pass `-tags
+    /// integration` through, those tests stay invisible to the
+    /// selector and TDAD misses them entirely. Mirrors the
+    /// `GoTestRunner::extra_args` surface so caller code can pass
+    /// the same flags to both discovery and execution.
+    pub async fn discover(repo_root: PathBuf, extra_args: &[String]) -> Result<Self, ImpactError> {
         match Self::detect(&repo_root) {
             Ok(Some(_)) => {
-                let universe = discover_go_tests(&repo_root).await?;
+                let universe = discover_go_tests(&repo_root, extra_args).await?;
                 Ok(Self {
                     repo_root,
                     universe,
@@ -279,13 +288,24 @@ impl ImpactSelector for GoTestImpact {
 /// in the package named by the event's `Package` field.
 ///
 /// Non-zero exit → `GoTestError::Discovery` with stdout+stderr merged.
-pub async fn discover_go_tests(repo_root: &Path) -> Result<TestUniverse, ImpactError> {
-    let out = Command::new("go")
-        .arg("test")
-        .arg("-json")
-        .arg("-list")
-        .arg(".*")
-        .arg("./...")
+pub async fn discover_go_tests(
+    repo_root: &Path,
+    extra_args: &[String],
+) -> Result<TestUniverse, ImpactError> {
+    // `extra_args` land BEFORE the internal flags so a caller passing
+    // `-tags integration` or `-tags unit,integration` reaches the
+    // compiler-level build-tag filter correctly — `go test` accepts
+    // build flags and test flags intermixed, but tags especially are
+    // resolved during test-binary compilation which happens before
+    // `-list` runs. Mirror of `GoTestRunner::run` argv shape
+    // (R4 gemini HIGH on PR #26).
+    let mut cmd = Command::new("go");
+    cmd.arg("test");
+    for a in extra_args {
+        cmd.arg(a);
+    }
+    cmd.arg("-json").arg("-list").arg(".*").arg("./...");
+    let out = cmd
         .current_dir(repo_root)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -343,19 +363,21 @@ struct GoTestEvent {
 /// would accept `"Testing helper: ..."` or `"TestMain with "` (the
 /// magic function) which aren't real test listings.
 ///
-/// Rules per `go help testflag` and the testing package source:
+/// Rules per `go help testflag` and the testing package source
+/// (`testing.matchTests` uses `!unicode.IsLower(first_rune)`):
 ///
-/// - `TestXxx` / `FuzzXxx` — tail char must be uppercase, digit, or
-///   underscore. Bare `Test` / `Fuzz` (no tail) are rejected by Go's
-///   own test matcher, so we reject them here too.
+/// - `TestXxx` / `FuzzXxx` — first tail rune must NOT be a lowercase
+///   letter. Accepts uppercase ASCII, uppercase Unicode (codex P2 on
+///   PR #26 R3: `TestÉclair` is a valid Go test identifier and appears
+///   in `go test -list` output), digits, and `_`. Bare `Test` / `Fuzz`
+///   are rejected by Go's own test matcher.
 /// - `ExampleXxx` OR bare `Example` — the bare form is a package-
-///   level runnable example and is a first-class `go test -list`
-///   output (codex P2 on PR #26). Tail char, if present, follows the
-///   same uppercase/digit/underscore rule.
+///   level runnable example (codex P2 on PR #26 R0). Tail rune, if
+///   present, follows the same Unicode non-lowercase rule.
 /// - `Benchmark*` — excluded entirely. `go test -run` does NOT execute
 ///   benchmarks (only `-bench` does per `go help testflag`). Including
 ///   them in discovery makes the runner report every benchmark as
-///   `Unknown` with stdout "no tests to run" (codex P2 on PR #26).
+///   `Unknown` with stdout "no tests to run" (codex P2 on PR #26 R0).
 ///   Re-visit in v2.2 when a `-bench`-aware runner path is wired.
 fn is_test_name_line(line: &str) -> bool {
     for prefix in ["Test", "Example", "Fuzz"] {
@@ -369,7 +391,12 @@ fn is_test_name_line(line: &str) -> bool {
             return prefix == "Example";
         }
         if let Some(c) = tail.chars().next() {
-            if c.is_ascii_uppercase() || c == '_' || c.is_ascii_digit() {
+            // Match Go's `testing.matchTests`: the first rune after
+            // the prefix must not be a lowercase letter. This accepts
+            // Unicode uppercase (`TestÉclair`), digits (`Test2`), and
+            // underscore (`Test_foo`) while still rejecting prose
+            // like `Testing` or `Testx`.
+            if !c.is_lowercase() {
                 return true;
             }
         }
@@ -642,8 +669,10 @@ fn parse_run_ndjson(text: &str) -> HashMap<String, (TestOutcome, u64, String)> {
         };
         // Per-test events always have `Test` set. Package-level
         // events (no `Test`) are ignored for per-test rollup.
+        // Move the owned `String` directly out of the Option instead
+        // of cloning (R4 gemini MED on PR #26) — ev is not reused.
         let test = match ev.test {
-            Some(ref t) if !t.is_empty() => t.clone(),
+            Some(t) if !t.is_empty() => t,
             _ => continue,
         };
         let slot = state
@@ -670,6 +699,18 @@ fn parse_run_ndjson(text: &str) -> HashMap<String, (TestOutcome, u64, String)> {
             _ => {} // "run", "pause", "cont", "bench" — ignored.
         }
     }
+    // Cap each slot's accumulated output BEFORE the snapshot so the
+    // subtest-outputs clone + rollup work on bounded strings
+    // (R4 gemini MED on PR #26). A verbose test emitting MB of
+    // `t.Logf` lines would otherwise balloon the slot, then get
+    // cloned wholesale into `subtest_outputs`, then get pushed
+    // into each ancestor — all before any truncation. Capping
+    // once here keeps peak memory at ~(unique_tests × MAX_DETAIL_BYTES)
+    // instead of ~(unique_tests × raw_stdout_bytes).
+    for slot in state.values_mut() {
+        cap_in_place(&mut slot.2, MAX_DETAIL_BYTES);
+    }
+
     // Second pass: roll each subtest's accumulated output up the
     // `/`-separated ancestor chain so TestA/B/C → TestA/B, TestA.
     // Snapshot subtest keys + contents first so we can mutate the
@@ -696,6 +737,12 @@ fn parse_run_ndjson(text: &str) -> HashMap<String, (TestOutcome, u64, String)> {
                 .push_str(&output);
             ancestor = prefix;
         }
+    }
+    // Ancestors accumulated from multiple subtests may now exceed the
+    // cap again — cap once more after the rollup to enforce the
+    // bound across the whole map.
+    for slot in state.values_mut() {
+        cap_in_place(&mut slot.2, MAX_DETAIL_BYTES);
     }
     state
 }
@@ -733,6 +780,22 @@ fn truncate_detail(text: String) -> Option<Arc<str>> {
 /// ≤4 bytes; every byte boundary is either a char boundary or at most
 /// 3 bytes inside a 4-byte codepoint.
 fn cap_to_max_bytes(mut text: String, max: usize) -> String {
+    cap_in_place(&mut text, max);
+    text
+}
+
+/// In-place variant of [`cap_to_max_bytes`]. Used by
+/// [`parse_run_ndjson`] between passes to bound each slot's
+/// accumulated output — R4 gemini MED on PR #26: verbose test output
+/// (a `t.Logf` loop emitting MB of lines) would otherwise balloon the
+/// per-slot `String` and the R3 two-pass snapshot would then clone
+/// ALL of it into `subtest_outputs` before truncation ever ran.
+/// Capping in-place before the snapshot bounds the clone to
+/// `MAX_DETAIL_BYTES`.
+///
+/// Walk-back terminates in ≤3 iterations (UTF-8 codepoints are ≤4
+/// bytes) so this is O(1) per call regardless of the input length.
+fn cap_in_place(text: &mut String, max: usize) {
     if text.len() > max {
         let mut cutoff = max;
         while !text.is_char_boundary(cutoff) {
@@ -740,7 +803,6 @@ fn cap_to_max_bytes(mut text: String, max: usize) -> String {
         }
         text.truncate(cutoff);
     }
-    text
 }
 
 #[cfg(test)]
@@ -756,6 +818,29 @@ mod tests {
         assert!(is_test_name_line("Test_foo"));
         // Digit after prefix (some test-generator conventions).
         assert!(is_test_name_line("Test2"));
+    }
+
+    #[test]
+    fn is_test_name_line_accepts_unicode_uppercase_tails() {
+        // R4 codex P2 on PR #26: Go's `testing.matchTests` uses
+        // `!unicode.IsLower(first_rune)`, so non-ASCII uppercase
+        // letters after the prefix must be accepted. Verified
+        // empirically with go 1.25.6: `func TestÉclair(t *testing.T)`
+        // is listed by `go test -list`. My R3 ASCII-only check
+        // dropped these from discovery.
+        assert!(is_test_name_line("TestÉclair"));
+        assert!(is_test_name_line("ExampleÖ"));
+        assert!(is_test_name_line("FuzzΑ")); // Greek capital alpha.
+    }
+
+    #[test]
+    fn is_test_name_line_rejects_unicode_lowercase_tails() {
+        // Symmetric guard: a LOWERCASE Unicode letter after the
+        // prefix must be rejected, matching Go's own behaviour. Go's
+        // test matcher reads these as continuation of a prose word,
+        // not a test function name.
+        assert!(!is_test_name_line("Testéclair"));
+        assert!(!is_test_name_line("Testα")); // Greek lowercase alpha.
     }
 
     #[test]
@@ -1026,6 +1111,44 @@ Actual JSON error: extra } somewhere
                 .unwrap_or(false),
             "top-level ancestor TestA must carry nested subtest output"
         );
+    }
+
+    #[test]
+    fn parse_run_ndjson_caps_per_slot_output_to_max_detail_bytes() {
+        // R4 gemini MED on PR #26: verbose test output must not
+        // balloon the per-slot `String` and then get cloned wholesale
+        // into `subtest_outputs`. Synthesise a stream with output
+        // ≥ 2× MAX_DETAIL_BYTES and confirm the post-parse slot is
+        // bounded.
+        //
+        // Build a single-test, single-event line with a payload that
+        // vastly exceeds the cap.
+        let huge = "x".repeat(MAX_DETAIL_BYTES * 3);
+        let ndjson = format!(
+            r#"{{"Action":"run","Package":"p","Test":"TestHuge"}}
+{{"Action":"output","Package":"p","Test":"TestHuge","Output":"{huge}"}}
+{{"Action":"pass","Package":"p","Test":"TestHuge","Elapsed":0}}"#
+        );
+        let m = parse_run_ndjson(&ndjson);
+        let slot = m.get("TestHuge").expect("TestHuge must be present");
+        assert!(
+            slot.2.len() <= MAX_DETAIL_BYTES,
+            "slot output must be capped to MAX_DETAIL_BYTES; got {}",
+            slot.2.len()
+        );
+    }
+
+    #[test]
+    fn cap_in_place_matches_cap_to_max_bytes_behaviour() {
+        // Single-source-of-truth check — the owned + borrow-mut
+        // variants must produce byte-identical output. R4 gemini MED
+        // extracted cap_in_place as the primitive so parse_run_ndjson
+        // can cap slots without a take+replace cycle.
+        let mut s1 = "aaaaaaabcdéé".to_string();
+        let len = s1.len();
+        let s2 = cap_to_max_bytes(s1.clone(), len - 1);
+        cap_in_place(&mut s1, len - 1);
+        assert_eq!(s1, s2);
     }
 
     #[test]
