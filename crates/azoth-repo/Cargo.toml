@@ -41,8 +41,11 @@ hex = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
-# Serde (for future persisted types)
+# Serde (for future persisted types + JSON parsing of `jest --json`
+# structured runner output — avoids the text-parsing trap PR-E hit
+# with `pytest -v` stdout).
 serde = { workspace = true }
+serde_json = { workspace = true }
 
 [features]
 # Gate for integration tests that shell out to live toolchains

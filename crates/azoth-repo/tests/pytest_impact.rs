@@ -160,3 +160,59 @@ async fn selector_name_and_version_are_stable() {
     assert_eq!(sel.name(), "pytest");
     assert_eq!(sel.version(), azoth_repo::impact::PYTEST_IMPACT_VERSION);
 }
+
+#[tokio::test]
+async fn selector_rejects_prefix_substring_author_vs_auth() {
+    // R3 gemini MED sibling (pytest): stem `auth` must not pull
+    // `test_author.py` when `src/auth.py` changes. Word-boundary
+    // predicate rejects the alphanumeric `o` following `auth`.
+    let universe = TestUniverse::from_tests(["tests/test_author.py::test_case"].iter().copied());
+    let sel = PytestImpact::with_universe(std::path::PathBuf::from("/tmp"), universe);
+    let plan = sel
+        .select(&Diff::from_paths(["src/auth.py"]), &stub_contract())
+        .await
+        .unwrap();
+    assert!(
+        plan.is_empty(),
+        "test_author.py must not be selected by an auth.py change: {plan:?}"
+    );
+}
+
+#[tokio::test]
+async fn selector_accepts_legitimate_auth_match_despite_word_boundary() {
+    // Canonical case must still match: `src/auth.py` → `test_auth.py`
+    // boundaries are `_` (not alphanumeric) and `.` — both valid
+    // word-boundary neighbours.
+    let universe = TestUniverse::from_tests(["tests/test_auth.py::test_case"].iter().copied());
+    let sel = PytestImpact::with_universe(std::path::PathBuf::from("/tmp"), universe);
+    let plan = sel
+        .select(&Diff::from_paths(["src/auth.py"]), &stub_contract())
+        .await
+        .unwrap();
+    assert_eq!(plan.tests.len(), 1, "legitimate auth match: {plan:?}");
+}
+
+#[tokio::test]
+async fn selector_matches_parametrized_node_id_with_slash_in_params() {
+    // R4 codex P1: pytest parametrized IDs can carry `/` inside the
+    // `[params]` suffix when the param is a URL-like string. The
+    // pre-R4 implementation applied `Path::file_name()` to the whole
+    // node ID, which tokenises by `/` and returns the garbage tail
+    // (`users]` below), losing the real filename (`test_api.py`) and
+    // dropping the test from the plan. Post-R4 splits on `::` before
+    // `Path::new`, so `file_name()` operates on the filesystem-path
+    // prefix only. The legitimate change in `src/api.py` must still
+    // pull the parametrized test.
+    let universe =
+        TestUniverse::from_tests(["tests/test_api.py::test_route[/v1/users]"].iter().copied());
+    let sel = PytestImpact::with_universe(std::path::PathBuf::from("/tmp"), universe);
+    let plan = sel
+        .select(&Diff::from_paths(["src/api.py"]), &stub_contract())
+        .await
+        .unwrap();
+    assert_eq!(
+        plan.tests.len(),
+        1,
+        "parametrized node ID with URL param must still match stem api: {plan:?}"
+    );
+}

@@ -35,11 +35,17 @@ use azoth_core::impact::{ImpactError, ImpactSelector};
 use azoth_core::schemas::{Contract, Diff, TestId, TestPlan};
 
 use super::cargo::TestUniverse;
+use super::heuristic::word_boundary_contains;
 use super::runner::{TestOutcome, TestRunResult, TestRunSummary, TestRunner};
 
 /// Selector-impl version. Bump on heuristic changes so replay can
 /// detect plan drift without re-running the selector.
-pub const PYTEST_IMPACT_VERSION: u32 = 1;
+/// Bumped 1 → 2 in PR #25 R3 when the selector's matching semantics
+/// shifted from full-node-ID substring (`t.contains(stem)`) to
+/// filename-stem + word-boundary via `word_boundary_contains`. Replays
+/// or cached plan consumers that key on this version can distinguish
+/// pre-R3 plans from the stricter post-R3 selection (codex P2 R4).
+pub const PYTEST_IMPACT_VERSION: u32 = 2;
 
 /// Forensic-detail truncation cap. `PytestRunner::run` stashes the
 /// combined stdout+stderr into `TestRunResult.detail` so the TUI
@@ -172,7 +178,43 @@ impl ImpactSelector for PytestImpact {
                 continue;
             }
             for t in &self.universe.tests {
-                if t.as_str().contains(stem) && seen.insert(t.as_str()) {
+                // PR #25 R1 gemini MED sibling: match against the
+                // FILENAME of the test node ID, not the whole id.
+                // A naive `t.as_str().contains(stem)` false-positives
+                // on any directory-name collision — e.g. a change
+                // in `src/auth.py` pulling every test under an
+                // unrelated `tests/auth/` directory. pytest node IDs
+                // look like `tests/auth/test_login.py::test_ok`, so
+                // `Path::new(id).file_name()` yields
+                // `test_login.py::test_ok` and narrows the match to
+                // the actual filename segment — aligning the code
+                // with the "direct filename-stem match" promise of
+                // the module docstring.
+                //
+                // PR #25 R3 gemini MED: `n.contains(stem)` STILL
+                // false-positives within the filename (`auth` matches
+                // `test_author.py`). Swap to `word_boundary_contains`
+                // — identical to the jest sibling; see
+                // `super::heuristic` for the class-bug rationale and
+                // the cargo sweep that closed the same gap.
+                //
+                // PR #25 R4 codex P1: pytest node IDs are
+                // `path/to/file.py::test_name[params]`. Parametrized
+                // IDs can carry `/` inside `[params]` when the param
+                // is a URL-like string (`tests/test_api.py::test_route
+                // [/v1/users]`). Applying `Path::file_name()` to the
+                // full node ID tokenises by `/` and returns the
+                // garbage tail (`users]`), not the real filename.
+                // Split on `::` first so only the filesystem-path
+                // prefix is fed to `Path::new`.
+                let t_str = t.as_str();
+                let path_part = t_str.split_once("::").map(|(p, _)| p).unwrap_or(t_str);
+                let filename_matches = Path::new(path_part)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| word_boundary_contains(n, stem))
+                    .unwrap_or(false);
+                if filename_matches && seen.insert(t_str) {
                     plan.tests.push(t.clone());
                     plan.rationale
                         .push(format!("changed file {path} → stem {stem}"));
@@ -549,6 +591,29 @@ impl TestRunner for PytestRunner {
         // don't appear in pytest's output surface as `Unknown` —
         // honest gap rather than guessed Pass/Fail.
         let outcomes = parse_pytest_verbose_outcomes(&stdout_text);
+        // R5/R6 deferral (sibling of jest.rs cross-test pollution
+        // fix, shipped in jest this round): this `detail` is the
+        // GLOBAL merged stdout+stderr attached to every per-test
+        // result, which means a passing test's TUI detail view shows
+        // unrelated failing tests' output. Same class bug gemini
+        // flagged in jest R5 (MED 3132338881) and which that PR
+        // closed by threading per-file `message` from jest's `--json`
+        // output into each `TestRunResult.detail`.
+        //
+        // NOT fixed here in R6 because pytest's `-v` text output
+        // does not carry a structured per-test failure message — the
+        // short traceback block is serialized as free-form text that
+        // would need a tracking parser to associate with specific
+        // node IDs. The clean path is to switch this runner to
+        // `--junitxml` output (per-test `<testcase><failure>`), which
+        // is a parser-replacement on top of PR #24's semantics. That
+        // is v2.2 scope — out-of-band for PR #25 (PR-F, jest landing).
+        //
+        // WHO ADDRESSES THIS: whoever opens the v2.2 pytest
+        // `--junitxml` migration PR. They should (a) parse per-test
+        // `<failure>`/`<error>` CDATA, (b) switch this buffer from
+        // `merge_pipes(stdout, stderr)` to per-test message lookup,
+        // (c) delete this comment.
         let detail = {
             // Reuse `merge_pipes` (gemini R2 top-level summary) —
             // single source of truth for stdout+stderr combination.
