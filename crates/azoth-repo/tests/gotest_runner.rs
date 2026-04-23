@@ -1,0 +1,239 @@
+//! Live `GoTestRunner` agreement test. Gated behind the `live-tools`
+//! feature so it is `#[ignore]`'d on machines without `go` on `PATH`.
+//! Run explicitly with:
+//!
+//! ```bash
+//! cargo test -p azoth-repo --features live-tools --test gotest_runner -- --ignored
+//! ```
+//!
+//! The live path builds a minimal go module inside a `TempDir` —
+//! `go.mod` plus one test file with three tests (pass, skip, fail) —
+//! and runs the runner end-to-end through the real `go` toolchain.
+
+use azoth_core::schemas::{TestId, TestPlan};
+use azoth_repo::impact::{GoTestRunner, TestOutcome, TestRunner};
+use tempfile::TempDir;
+
+#[tokio::test]
+#[cfg_attr(
+    not(feature = "live-tools"),
+    ignore = "requires the `go` toolchain on PATH"
+)]
+async fn gotest_runner_agrees_with_go_on_mixed_pass_skip_fail_fixture() {
+    let td = TempDir::new().unwrap();
+    // Minimal single-module fixture. Use a private import path so we
+    // never accidentally hit module proxy lookups.
+    std::fs::write(
+        td.path().join("go.mod"),
+        "module example.com/probe\n\ngo 1.21\n",
+    )
+    .unwrap();
+    std::fs::write(
+        td.path().join("sum_test.go"),
+        r#"package probe
+
+import "testing"
+
+func TestAlpha(t *testing.T) { if 1+1 != 2 { t.Fail() } }
+func TestBeta(t *testing.T)  { t.Skip("skip-me") }
+func TestGamma(t *testing.T) { t.Fatal("boom") }
+"#,
+    )
+    .unwrap();
+
+    let runner = GoTestRunner::default();
+    let plan = TestPlan {
+        tests: vec![
+            TestId::new("example.com/probe::TestAlpha"),
+            TestId::new("example.com/probe::TestBeta"),
+            TestId::new("example.com/probe::TestGamma"),
+        ],
+        rationale: vec!["".into(); 3],
+        confidence: vec![1.0; 3],
+        selector_version: 1,
+    };
+
+    let summary = runner.run(td.path(), &plan).await.unwrap();
+    assert_eq!(summary.len(), 3);
+
+    let by_id: std::collections::HashMap<&str, &TestOutcome> = summary
+        .results
+        .iter()
+        .map(|r| (r.id.as_str(), &r.outcome))
+        .collect();
+    assert_eq!(
+        by_id.get("example.com/probe::TestAlpha"),
+        Some(&&TestOutcome::Pass),
+        "TestAlpha must be Pass"
+    );
+    assert_eq!(
+        by_id.get("example.com/probe::TestBeta"),
+        Some(&&TestOutcome::Skip),
+        "TestBeta must be Skip"
+    );
+    assert_eq!(
+        by_id.get("example.com/probe::TestGamma"),
+        Some(&&TestOutcome::Fail),
+        "TestGamma must be Fail"
+    );
+
+    // Forensic detail for the FAILING test specifically — R5 gemini
+    // MED on PR #26: the pre-R5 assertion used `find_map` which
+    // picked the first result carrying any detail (likely TestAlpha's
+    // "PASS" string), then a `|| contains("PASS")` disjunction made
+    // the assertion a tautology for any test that produced output.
+    // Tight version: pin to TestGamma (the only guaranteed failure)
+    // and require either the user's `t.Fatal` message or Go's own
+    // `--- FAIL:` marker in its detail.
+    let gamma = summary
+        .results
+        .iter()
+        .find(|r| r.id.as_str() == "example.com/probe::TestGamma")
+        .expect("TestGamma must be present in summary");
+    let detail = gamma
+        .detail
+        .clone()
+        .expect("TestGamma must carry forensic detail");
+    assert!(
+        detail.contains("boom") || detail.contains("FAIL: TestGamma"),
+        "TestGamma detail must reference the failure text: {detail}"
+    );
+}
+
+#[tokio::test]
+#[cfg_attr(
+    not(feature = "live-tools"),
+    ignore = "requires the `go` toolchain on PATH"
+)]
+async fn gotest_runner_preserves_plan_order_across_packages() {
+    // R6 codex P2 on PR #26: pre-R6 the runner grouped tests into a
+    // BTreeMap by package path, executed package-by-package in
+    // alphabetical order, and emitted results in that order — not
+    // in plan.tests order. Callers that zip plan metadata
+    // (rationale, confidence) with the summary by index got
+    // misaligned attribution.
+    //
+    // This fixture puts two packages in a Go module where the
+    // package names DO NOT match the plan order: package `z_last`
+    // comes alphabetically after `a_first`, but the plan lists
+    // z_last's test FIRST. The runner must emit z_last first.
+    let td = TempDir::new().unwrap();
+    std::fs::write(
+        td.path().join("go.mod"),
+        "module example.com/probe\n\ngo 1.21\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(td.path().join("a_first")).unwrap();
+    std::fs::write(
+        td.path().join("a_first/a_test.go"),
+        "package a_first\n\nimport \"testing\"\n\nfunc TestAlpha(t *testing.T) { _ = t }\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(td.path().join("z_last")).unwrap();
+    std::fs::write(
+        td.path().join("z_last/z_test.go"),
+        "package z_last\n\nimport \"testing\"\n\nfunc TestZeta(t *testing.T) { _ = t }\n",
+    )
+    .unwrap();
+
+    let runner = GoTestRunner::default();
+    // Plan order: z_last BEFORE a_first. Alphabetical package-batch
+    // order is the inverse.
+    let plan = TestPlan {
+        tests: vec![
+            TestId::new("example.com/probe/z_last::TestZeta"),
+            TestId::new("example.com/probe/a_first::TestAlpha"),
+        ],
+        rationale: vec!["z-rationale".into(), "a-rationale".into()],
+        confidence: vec![1.0; 2],
+        selector_version: 1,
+    };
+
+    let summary = runner.run(td.path(), &plan).await.unwrap();
+    assert_eq!(summary.len(), 2);
+    // Results must match plan.tests order — not package-alphabetical.
+    assert_eq!(
+        summary.results[0].id.as_str(),
+        "example.com/probe/z_last::TestZeta",
+        "first result must match plan.tests[0]: got {:?}",
+        summary.results[0].id
+    );
+    assert_eq!(
+        summary.results[1].id.as_str(),
+        "example.com/probe/a_first::TestAlpha",
+        "second result must match plan.tests[1]: got {:?}",
+        summary.results[1].id
+    );
+    // Outcomes exist (both tests pass trivially).
+    assert_eq!(summary.results[0].outcome, TestOutcome::Pass);
+    assert_eq!(summary.results[1].outcome, TestOutcome::Pass);
+}
+
+#[tokio::test]
+async fn gotest_runner_empty_plan_short_circuits() {
+    // Safe without `live-tools` — `plan.is_empty()` short-circuits
+    // before any `Command::spawn`.
+    let runner = GoTestRunner::default();
+    let plan = TestPlan::empty(1);
+    let summary = runner
+        .run(std::path::Path::new("/tmp"), &plan)
+        .await
+        .unwrap();
+    assert!(summary.is_empty());
+}
+
+#[tokio::test]
+#[cfg_attr(
+    not(feature = "live-tools"),
+    ignore = "requires the `go` toolchain on PATH"
+)]
+async fn gotest_discover_respects_extra_args_for_build_tags() {
+    // R4 gemini HIGH on PR #26: build-tagged tests are invisible to
+    // `go test -list` unless `-tags` is passed. Discovery must
+    // forward caller-provided `extra_args` so projects using
+    // `//go:build integration` gates are reachable.
+    //
+    // Verified empirically with go 1.25.6 before coding: without
+    // `-tags integration`, `TestIntegration` does NOT appear;
+    // with it, `TestIntegration` + `TestAlpha` both appear.
+    use azoth_repo::impact::discover_go_tests;
+
+    let td = TempDir::new().unwrap();
+    std::fs::write(
+        td.path().join("go.mod"),
+        "module example.com/probe\n\ngo 1.21\n",
+    )
+    .unwrap();
+    std::fs::write(
+        td.path().join("plain_test.go"),
+        "package probe\n\nimport \"testing\"\n\nfunc TestAlpha(t *testing.T) { _ = t }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        td.path().join("gated_test.go"),
+        "//go:build integration\n\npackage probe\n\nimport \"testing\"\n\nfunc TestIntegration(t *testing.T) { _ = t }\n",
+    )
+    .unwrap();
+
+    // Without extra_args — gated test must be INVISIBLE.
+    let uni_no_tags = discover_go_tests(td.path(), &[]).await.unwrap();
+    let ids_no_tags: Vec<&str> = uni_no_tags.tests.iter().map(|t| t.as_str()).collect();
+    assert!(
+        ids_no_tags.iter().any(|s| s.contains("TestAlpha")),
+        "TestAlpha must be discovered without tags: {ids_no_tags:?}"
+    );
+    assert!(
+        !ids_no_tags.iter().any(|s| s.contains("TestIntegration")),
+        "gated test must NOT appear without -tags: {ids_no_tags:?}"
+    );
+
+    // With `-tags integration` — gated test must now be VISIBLE.
+    let uni_tags = discover_go_tests(td.path(), &["-tags".to_string(), "integration".to_string()])
+        .await
+        .unwrap();
+    let ids_tags: Vec<&str> = uni_tags.tests.iter().map(|t| t.as_str()).collect();
+    assert!(
+        ids_tags.iter().any(|s| s.contains("TestIntegration")),
+        "gated test must be discovered with -tags integration: {ids_tags:?}"
+    );
+}
