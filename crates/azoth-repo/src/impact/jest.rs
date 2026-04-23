@@ -155,15 +155,26 @@ impl JestImpact {
             Ok(v) => v,
             Err(_) => return Ok(None),
         };
-        // Monorepo guards FIRST — a repo with `jest` AND `workspaces`
-        // is still UnsupportedConfig, not a single-project config.
-        if pkg.get("workspaces").is_some() || pkg.get("projects").is_some() {
+        // `workspaces` is a TOP-LEVEL `package.json` field (npm/yarn
+        // monorepo convention) and is an UnsupportedConfig regardless
+        // of whether jest is also configured.
+        if pkg.get("workspaces").is_some() {
             return Err(JestError::UnsupportedConfig);
         }
-        if pkg.get("jest").is_some() {
-            return Ok(Some("package_json"));
+        // `projects` is a JEST-SPECIFIC config key — lives under
+        // `pkg.jest.projects`, NOT at the package.json root (R1
+        // codex P1). Checking the root would both miss the real
+        // canonical monorepo shape `{ "jest": { "projects": [...] } }`
+        // AND false-reject repos that use an unrelated top-level
+        // `projects` field (some third-party tool's config).
+        let jest_section = match pkg.get("jest") {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+        if jest_section.get("projects").is_some() {
+            return Err(JestError::UnsupportedConfig);
         }
-        Ok(None)
+        Ok(Some("package_json"))
     }
 
     pub fn universe(&self) -> &TestUniverse {
@@ -203,7 +214,22 @@ impl ImpactSelector for JestImpact {
                 continue;
             }
             for t in &self.universe.tests {
-                if t.as_str().contains(stem) && seen.insert(t.as_str()) {
+                // R1 gemini MED: match against the FILENAME of the
+                // test path, not the whole absolute path. A naive
+                // `t.as_str().contains(stem)` false-positives on any
+                // directory-name collision (e.g. a change in
+                // `src/auth.ts` pulling every test under an
+                // unrelated `tests/auth/` directory). Narrowing to
+                // `Path::new(t).file_name()` aligns the implementation
+                // with the "direct filename-stem match" promise of
+                // the module docstring.
+                let t_str = t.as_str();
+                let filename_matches = Path::new(t_str)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.contains(stem))
+                    .unwrap_or(false);
+                if filename_matches && seen.insert(t_str) {
                     plan.tests.push(t.clone());
                     plan.rationale
                         .push(format!("changed file {path} → stem {stem}"));
@@ -286,6 +312,25 @@ struct JestFileResult {
     /// `pending`/`skipped`/`todo` all mean the file ran no real
     /// assertions, which maps cleanly to `TestOutcome::Skip`.
     status: String,
+    /// Optional because legacy jest versions (and synthetic test
+    /// fixtures) omit it. `#[serde(default)]` delivers
+    /// `JestPerfStats::default()` on absence, which carries
+    /// `runtime = 0` and lets the runner fall through to the
+    /// zero-duration path instead of erroring.
+    #[serde(default)]
+    perf_stats: JestPerfStats,
+}
+
+/// Per-file timing from jest's `--json` reporter. Jest calls the
+/// millisecond field `runtime` (NOT `duration` — gemini R1 got the
+/// concept right but the field name wrong; verified against jest
+/// v29 type definitions: `perfStats: { start: number; end: number;
+/// runtime: number; slow: boolean }`).
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct JestPerfStats {
+    #[serde(default)]
+    runtime: u64,
 }
 
 /// Map jest's file-level status to `TestOutcome`. Unrecognised
@@ -300,16 +345,26 @@ fn status_to_outcome(status: &str) -> TestOutcome {
     }
 }
 
-/// Parse jest's `--json` stdout into a `path → outcome` map. Returns
-/// `None` when the stdout isn't valid JSON (jest failed before it
-/// could emit the reporter output); caller surfaces that as a
-/// `Discovery` error.
-fn parse_jest_json(stdout: &str) -> Option<HashMap<String, TestOutcome>> {
+/// Parse jest's `--json` stdout into a `path → (outcome, duration_ms)`
+/// map. Returns `None` when stdout isn't valid JSON; caller surfaces
+/// that as a `Discovery` error.
+///
+/// `duration_ms` is pulled from `testResults[].perfStats.runtime` —
+/// the canonical jest timing field. When `perfStats` is absent
+/// (malformed output / legacy versions), duration falls back to 0
+/// rather than blocking the parse (R1 gemini MED).
+fn parse_jest_json(stdout: &str) -> Option<HashMap<String, (TestOutcome, u64)>> {
     let parsed: JestRunOutput = serde_json::from_str(stdout).ok()?;
     let map = parsed
         .test_results
         .into_iter()
-        .map(|fr| (fr.test_file_path, status_to_outcome(&fr.status)))
+        .map(|fr| {
+            let duration_ms = fr.perf_stats.runtime;
+            (
+                fr.test_file_path,
+                (status_to_outcome(&fr.status), duration_ms),
+            )
+        })
         .collect();
     Some(map)
 }
@@ -366,7 +421,17 @@ impl TestRunner for JestRunner {
             // `console.*` calls from user tests still go to stdout
             // unless silenced — which would corrupt our
             // serde_json parse. `--silent` makes stdout pure JSON.
-            .arg("--silent");
+            .arg("--silent")
+            // `--runTestsByPath` makes jest treat the positional
+            // arguments as LITERAL PATHS rather than regex patterns
+            // (R1 codex P1). Without this flag, paths that contain
+            // regex metacharacters — e.g. parametrized fixtures
+            // named `tests/[id].test.ts` or `tests/foo+bar.test.ts`
+            // — would fail to match (Unknown outcome) or match
+            // unintended files (running extra suites outside the
+            // plan). Jest's CLI docs recommend this flag for any
+            // programmatic path-driven invocation.
+            .arg("--runTestsByPath");
         // `--` separator: jest/yargs stops flag parsing here so a
         // test path starting with `-` (unusual but possible) isn't
         // interpreted as a flag. Mirrors PR-E R9.
@@ -431,14 +496,17 @@ impl TestRunner for JestRunner {
         let results = plan
             .tests
             .iter()
-            .map(|t| TestRunResult {
-                id: t.clone(),
-                outcome: outcomes
+            .map(|t| {
+                let (outcome, duration_ms) = outcomes
                     .get(t.as_str())
                     .cloned()
-                    .unwrap_or(TestOutcome::Unknown),
-                duration_ms: 0,
-                detail: detail.clone(),
+                    .unwrap_or((TestOutcome::Unknown, 0));
+                TestRunResult {
+                    id: t.clone(),
+                    outcome,
+                    duration_ms,
+                    detail: detail.clone(),
+                }
             })
             .collect();
         Ok(TestRunSummary { results })
@@ -462,8 +530,9 @@ mod tests {
     #[test]
     fn parse_jest_json_maps_passed_failed_skipped() {
         // Minimal real jest `--json` envelope. Fields not consumed
-        // (numTotalTests, perfStats, coverageMap, …) are left out so
-        // the test locks only the public contract.
+        // (numTotalTests, coverageMap, …) are left out so the test
+        // locks only the public contract. `perfStats` omitted here
+        // is covered by a dedicated duration extraction test below.
         let stdout = r#"{
             "success": false,
             "testResults": [
@@ -475,11 +544,65 @@ mod tests {
             ]
         }"#;
         let map = parse_jest_json(stdout).expect("json must parse");
-        assert_eq!(map.get("/abs/a.test.js"), Some(&TestOutcome::Pass));
-        assert_eq!(map.get("/abs/b.test.js"), Some(&TestOutcome::Fail));
-        assert_eq!(map.get("/abs/c.test.js"), Some(&TestOutcome::Skip));
-        assert_eq!(map.get("/abs/d.test.js"), Some(&TestOutcome::Skip));
-        assert_eq!(map.get("/abs/e.test.js"), Some(&TestOutcome::Skip));
+        assert_eq!(map.get("/abs/a.test.js"), Some(&(TestOutcome::Pass, 0)));
+        assert_eq!(map.get("/abs/b.test.js"), Some(&(TestOutcome::Fail, 0)));
+        assert_eq!(map.get("/abs/c.test.js"), Some(&(TestOutcome::Skip, 0)));
+        assert_eq!(map.get("/abs/d.test.js"), Some(&(TestOutcome::Skip, 0)));
+        assert_eq!(map.get("/abs/e.test.js"), Some(&(TestOutcome::Skip, 0)));
+    }
+
+    #[test]
+    fn parse_jest_json_extracts_duration_from_perfstats_runtime() {
+        // R1 gemini MED regression guard: jest's `--json` reporter
+        // emits per-file timing at `testResults[].perfStats.runtime`
+        // (NOT `perfStats.duration` — gemini's suggested field name
+        // is wrong). The parser must thread that into the caller-
+        // visible tuple so `TestRunResult.duration_ms` stops being
+        // hardcoded to zero.
+        let stdout = r#"{
+            "success": true,
+            "testResults": [
+                {
+                    "testFilePath": "/abs/fast.test.js",
+                    "status": "passed",
+                    "perfStats": { "start": 100, "end": 250, "runtime": 150, "slow": false }
+                },
+                {
+                    "testFilePath": "/abs/slow.test.js",
+                    "status": "passed",
+                    "perfStats": { "start": 300, "end": 12300, "runtime": 12000, "slow": true }
+                }
+            ]
+        }"#;
+        let map = parse_jest_json(stdout).expect("json must parse");
+        assert_eq!(
+            map.get("/abs/fast.test.js"),
+            Some(&(TestOutcome::Pass, 150))
+        );
+        assert_eq!(
+            map.get("/abs/slow.test.js"),
+            Some(&(TestOutcome::Pass, 12000))
+        );
+    }
+
+    #[test]
+    fn parse_jest_json_missing_perfstats_defaults_to_zero_duration() {
+        // Legacy jest versions / synthetic fixtures may omit
+        // `perfStats` entirely. The `#[serde(default)]` on the field
+        // falls back to `JestPerfStats::default()` (runtime = 0),
+        // which keeps duration reporting honest rather than blocking
+        // the whole parse.
+        let stdout = r#"{
+            "success": true,
+            "testResults": [
+                { "testFilePath": "/abs/legacy.test.js", "status": "passed" }
+            ]
+        }"#;
+        let map = parse_jest_json(stdout).expect("json must parse");
+        assert_eq!(
+            map.get("/abs/legacy.test.js"),
+            Some(&(TestOutcome::Pass, 0))
+        );
     }
 
     #[test]
@@ -514,7 +637,7 @@ mod tests {
             "someTopLevelAddition": "whatever"
         }"#;
         let map = parse_jest_json(stdout).expect("unknown fields must not break parse");
-        assert_eq!(map.get("/abs/a.test.js"), Some(&TestOutcome::Pass));
+        assert_eq!(map.get("/abs/a.test.js"), Some(&(TestOutcome::Pass, 0)));
     }
 
     #[test]

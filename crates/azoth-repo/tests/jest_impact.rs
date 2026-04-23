@@ -143,19 +143,36 @@ fn detection_workspaces_array_flags_unsupported() {
 }
 
 #[test]
-fn detection_projects_array_flags_unsupported() {
-    // `projects` in package.json is the second monorepo shape jest
-    // supports. Also unsupported in v2.1.
+fn detection_jest_projects_array_flags_unsupported() {
+    // R1 codex P1: jest's multi-project shape lives under the `jest`
+    // key as `jest.projects`, NOT at the package.json root. This is
+    // the canonical jest monorepo config that v2.1 rejects.
     let td = TempDir::new().unwrap();
     std::fs::write(
         td.path().join("package.json"),
-        r#"{"name":"x","projects":["packages/a","packages/b"]}"#,
+        r#"{"name":"x","jest":{"projects":["packages/a","packages/b"]}}"#,
     )
     .unwrap();
     assert!(matches!(
         JestImpact::detect(td.path()),
         Err(JestError::UnsupportedConfig)
     ));
+}
+
+#[test]
+fn detection_top_level_projects_without_jest_is_ignored() {
+    // R1 codex P1 sibling: a package.json with an unrelated top-level
+    // `projects` field (some other tool's config — e.g. angular.json-
+    // style workspace listings landing in package.json by accident)
+    // must NOT be misread as a jest monorepo. No `jest` key ⇒ no jest
+    // config ⇒ detect returns `Ok(None)`.
+    let td = TempDir::new().unwrap();
+    std::fs::write(
+        td.path().join("package.json"),
+        r#"{"name":"x","projects":["unrelated/a","unrelated/b"]}"#,
+    )
+    .unwrap();
+    assert!(matches!(JestImpact::detect(td.path()), Ok(None)));
 }
 
 #[test]
