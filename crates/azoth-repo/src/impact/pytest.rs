@@ -172,7 +172,25 @@ impl ImpactSelector for PytestImpact {
                 continue;
             }
             for t in &self.universe.tests {
-                if t.as_str().contains(stem) && seen.insert(t.as_str()) {
+                // PR #25 R1 gemini MED sibling: match against the
+                // FILENAME of the test node ID, not the whole id.
+                // A naive `t.as_str().contains(stem)` false-positives
+                // on any directory-name collision — e.g. a change
+                // in `src/auth.py` pulling every test under an
+                // unrelated `tests/auth/` directory. pytest node IDs
+                // look like `tests/auth/test_login.py::test_ok`, so
+                // `Path::new(id).file_name()` yields
+                // `test_login.py::test_ok` and narrows the match to
+                // the actual filename segment — aligning the code
+                // with the "direct filename-stem match" promise of
+                // the module docstring.
+                let t_str = t.as_str();
+                let filename_matches = Path::new(t_str)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.contains(stem))
+                    .unwrap_or(false);
+                if filename_matches && seen.insert(t_str) {
                     plan.tests.push(t.clone());
                     plan.rationale
                         .push(format!("changed file {path} → stem {stem}"));
