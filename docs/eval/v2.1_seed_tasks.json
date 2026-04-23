@@ -132,9 +132,9 @@
       "crates/azoth-core/src/validators/impact.rs"
     ],
     "predicted_files": [
-      "crates/azoth-repo/src/impact",
+      "crates/azoth-repo/src/impact/mod.rs",
       "crates/azoth-core/src/validators/impact.rs",
-      "crates/azoth-core/src/impact",
+      "crates/azoth-core/src/impact/mod.rs",
       "crates/azoth-core/src/schemas/impact.rs"
     ],
     "notes": "Sprint 5 ImpactSelector dispatch."
