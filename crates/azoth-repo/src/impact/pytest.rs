@@ -35,6 +35,7 @@ use azoth_core::impact::{ImpactError, ImpactSelector};
 use azoth_core::schemas::{Contract, Diff, TestId, TestPlan};
 
 use super::cargo::TestUniverse;
+use super::heuristic::word_boundary_contains;
 use super::runner::{TestOutcome, TestRunResult, TestRunSummary, TestRunner};
 
 /// Selector-impl version. Bump on heuristic changes so replay can
@@ -184,11 +185,18 @@ impl ImpactSelector for PytestImpact {
                 // the actual filename segment — aligning the code
                 // with the "direct filename-stem match" promise of
                 // the module docstring.
+                //
+                // PR #25 R3 gemini MED: `n.contains(stem)` STILL
+                // false-positives within the filename (`auth` matches
+                // `test_author.py`). Swap to `word_boundary_contains`
+                // — identical to the jest sibling; see
+                // `super::heuristic` for the class-bug rationale and
+                // the cargo sweep that closed the same gap.
                 let t_str = t.as_str();
                 let filename_matches = Path::new(t_str)
                     .file_name()
                     .and_then(|n| n.to_str())
-                    .map(|n| n.contains(stem))
+                    .map(|n| word_boundary_contains(n, stem))
                     .unwrap_or(false);
                 if filename_matches && seen.insert(t_str) {
                     plan.tests.push(t.clone());

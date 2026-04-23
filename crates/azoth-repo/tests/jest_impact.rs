@@ -64,6 +64,21 @@ fn detection_jest_config_cjs_hits() {
 }
 
 #[test]
+fn detection_jest_config_json_hits() {
+    // R3 gemini MED: jest.config.json is a first-class jest config file.
+    let td = TempDir::new().unwrap();
+    std::fs::write(
+        td.path().join("jest.config.json"),
+        r#"{"testEnvironment":"node"}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        JestImpact::detect(td.path()).unwrap(),
+        Some("jest_config_file")
+    );
+}
+
+#[test]
 fn detection_package_json_jest_section_hits() {
     let td = TempDir::new().unwrap();
     std::fs::write(
@@ -306,4 +321,34 @@ async fn selector_name_and_version_are_stable() {
     let sel = JestImpact::with_universe(std::path::PathBuf::from("/tmp"), TestUniverse::default());
     assert_eq!(sel.name(), "jest");
     assert_eq!(sel.version(), azoth_repo::impact::JEST_IMPACT_VERSION);
+}
+
+#[tokio::test]
+async fn selector_rejects_prefix_substring_author_vs_auth() {
+    // R3 gemini MED: naive `contains("auth")` on `author.test.ts`
+    // false-positively pulls unrelated `author` tests whenever a file
+    // named `auth.ts` changes. Word-boundary guard must reject this.
+    let universe = TestUniverse::from_tests(["/repo/src/__tests__/author.test.ts"].iter().copied());
+    let sel = JestImpact::with_universe(std::path::PathBuf::from("/repo"), universe);
+    let plan = sel
+        .select(&Diff::from_paths(["src/auth.ts"]), &stub_contract())
+        .await
+        .unwrap();
+    assert!(
+        plan.is_empty(),
+        "author.test.ts must not be selected by an auth.ts change: {plan:?}"
+    );
+}
+
+#[tokio::test]
+async fn selector_accepts_legitimate_auth_match_despite_word_boundary() {
+    // Symmetric guard: word-boundary must NOT reject the canonical
+    // `auth.ts` → `auth.test.ts` case it was designed to accept.
+    let universe = TestUniverse::from_tests(["/repo/src/__tests__/auth.test.ts"].iter().copied());
+    let sel = JestImpact::with_universe(std::path::PathBuf::from("/repo"), universe);
+    let plan = sel
+        .select(&Diff::from_paths(["src/auth.ts"]), &stub_contract())
+        .await
+        .unwrap();
+    assert_eq!(plan.tests.len(), 1, "legitimate auth match: {plan:?}");
 }

@@ -41,6 +41,8 @@ use azoth_core::impact::{ImpactError, ImpactSelector};
 use azoth_core::retrieval::{GraphRetrieval, NodeRef};
 use azoth_core::schemas::{Contract, Diff, TestId, TestPlan};
 
+use super::heuristic::word_boundary_contains;
+
 /// Selector-impl version. Bump whenever the ranking heuristic
 /// changes so `SessionEvent::ImpactComputed.selector_version`
 /// replays correctly reflect plan drift.
@@ -216,7 +218,14 @@ pub fn select_impacted_tests(
             continue;
         }
         for t in &universe.tests {
-            if !t.as_str().contains(&stem) {
+            // PR #25 R3 sibling sweep: same class bug gemini flagged on
+            // jest/pytest (stem `auth` pulling `author::*` tests). cargo
+            // test IDs are `::`-separated module paths like
+            // `my_crate::auth::tests::foo`, so the word-boundary guard
+            // rejects `author::*` via the trailing alphanumeric after
+            // `auth` while accepting legitimate `auth::*` hits via the
+            // trailing `:`. See `super::heuristic` for the rationale.
+            if !word_boundary_contains(t.as_str(), &stem) {
                 continue;
             }
             if !seen.insert(t.as_str()) {
@@ -452,6 +461,27 @@ mod tests {
         let plan = select_impacted_tests(&u, &["src/foo.rs".into()], &[], 7);
         assert!(plan.is_empty());
         assert_eq!(plan.selector_version, 7);
+    }
+
+    #[test]
+    fn select_impacted_tests_rejects_prefix_substring_author_vs_auth() {
+        // PR #25 R3 sibling sweep: stem `auth` from `src/auth.rs` must
+        // not pull `my_crate::author::tests::*` via substring collision.
+        // Word-boundary guard rejects because the `o` following `auth` is
+        // alphanumeric.
+        let u = TestUniverse::from_tests([
+            "my_crate::author::tests::writes_book",
+            "my_crate::auth::tests::login_ok",
+        ]);
+        let paths = vec!["src/auth.rs".to_string()];
+        let rationale = vec![("src/auth.rs".to_string(), "changed file src/auth.rs".into())];
+        let plan = select_impacted_tests(&u, &paths, &rationale, 1);
+        assert_eq!(
+            plan.tests.len(),
+            1,
+            "expected only the genuine auth hit: {plan:?}"
+        );
+        assert_eq!(plan.tests[0].as_str(), "my_crate::auth::tests::login_ok");
     }
 
     struct MockGraph {

@@ -16,6 +16,7 @@
 
 pub mod cargo;
 pub mod git_status;
+pub(crate) mod heuristic;
 pub mod jest;
 pub mod pytest;
 pub mod runner;

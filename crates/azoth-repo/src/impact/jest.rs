@@ -38,6 +38,8 @@ use tokio::process::Command;
 use azoth_core::impact::{ImpactError, ImpactSelector};
 use azoth_core::schemas::{Contract, Diff, TestId, TestPlan};
 
+use super::heuristic::word_boundary_contains;
+
 use super::cargo::TestUniverse;
 use super::runner::{TestOutcome, TestRunResult, TestRunSummary, TestRunner};
 
@@ -133,11 +135,17 @@ impl JestImpact {
     /// `Discovery(..)` when `npx jest` actually runs.
     pub fn detect(repo_root: &Path) -> Result<Option<&'static str>, JestError> {
         // Config files first — presence alone implies single-project.
+        // R3 gemini MED: `jest.config.json` is a first-class jest config
+        // file (jest resolves `.js`/`.ts`/`.mjs`/`.cjs`/`.json` by default).
+        // Missing it left JSON-configured projects falling through to the
+        // `package.json` branch, which would mis-report them as "no jest"
+        // when no `jest` key was present in package.json.
         const CONFIG_FILES: &[&str] = &[
             "jest.config.js",
             "jest.config.ts",
             "jest.config.mjs",
             "jest.config.cjs",
+            "jest.config.json",
         ];
         for name in CONFIG_FILES {
             if repo_root.join(name).exists() {
@@ -223,11 +231,18 @@ impl ImpactSelector for JestImpact {
                 // `Path::new(t).file_name()` aligns the implementation
                 // with the "direct filename-stem match" promise of
                 // the module docstring.
+                //
+                // R3 gemini MED: `n.contains(stem)` STILL false-positives
+                // within the filename (e.g. stem `auth` matching
+                // `author.test.ts`). Swap to `word_boundary_contains`
+                // which guards the match with non-alphanumeric neighbours.
+                // See `super::heuristic` for the class-bug rationale and
+                // sibling sweep across pytest + cargo.
                 let t_str = t.as_str();
                 let filename_matches = Path::new(t_str)
                     .file_name()
                     .and_then(|n| n.to_str())
-                    .map(|n| n.contains(stem))
+                    .map(|n| word_boundary_contains(n, stem))
                     .unwrap_or(false);
                 if filename_matches && seen.insert(t_str) {
                     plan.tests.push(t.clone());
