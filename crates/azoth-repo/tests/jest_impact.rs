@@ -175,6 +175,42 @@ fn detection_jest_projects_array_flags_unsupported() {
 }
 
 #[test]
+fn detection_workspaces_null_does_not_false_trigger() {
+    // R3 gemini MED: `{"workspaces": null}` means "no monorepo"
+    // (user left the key but disabled it). The pre-R3 `.is_some()`
+    // check fired on any presence including null, producing a false
+    // `UnsupportedConfig`. Null-safety via `is_some_and(!is_null)`
+    // lets this fall through to the jest-section check.
+    let td = TempDir::new().unwrap();
+    std::fs::write(
+        td.path().join("package.json"),
+        r#"{"name":"x","workspaces":null,"jest":{}}"#,
+    )
+    .unwrap();
+    assert!(matches!(
+        JestImpact::detect(td.path()),
+        Ok(Some("package_json"))
+    ));
+}
+
+#[test]
+fn detection_jest_projects_null_does_not_false_trigger() {
+    // R3 gemini MED sibling to the `workspaces: null` case. A
+    // `{"jest": {"projects": null}}` means "no multi-project setup"
+    // — must fall through as a normal single-project jest section.
+    let td = TempDir::new().unwrap();
+    std::fs::write(
+        td.path().join("package.json"),
+        r#"{"name":"x","jest":{"projects":null}}"#,
+    )
+    .unwrap();
+    assert!(matches!(
+        JestImpact::detect(td.path()),
+        Ok(Some("package_json"))
+    ));
+}
+
+#[test]
 fn detection_top_level_projects_without_jest_is_ignored() {
     // R1 codex P1 sibling: a package.json with an unrelated top-level
     // `projects` field (some other tool's config — e.g. angular.json-

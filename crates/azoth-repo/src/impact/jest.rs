@@ -165,8 +165,9 @@ impl JestImpact {
         };
         // `workspaces` is a TOP-LEVEL `package.json` field (npm/yarn
         // monorepo convention) and is an UnsupportedConfig regardless
-        // of whether jest is also configured.
-        if pkg.get("workspaces").is_some() {
+        // of whether jest is also configured. Explicit `null` means
+        // "no monorepo" — don't false-trigger on it (R3 gemini MED).
+        if pkg.get("workspaces").is_some_and(|v| !v.is_null()) {
             return Err(JestError::UnsupportedConfig);
         }
         // `projects` is a JEST-SPECIFIC config key — lives under
@@ -179,7 +180,8 @@ impl JestImpact {
             Some(v) => v,
             None => return Ok(None),
         };
-        if jest_section.get("projects").is_some() {
+        // Same null-safe shape as `workspaces` above (R3 gemini MED).
+        if jest_section.get("projects").is_some_and(|v| !v.is_null()) {
             return Err(JestError::UnsupportedConfig);
         }
         Ok(Some("package_json"))
@@ -266,7 +268,13 @@ impl ImpactSelector for JestImpact {
 ///
 /// `--listTests` prints one absolute path per line on stdout.
 pub async fn discover_jest_tests(repo_root: &Path) -> Result<TestUniverse, ImpactError> {
+    // `--yes` auto-accepts npx's "Need to install ... OK to proceed?"
+    // confirmation. In non-interactive environments (CI, background
+    // workers, sandboxed agents) npx blocks forever on that prompt
+    // when the requested package isn't in `node_modules` (R3 gemini
+    // MED). Sibling fix in `JestRunner::run` below.
     let out = Command::new("npx")
+        .arg("--yes")
         .arg("jest")
         .arg("--listTests")
         .current_dir(repo_root)
@@ -323,9 +331,12 @@ struct JestRunOutput {
 #[serde(rename_all = "camelCase")]
 struct JestFileResult {
     test_file_path: String,
-    /// `"passed" | "failed" | "pending" | "skipped" | "todo"` —
-    /// `pending`/`skipped`/`todo` all mean the file ran no real
-    /// assertions, which maps cleanly to `TestOutcome::Skip`.
+    /// `"passed" | "failed" | "pending" | "skipped" | "todo" | "disabled"` —
+    /// all four non-running variants (`pending`/`skipped`/`todo`/`disabled`)
+    /// mean the file ran no real assertions, which maps cleanly to
+    /// `TestOutcome::Skip`. `disabled` is emitted when a suite is
+    /// turned off via `testPathIgnorePatterns` or `test.skip` at the
+    /// file level (jest v29 Status union, R3 gemini MED).
     status: String,
     /// Optional because legacy jest versions (and synthetic test
     /// fixtures) omit it. `#[serde(default)]` delivers
@@ -355,7 +366,7 @@ fn status_to_outcome(status: &str) -> TestOutcome {
     match status {
         "passed" => TestOutcome::Pass,
         "failed" => TestOutcome::Fail,
-        "pending" | "skipped" | "todo" => TestOutcome::Skip,
+        "pending" | "skipped" | "todo" | "disabled" => TestOutcome::Skip,
         _ => TestOutcome::Unknown,
     }
 }
@@ -418,6 +429,10 @@ impl TestRunner for JestRunner {
         // emits ≤100 ids per turn. Batching mitigation revisited in
         // v2.2 if eval seeds grow past 5k tests.
         let mut cmd = Command::new("npx");
+        // `--yes` auto-accepts npx's install-confirmation prompt so
+        // non-interactive environments don't hang (R3 gemini MED;
+        // mirror of `discover_jest_tests` above).
+        cmd.arg("--yes");
         cmd.arg("jest");
         // PR-E R11 argv-precedence: user extra_args FIRST, internal
         // flags LAST, so jest/yargs' last-flag-wins semantics keeps
@@ -541,6 +556,10 @@ mod tests {
         assert_eq!(status_to_outcome("pending"), TestOutcome::Skip);
         assert_eq!(status_to_outcome("skipped"), TestOutcome::Skip);
         assert_eq!(status_to_outcome("todo"), TestOutcome::Skip);
+        // R3 gemini MED: `disabled` is in jest v29's Status union
+        // (`@jest/test-result` → `Status`). Emitted when a suite is
+        // turned off via `testPathIgnorePatterns` or equivalent.
+        assert_eq!(status_to_outcome("disabled"), TestOutcome::Skip);
         assert_eq!(status_to_outcome("???"), TestOutcome::Unknown);
     }
 
