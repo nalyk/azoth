@@ -176,11 +176,11 @@ impl ImpactSelector for GoTestImpact {
         // `HashSet<&str>` borrows from `self.universe` — zero-alloc
         // dedupe, same as PR-E/F.
         let mut seen: HashSet<&str> = HashSet::new();
-        // Dedupe parent_name → representative changed-file path. R1
+        // Dedupe parent_path → representative changed-file path. R1
         // gemini MED on PR #26: N changed files × M tests is O(N*M)
         // with repeated redundant work when multiple changed files
         // map to the same package directory. Collapsing to
-        // unique-parent-names first drops the outer loop to
+        // unique-parent-paths first drops the outer loop to
         // O(unique_parents × M) without changing the semantic — the
         // dedupe on `seen` already kept only the FIRST changed file's
         // rationale for each matched test, so recording the
@@ -188,18 +188,35 @@ impl ImpactSelector for GoTestImpact {
         let mut by_parent: Vec<(&str, &str)> = Vec::new();
         let mut parent_seen: HashSet<&str> = HashSet::new();
         for path in &diff.changed_files {
-            // Go-native heuristic: parent-dir-name against package path.
-            // See module doc for why this differs from jest/pytest's
-            // file-stem approach.
-            let parent_name = parent_dir_name(path);
-            if parent_name.is_empty() {
+            // Go-native heuristic: RELATIVE parent-dir-path (full,
+            // not just the last component) against the test id's
+            // package path. R2 gemini HIGH on PR #26: my R1 used
+            // only the last component, which over-selected on
+            // common dir names — e.g. a change in
+            // `pkg/auth/internal/foo.go` pulled tests from every
+            // `*/internal` package in the repo because stem
+            // `internal` matched them all. Using the full relative
+            // parent `pkg/auth/internal` narrows the match to the
+            // specific package suffix. Residual imprecision: if
+            // two distinct modules happen to share a long suffix
+            // (e.g. `other/pkg/auth` and `pkg/auth` both exist),
+            // both match. Tight fix requires parsing go.mod for the
+            // module prefix — deferred to v2.2.
+            //
+            // `rsplit_once('/')` over `Path::parent().file_name()`
+            // per gemini MED on PR #26: no Path-object allocation,
+            // preserves hierarchy, and uses git-diff-native `/`
+            // separator (non-Windows paths only, which matches
+            // azoth's Linux-only operational envelope).
+            let parent_path = path.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
+            if parent_path.is_empty() {
                 continue;
             }
-            if parent_seen.insert(parent_name) {
-                by_parent.push((parent_name, path.as_str()));
+            if parent_seen.insert(parent_path) {
+                by_parent.push((parent_path, path.as_str()));
             }
         }
-        for (parent_name, path) in by_parent {
+        for (parent_path, path) in by_parent {
             for t in &self.universe.tests {
                 let t_str = t.as_str();
                 // Package path is everything left of `::`. Missing
@@ -207,10 +224,10 @@ impl ImpactSelector for GoTestImpact {
                 // skip rather than crash (defensive; discovery emits
                 // the separator on every id).
                 let pkg_path = t_str.split_once(ID_SEP).map(|(p, _)| p).unwrap_or("");
-                if word_boundary_contains(pkg_path, parent_name) && seen.insert(t_str) {
+                if word_boundary_contains(pkg_path, parent_path) && seen.insert(t_str) {
                     plan.tests.push(t.clone());
                     plan.rationale
-                        .push(format!("changed file {path} → pkg dir {parent_name}"));
+                        .push(format!("changed file {path} → pkg dir {parent_path}"));
                     plan.confidence.push(1.0);
                 }
             }
@@ -218,18 +235,6 @@ impl ImpactSelector for GoTestImpact {
         debug_assert!(plan.is_well_formed());
         Ok(plan)
     }
-}
-
-/// Return the last component of `path`'s parent directory, or empty
-/// string when `path` is a bare filename or has no meaningful parent.
-/// `src/auth/tokens.go` → `"auth"`, `foo.go` → `""`,
-/// `/root/foo.go` → `""` (root has no named parent).
-fn parent_dir_name(path: &str) -> &str {
-    Path::new(path)
-        .parent()
-        .and_then(|p| p.file_name())
-        .and_then(|n| n.to_str())
-        .unwrap_or("")
 }
 
 /// Shell out to `go test -json -list '.*' ./...` inside `repo_root`
@@ -581,11 +586,6 @@ fn parse_run_ndjson(text: &str) -> HashMap<String, (TestOutcome, u64, String)> {
             Some(ref t) if !t.is_empty() => t.clone(),
             _ => continue,
         };
-        // Top-level name: everything before the first `/`. For
-        // non-subtest events this equals `test`. For `TestParent/Sub`
-        // it's `TestParent`.
-        let top_level = test.split_once('/').map(|(p, _)| p.to_string());
-
         match ev.action.as_str() {
             "output" => {
                 if let Some(ref o) = ev.output {
@@ -595,14 +595,26 @@ fn parse_run_ndjson(text: &str) -> HashMap<String, (TestOutcome, u64, String)> {
                         .or_insert((TestOutcome::Unknown, 0, String::new()))
                         .2
                         .push_str(o);
-                    // Also append to the parent's slot so the
-                    // top-level lookup sees subtest output.
-                    if let Some(ref parent) = top_level {
+                    // Walk the full ancestor chain — every `/`-
+                    // separated prefix gets the subtest's output
+                    // appended. R2 gemini MED on PR #26: R1 only
+                    // rolled up to the top-level (`TestParent`),
+                    // missing intermediate levels. For
+                    // `Test="TestA/B/C/D"` we now append to
+                    // `TestA/B/C`, `TestA/B`, and `TestA` — so
+                    // whichever granularity the caller looks up,
+                    // forensic detail is complete. Outcomes stay
+                    // scoped per-slot: Go emits pass/fail/skip at
+                    // every level that runs, so each ancestor's
+                    // own outcome event seals its slot correctly.
+                    let mut ancestor = test.as_str();
+                    while let Some((prefix, _)) = ancestor.rsplit_once('/') {
                         state
-                            .entry(parent.clone())
+                            .entry(prefix.to_string())
                             .or_insert((TestOutcome::Unknown, 0, String::new()))
                             .2
                             .push_str(o);
+                        ancestor = prefix;
                     }
                 }
             }
@@ -907,6 +919,45 @@ Actual JSON error: extra } somewhere
     }
 
     #[test]
+    fn parse_run_ndjson_aggregates_nested_subtest_into_every_ancestor() {
+        // R2 gemini MED on PR #26: R1 only rolled up output to the
+        // top-most parent (split_once('/') gave `TestA` from
+        // `TestA/B/C`). Nested subtests like `TestA/B/C` left the
+        // intermediate `TestA/B` slot empty — fine for v2.1 (only
+        // top-level ids are in the universe), but a future feature
+        // that looks up intermediate nodes would see blank details.
+        // Fix walks the full ancestor chain so every `/`-separated
+        // prefix gets the output appended.
+        let ndjson = r#"{"Action":"run","Package":"p","Test":"TestA/B/C"}
+{"Action":"output","Package":"p","Test":"TestA/B/C","Output":"    test.go:7: deep boom\n"}
+{"Action":"output","Package":"p","Test":"TestA/B/C","Output":"--- FAIL: TestA/B/C (0.00s)\n"}
+{"Action":"fail","Package":"p","Test":"TestA/B/C","Elapsed":0}"#;
+        let m = parse_run_ndjson(ndjson);
+
+        // Leaf slot carries its own output.
+        assert!(
+            m.get("TestA/B/C")
+                .map(|e| e.2.contains("deep boom"))
+                .unwrap_or(false),
+            "leaf slot must carry subtest output"
+        );
+        // Intermediate slot (TestA/B) carries the same output.
+        assert!(
+            m.get("TestA/B")
+                .map(|e| e.2.contains("deep boom"))
+                .unwrap_or(false),
+            "intermediate ancestor TestA/B must carry nested subtest output"
+        );
+        // Top-level slot (TestA) also carries it.
+        assert!(
+            m.get("TestA")
+                .map(|e| e.2.contains("deep boom"))
+                .unwrap_or(false),
+            "top-level ancestor TestA must carry nested subtest output"
+        );
+    }
+
+    #[test]
     fn elapsed_to_ms_clamps_weird_values() {
         assert_eq!(elapsed_to_ms(None), 0);
         assert_eq!(elapsed_to_ms(Some(f64::NAN)), 0);
@@ -915,13 +966,6 @@ Actual JSON error: extra } somewhere
         // Normal case: rounded-half-to-nearest.
         assert_eq!(elapsed_to_ms(Some(0.1234)), 123);
         assert_eq!(elapsed_to_ms(Some(0.0)), 0);
-    }
-
-    #[test]
-    fn parent_dir_name_returns_last_component() {
-        assert_eq!(parent_dir_name("src/auth/tokens.go"), "auth");
-        assert_eq!(parent_dir_name("pkg/foo_test.go"), "pkg");
-        assert_eq!(parent_dir_name("foo.go"), "");
     }
 
     #[test]

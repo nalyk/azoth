@@ -135,6 +135,37 @@ async fn selector_rejects_word_boundary_collision_auth_vs_author() {
 }
 
 #[tokio::test]
+async fn selector_rejects_common_dir_name_collision_across_packages() {
+    // R2 gemini HIGH on PR #26: R1 matched on just the last parent
+    // dir component (`internal`), which over-selected in repos with
+    // multiple `*/internal` packages. A change in
+    // `pkg/auth/internal/foo.go` must NOT pull tests from an
+    // unrelated `pkg/db/internal` package — those are two different
+    // Go packages with different import paths. The R2 fix uses the
+    // FULL relative parent path (`pkg/auth/internal`) so the match
+    // narrows to the specific suffix.
+    let universe = TestUniverse::from_tests([
+        "example.com/m/pkg/auth/internal::TestAuthInternal",
+        "example.com/m/pkg/db/internal::TestDbInternal",
+        "example.com/m/pkg/api/internal::TestApiInternal",
+    ]);
+    let sel = GoTestImpact::with_universe(std::path::PathBuf::from("/repo"), universe);
+    let plan = sel
+        .select(
+            &Diff::from_paths(["pkg/auth/internal/foo.go"]),
+            &stub_contract(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        plan.tests.len(),
+        1,
+        "only the auth/internal pkg; db/internal + api/internal must be skipped: {plan:?}"
+    );
+    assert!(plan.tests[0].as_str().ends_with("::TestAuthInternal"));
+}
+
+#[tokio::test]
 async fn selector_dedupes_across_multiple_changed_files_in_same_pkg() {
     // Two changed files in the same package: plan must still include
     // each test only once (PR-E/F dedupe pattern).
