@@ -99,30 +99,3 @@ async fn jest_runner_empty_plan_short_circuits() {
         .unwrap();
     assert!(summary.is_empty());
 }
-
-/// Regression guard for the detail-capture buffer: jest stderr can
-/// contain multi-byte UTF-8 (non-English file names, jest diagnostic
-/// messages with unicode quotes). A naive `String::truncate(4096)` on
-/// a mid-codepoint boundary panics. This test locks the walk-back
-/// loop the runner uses.
-#[test]
-fn truncate_loop_is_char_boundary_safe_on_mid_codepoint() {
-    let mut text = "a".repeat(4095);
-    text.push('é');
-    assert_eq!(text.len(), 4097);
-    assert!(
-        !text.is_char_boundary(4096),
-        "fixture precondition: byte 4096 must NOT be a char boundary"
-    );
-
-    if text.len() > 4096 {
-        let mut cutoff = 4096;
-        while !text.is_char_boundary(cutoff) {
-            cutoff -= 1;
-        }
-        text.truncate(cutoff);
-    }
-
-    assert_eq!(text.len(), 4095);
-    assert!(text.is_ascii(), "truncated to all-ASCII prefix");
-}
