@@ -77,17 +77,26 @@ func TestGamma(t *testing.T) { t.Fatal("boom") }
         "TestGamma must be Fail"
     );
 
-    // Forensic detail — at least one result must carry the failure
-    // text so the TUI has context to render. Accept either the
-    // failure message or the standard `--- FAIL: TestGamma` marker.
-    let detail = summary
+    // Forensic detail for the FAILING test specifically — R5 gemini
+    // MED on PR #26: the pre-R5 assertion used `find_map` which
+    // picked the first result carrying any detail (likely TestAlpha's
+    // "PASS" string), then a `|| contains("PASS")` disjunction made
+    // the assertion a tautology for any test that produced output.
+    // Tight version: pin to TestGamma (the only guaranteed failure)
+    // and require either the user's `t.Fatal` message or Go's own
+    // `--- FAIL:` marker in its detail.
+    let gamma = summary
         .results
         .iter()
-        .find_map(|r| r.detail.clone())
-        .expect("at least one result must carry forensic detail");
+        .find(|r| r.id.as_str() == "example.com/probe::TestGamma")
+        .expect("TestGamma must be present in summary");
+    let detail = gamma
+        .detail
+        .clone()
+        .expect("TestGamma must carry forensic detail");
     assert!(
-        detail.contains("boom") || detail.contains("FAIL: TestGamma") || detail.contains("PASS"),
-        "detail must reference test output: {detail}"
+        detail.contains("boom") || detail.contains("FAIL: TestGamma"),
+        "TestGamma detail must reference the failure text: {detail}"
     );
 }
 
