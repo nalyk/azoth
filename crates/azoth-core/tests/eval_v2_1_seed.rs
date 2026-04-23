@@ -44,8 +44,18 @@ fn v2_1_seed_loads_ships_50_tasks_and_meets_localization_at_5_floor() {
     );
 
     // Every task must have a non-empty relevant_files — a zero-ground-truth
-    // task contributes noise, not signal.
+    // task contributes noise, not signal. Task IDs must be unique: duplicates
+    // would make the SQLite mirror's composite PK (run_id, turn_id, metric,
+    // task_id) collide, silently overwriting per-task rows when the eval CLI
+    // writes the synthetic session JSONL (see `crates/azoth/src/eval.rs`
+    // around the `write_eval_session` path). Gemini PR #28 flagged this.
+    let mut seen_ids = std::collections::HashSet::with_capacity(tasks.len());
     for t in &tasks {
+        assert!(
+            seen_ids.insert(t.id.as_str()),
+            "duplicate task id {} in seed — breaks eval_runs composite PK",
+            t.id
+        );
         assert!(
             !t.relevant_files.is_empty(),
             "seed task {} has no relevant_files",
