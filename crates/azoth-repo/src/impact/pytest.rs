@@ -591,6 +591,29 @@ impl TestRunner for PytestRunner {
         // don't appear in pytest's output surface as `Unknown` —
         // honest gap rather than guessed Pass/Fail.
         let outcomes = parse_pytest_verbose_outcomes(&stdout_text);
+        // R5/R6 deferral (sibling of jest.rs cross-test pollution
+        // fix, shipped in jest this round): this `detail` is the
+        // GLOBAL merged stdout+stderr attached to every per-test
+        // result, which means a passing test's TUI detail view shows
+        // unrelated failing tests' output. Same class bug gemini
+        // flagged in jest R5 (MED 3132338881) and which that PR
+        // closed by threading per-file `message` from jest's `--json`
+        // output into each `TestRunResult.detail`.
+        //
+        // NOT fixed here in R6 because pytest's `-v` text output
+        // does not carry a structured per-test failure message — the
+        // short traceback block is serialized as free-form text that
+        // would need a tracking parser to associate with specific
+        // node IDs. The clean path is to switch this runner to
+        // `--junitxml` output (per-test `<testcase><failure>`), which
+        // is a parser-replacement on top of PR #24's semantics. That
+        // is v2.2 scope — out-of-band for PR #25 (PR-F, jest landing).
+        //
+        // WHO ADDRESSES THIS: whoever opens the v2.2 pytest
+        // `--junitxml` migration PR. They should (a) parse per-test
+        // `<failure>`/`<error>` CDATA, (b) switch this buffer from
+        // `merge_pipes(stdout, stderr)` to per-test message lookup,
+        // (c) delete this comment.
         let detail = {
             // Reuse `merge_pipes` (gemini R2 top-level summary) —
             // single source of truth for stdout+stderr combination.

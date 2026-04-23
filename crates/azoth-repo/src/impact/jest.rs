@@ -353,6 +353,17 @@ struct JestFileResult {
     /// zero-duration path instead of erroring.
     #[serde(default)]
     perf_stats: JestPerfStats,
+    /// Per-file failure message. Jest populates this on failed
+    /// suites with the multi-line stack trace specific to THIS
+    /// file. Passing/skipped suites either omit the key or set it
+    /// to an empty string. Threaded into `TestRunResult.detail` so
+    /// the TUI shows only this test's failure output — not the
+    /// global stderr of the whole jest run (R5 gemini MED: the
+    /// pre-R6 runner attached global stderr to every result,
+    /// polluting passing tests' forensic view with other tests'
+    /// failure output).
+    #[serde(default)]
+    message: String,
 }
 
 /// Per-file timing from jest's `--json` reporter. Jest calls the
@@ -379,7 +390,7 @@ fn status_to_outcome(status: &str) -> TestOutcome {
     }
 }
 
-/// Parse jest's `--json` stdout into a `path → (outcome, duration_ms)`
+/// Parse jest's `--json` stdout into a `path → (outcome, duration_ms, message)`
 /// map. Returns `None` when stdout isn't valid JSON; caller surfaces
 /// that as a `Discovery` error.
 ///
@@ -387,7 +398,12 @@ fn status_to_outcome(status: &str) -> TestOutcome {
 /// the canonical jest timing field. When `perfStats` is absent
 /// (malformed output / legacy versions), duration falls back to 0
 /// rather than blocking the parse (R1 gemini MED).
-fn parse_jest_json(stdout: &str) -> Option<HashMap<String, (TestOutcome, u64)>> {
+///
+/// `message` is the per-file failure text from `testResults[].message`.
+/// Empty on pass/skip; used as `TestRunResult.detail` on fail so the
+/// TUI shows per-test forensic context instead of global stderr
+/// (R5 gemini MED).
+fn parse_jest_json(stdout: &str) -> Option<HashMap<String, (TestOutcome, u64, String)>> {
     let parsed: JestRunOutput = serde_json::from_str(stdout).ok()?;
     let map = parsed
         .test_results
@@ -396,7 +412,7 @@ fn parse_jest_json(stdout: &str) -> Option<HashMap<String, (TestOutcome, u64)>> 
             let duration_ms = fr.perf_stats.runtime;
             (
                 fr.test_file_path,
-                (status_to_outcome(&fr.status), duration_ms),
+                (status_to_outcome(&fr.status), duration_ms, fr.message),
             )
         })
         .collect();
@@ -505,52 +521,54 @@ impl TestRunner for JestRunner {
                 ))));
             }
         };
-        // Detail buffer: merge stderr into the forensic tail. stdout
-        // is jest's JSON (already parsed), so we intentionally carry
-        // only stderr — the failing assertion output lives there in
-        // `--silent` mode. `stderr_text` is only borrowed above, in
-        // the `None` arm of the `outcomes` match (which already
-        // returned), so move it instead of cloning (R2 gemini MED).
-        let detail = {
-            let mut text = stderr_text;
-            // `String::truncate` panics on non-char-boundary indices;
-            // walk back to the nearest boundary. UTF-8 codepoints
-            // are ≤4 bytes, so this terminates in ≤3 iterations
-            // (PR-E R1 gemini HIGH sibling).
-            if text.len() > MAX_DETAIL_BYTES {
-                let mut cutoff = MAX_DETAIL_BYTES;
-                while !text.is_char_boundary(cutoff) {
-                    cutoff -= 1;
-                }
-                text.truncate(cutoff);
-            }
-            if text.is_empty() {
-                None
-            } else {
-                // `Arc::<str>::from(String)` wraps the heap buffer in
-                // atomic refcount. Per-test `detail.clone()` below is
-                // an Arc-inc, not an allocation (PR-E R4 gemini MED).
-                Some(Arc::<str>::from(text))
-            }
-        };
+        // R5 gemini MED: per-test `detail` = per-file `message`
+        // from jest's `--json` output, NOT the global process
+        // stderr. Pre-R6 behavior attached the entire `stderr_text`
+        // to every `TestRunResult`, so a passing test's TUI view
+        // showed unrelated failing tests' output. Each test's
+        // `detail` now carries ONLY its own failure message (empty
+        // for passing/skipped tests → `None`). `stderr_text` remains
+        // bound above because it's consumed in the `None` arm of
+        // the earlier `parse_jest_json` match (the `Discovery(..)`
+        // error path merges it with stdout for forensic triage).
+        let _ = stderr_text; // explicitly named so a future reader sees the handoff
         let results = plan
             .tests
             .iter()
             .map(|t| {
-                let (outcome, duration_ms) = outcomes
+                let (outcome, duration_ms, message) = outcomes
                     .get(t.as_str())
                     .cloned()
-                    .unwrap_or((TestOutcome::Unknown, 0));
+                    .unwrap_or((TestOutcome::Unknown, 0, String::new()));
                 TestRunResult {
                     id: t.clone(),
                     outcome,
                     duration_ms,
-                    detail: detail.clone(),
+                    detail: truncate_detail(message),
                 }
             })
             .collect();
         Ok(TestRunSummary { results })
     }
+}
+
+/// Per-test detail truncation to `MAX_DETAIL_BYTES`. Empty input →
+/// `None` so the TUI knows to hide the detail pane entirely. UTF-8
+/// char-boundary walk-back mirrors the PR-E R1 gemini HIGH sibling
+/// (`String::truncate` panics on non-char-boundary indices; UTF-8
+/// codepoints are ≤4 bytes so this terminates in ≤3 iterations).
+fn truncate_detail(mut text: String) -> Option<Arc<str>> {
+    if text.is_empty() {
+        return None;
+    }
+    if text.len() > MAX_DETAIL_BYTES {
+        let mut cutoff = MAX_DETAIL_BYTES;
+        while !text.is_char_boundary(cutoff) {
+            cutoff -= 1;
+        }
+        text.truncate(cutoff);
+    }
+    Some(Arc::<str>::from(text))
 }
 
 #[cfg(test)]
@@ -588,11 +606,26 @@ mod tests {
             ]
         }"#;
         let map = parse_jest_json(stdout).expect("json must parse");
-        assert_eq!(map.get("/abs/a.test.js"), Some(&(TestOutcome::Pass, 0)));
-        assert_eq!(map.get("/abs/b.test.js"), Some(&(TestOutcome::Fail, 0)));
-        assert_eq!(map.get("/abs/c.test.js"), Some(&(TestOutcome::Skip, 0)));
-        assert_eq!(map.get("/abs/d.test.js"), Some(&(TestOutcome::Skip, 0)));
-        assert_eq!(map.get("/abs/e.test.js"), Some(&(TestOutcome::Skip, 0)));
+        assert_eq!(
+            map.get("/abs/a.test.js"),
+            Some(&(TestOutcome::Pass, 0, String::new()))
+        );
+        assert_eq!(
+            map.get("/abs/b.test.js"),
+            Some(&(TestOutcome::Fail, 0, String::new()))
+        );
+        assert_eq!(
+            map.get("/abs/c.test.js"),
+            Some(&(TestOutcome::Skip, 0, String::new()))
+        );
+        assert_eq!(
+            map.get("/abs/d.test.js"),
+            Some(&(TestOutcome::Skip, 0, String::new()))
+        );
+        assert_eq!(
+            map.get("/abs/e.test.js"),
+            Some(&(TestOutcome::Skip, 0, String::new()))
+        );
     }
 
     #[test]
@@ -621,11 +654,11 @@ mod tests {
         let map = parse_jest_json(stdout).expect("json must parse");
         assert_eq!(
             map.get("/abs/fast.test.js"),
-            Some(&(TestOutcome::Pass, 150))
+            Some(&(TestOutcome::Pass, 150, String::new()))
         );
         assert_eq!(
             map.get("/abs/slow.test.js"),
-            Some(&(TestOutcome::Pass, 12000))
+            Some(&(TestOutcome::Pass, 12000, String::new()))
         );
     }
 
@@ -645,7 +678,7 @@ mod tests {
         let map = parse_jest_json(stdout).expect("json must parse");
         assert_eq!(
             map.get("/abs/legacy.test.js"),
-            Some(&(TestOutcome::Pass, 0))
+            Some(&(TestOutcome::Pass, 0, String::new()))
         );
     }
 
@@ -681,7 +714,10 @@ mod tests {
             "someTopLevelAddition": "whatever"
         }"#;
         let map = parse_jest_json(stdout).expect("unknown fields must not break parse");
-        assert_eq!(map.get("/abs/a.test.js"), Some(&(TestOutcome::Pass, 0)));
+        assert_eq!(
+            map.get("/abs/a.test.js"),
+            Some(&(TestOutcome::Pass, 0, String::new()))
+        );
     }
 
     #[test]
@@ -692,6 +728,62 @@ mod tests {
         let stdout = r#"{ "success": true, "testResults": [] }"#;
         let map = parse_jest_json(stdout).expect("empty array must parse");
         assert!(map.is_empty());
+    }
+
+    #[test]
+    fn parse_jest_json_threads_per_file_message_into_tuple() {
+        // R5 gemini MED: per-test `detail` on `TestRunResult` must
+        // carry the specific file's `message` field, not the global
+        // process stderr. Verify the parser surfaces the message as
+        // the third tuple element — downstream `JestRunner::run`
+        // threads it into the per-test detail Arc.
+        let stdout = r#"{
+            "success": false,
+            "testResults": [
+                {
+                    "testFilePath": "/abs/a.test.js",
+                    "status": "failed",
+                    "message": "FAIL src/a.test.js\n  ● a › throws\n    Error: boom\n      at line 3"
+                },
+                {
+                    "testFilePath": "/abs/b.test.js",
+                    "status": "passed"
+                }
+            ]
+        }"#;
+        let map = parse_jest_json(stdout).expect("json must parse");
+        let (_, _, msg_a) = map.get("/abs/a.test.js").cloned().unwrap();
+        assert!(
+            msg_a.contains("Error: boom"),
+            "failed test's message must be threaded verbatim: {msg_a:?}"
+        );
+        // Passing test: missing `message` key defaults to empty
+        // string, which `JestRunner::run` maps to `detail = None`.
+        let (_, _, msg_b) = map.get("/abs/b.test.js").cloned().unwrap();
+        assert!(
+            msg_b.is_empty(),
+            "passing test's message must be empty (no cross-test pollution): {msg_b:?}"
+        );
+    }
+
+    #[test]
+    fn truncate_detail_empty_returns_none() {
+        assert!(truncate_detail(String::new()).is_none());
+    }
+
+    #[test]
+    fn truncate_detail_caps_at_max_and_walks_to_char_boundary() {
+        // Build a string just over MAX_DETAIL_BYTES ending in a
+        // multi-byte codepoint so naive `truncate` would panic on a
+        // non-char-boundary. The walk-back loop must step back to
+        // the previous boundary without overshooting.
+        let mut s = "a".repeat(MAX_DETAIL_BYTES - 2);
+        s.push('é'); // 2 bytes, lands at byte MAX_DETAIL_BYTES
+        s.push('é'); // 2 bytes, lands past MAX_DETAIL_BYTES
+        let out = truncate_detail(s).expect("non-empty must return Some");
+        assert!(out.len() <= MAX_DETAIL_BYTES);
+        // Output must be valid UTF-8 (implicit — Arc<str> can't carry invalid).
+        assert!(std::str::from_utf8(out.as_bytes()).is_ok());
     }
 
     #[test]
