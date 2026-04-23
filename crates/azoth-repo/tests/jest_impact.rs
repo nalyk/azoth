@@ -194,6 +194,22 @@ fn detection_workspaces_null_does_not_false_trigger() {
 }
 
 #[test]
+fn detection_jest_key_null_returns_none() {
+    // R4 gemini MED: `{"jest": null}` means the user explicitly
+    // disabled jest at the package root — detect must return
+    // `Ok(None)`, not `Ok(Some("package_json"))`. The null-safety
+    // applies to the `jest` key itself, not only to `jest.projects`
+    // and `workspaces`.
+    let td = TempDir::new().unwrap();
+    std::fs::write(
+        td.path().join("package.json"),
+        r#"{"name":"x","jest":null}"#,
+    )
+    .unwrap();
+    assert!(matches!(JestImpact::detect(td.path()), Ok(None)));
+}
+
+#[test]
 fn detection_jest_projects_null_does_not_false_trigger() {
     // R3 gemini MED sibling to the `workspaces: null` case. A
     // `{"jest": {"projects": null}}` means "no multi-project setup"

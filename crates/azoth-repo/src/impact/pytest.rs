@@ -40,7 +40,12 @@ use super::runner::{TestOutcome, TestRunResult, TestRunSummary, TestRunner};
 
 /// Selector-impl version. Bump on heuristic changes so replay can
 /// detect plan drift without re-running the selector.
-pub const PYTEST_IMPACT_VERSION: u32 = 1;
+/// Bumped 1 → 2 in PR #25 R3 when the selector's matching semantics
+/// shifted from full-node-ID substring (`t.contains(stem)`) to
+/// filename-stem + word-boundary via `word_boundary_contains`. Replays
+/// or cached plan consumers that key on this version can distinguish
+/// pre-R3 plans from the stricter post-R3 selection (codex P2 R4).
+pub const PYTEST_IMPACT_VERSION: u32 = 2;
 
 /// Forensic-detail truncation cap. `PytestRunner::run` stashes the
 /// combined stdout+stderr into `TestRunResult.detail` so the TUI
@@ -192,8 +197,19 @@ impl ImpactSelector for PytestImpact {
                 // — identical to the jest sibling; see
                 // `super::heuristic` for the class-bug rationale and
                 // the cargo sweep that closed the same gap.
+                //
+                // PR #25 R4 codex P1: pytest node IDs are
+                // `path/to/file.py::test_name[params]`. Parametrized
+                // IDs can carry `/` inside `[params]` when the param
+                // is a URL-like string (`tests/test_api.py::test_route
+                // [/v1/users]`). Applying `Path::file_name()` to the
+                // full node ID tokenises by `/` and returns the
+                // garbage tail (`users]`), not the real filename.
+                // Split on `::` first so only the filesystem-path
+                // prefix is fed to `Path::new`.
                 let t_str = t.as_str();
-                let filename_matches = Path::new(t_str)
+                let path_part = t_str.split_once("::").map(|(p, _)| p).unwrap_or(t_str);
+                let filename_matches = Path::new(path_part)
                     .file_name()
                     .and_then(|n| n.to_str())
                     .map(|n| word_boundary_contains(n, stem))

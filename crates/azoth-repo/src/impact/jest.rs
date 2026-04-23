@@ -176,9 +176,17 @@ impl JestImpact {
         // canonical monorepo shape `{ "jest": { "projects": [...] } }`
         // AND false-reject repos that use an unrelated top-level
         // `projects` field (some third-party tool's config).
+        //
+        // R4 gemini MED gap: R4 null-safed `workspaces` and
+        // `jest.projects` but not the `jest` key itself. A
+        // `{"jest": null}` in `package.json` means the user
+        // explicitly disabled jest at the package root — treat it
+        // the same as the key missing entirely. Without this guard
+        // the function returned `Ok(Some("package_json"))`, falsely
+        // claiming detection for a disabled config.
         let jest_section = match pkg.get("jest") {
-            Some(v) => v,
-            None => return Ok(None),
+            Some(v) if !v.is_null() => v,
+            _ => return Ok(None),
         };
         // Same null-safe shape as `workspaces` above (R3 gemini MED).
         if jest_section.get("projects").is_some_and(|v| !v.is_null()) {

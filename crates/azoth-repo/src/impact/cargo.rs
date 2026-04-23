@@ -46,7 +46,14 @@ use super::heuristic::word_boundary_contains;
 /// Selector-impl version. Bump whenever the ranking heuristic
 /// changes so `SessionEvent::ImpactComputed.selector_version`
 /// replays correctly reflect plan drift.
-pub const CARGO_TEST_IMPACT_VERSION: u32 = 1;
+///
+/// Bumped 1 → 2 in PR #25 R3 when the selector's matching semantics
+/// shifted from naked substring (`t.contains(stem)`) to word-boundary
+/// via `word_boundary_contains` — closing the prefix-substring class
+/// bug (stem `auth` matching `my_crate::author::tests::foo`). Replays
+/// keyed on the older version yield different test plans than the
+/// corrected v2 (codex P2 R4).
+pub const CARGO_TEST_IMPACT_VERSION: u32 = 2;
 
 /// The discoverable test set for a cargo workspace. Produced by
 /// [`discover_cargo_tests`]; accepts hand-seeded test ids in
