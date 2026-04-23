@@ -182,10 +182,11 @@ async fn selector_dedupes_across_multiple_changed_files_in_same_pkg() {
 }
 
 #[tokio::test]
-async fn selector_skips_changed_files_without_named_parent() {
-    // A bare filename at the repo root has parent="", which is
-    // structurally empty — no package association possible. Must not
-    // panic and must not pull unrelated tests.
+async fn selector_skips_non_go_root_level_files() {
+    // Non-Go files at the repo root (README.md, config.yaml, etc.)
+    // cannot affect Go test outcomes. Must not pull unrelated tests.
+    // Inverts into the root-level Go fallback below: the extension
+    // check gates which root-level files trigger select-all.
     let universe = TestUniverse::from_tests(["example.com/m/pkg/auth::TestRefresh"]);
     let sel = GoTestImpact::with_universe(std::path::PathBuf::from("/repo"), universe);
     let plan = sel
@@ -194,8 +195,58 @@ async fn selector_skips_changed_files_without_named_parent() {
         .unwrap();
     assert!(
         plan.is_empty(),
-        "empty-parent stem must short-circuit: {plan:?}"
+        "non-Go root-level file must not trigger select-all: {plan:?}"
     );
+}
+
+#[tokio::test]
+async fn selector_root_level_go_change_triggers_select_all() {
+    // R3 gemini MED on PR #26: `main.go` at the repo root has empty
+    // parent_path (no directory prefix), so R2 skipped it entirely —
+    // which silently invalidates TDAD on flat Go projects (tools,
+    // small libs). Conservative fallback: include the entire
+    // universe when any root-level `.go` file changes. Tight fix
+    // needs go.mod module-prefix parsing → v2.2.
+    let universe = TestUniverse::from_tests([
+        "example.com/m::TestBase",
+        "example.com/m/pkg/auth::TestAuth",
+        "example.com/m/pkg/db::TestDb",
+    ]);
+    let sel = GoTestImpact::with_universe(std::path::PathBuf::from("/repo"), universe);
+    let plan = sel
+        .select(&Diff::from_paths(["main.go"]), &stub_contract())
+        .await
+        .unwrap();
+    assert_eq!(
+        plan.tests.len(),
+        3,
+        "root-level .go change must select the whole universe: {plan:?}"
+    );
+    assert!(
+        plan.rationale[0].contains("select-all"),
+        "rationale must name the fallback: {:?}",
+        plan.rationale
+    );
+}
+
+#[tokio::test]
+async fn selector_root_level_go_plus_subdir_still_selects_all_dedup() {
+    // Mixed diff: main.go + pkg/auth/tokens.go. The select-all path
+    // fires first, then the parent-path path runs but its tests are
+    // already in `seen` and get skipped. Verifies no duplication.
+    let universe = TestUniverse::from_tests([
+        "example.com/m::TestBase",
+        "example.com/m/pkg/auth::TestAuth",
+    ]);
+    let sel = GoTestImpact::with_universe(std::path::PathBuf::from("/repo"), universe);
+    let plan = sel
+        .select(
+            &Diff::from_paths(["main.go", "pkg/auth/tokens.go"]),
+            &stub_contract(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(plan.tests.len(), 2, "no duplication: {plan:?}");
 }
 
 #[tokio::test]

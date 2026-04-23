@@ -187,6 +187,18 @@ impl ImpactSelector for GoTestImpact {
         // representative path here is behaviourally identical.
         let mut by_parent: Vec<(&str, &str)> = Vec::new();
         let mut parent_seen: HashSet<&str> = HashSet::new();
+        // R3 gemini MED on PR #26: a `.go` file at the repo root
+        // (e.g. `main.go` in a flat project) has empty parent_path,
+        // so R2 skipped it entirely. That invalidates TDAD for every
+        // flat project — the correct test universe subset is "all
+        // tests in the module's base package", but we can't identify
+        // the base package without parsing go.mod for the module
+        // prefix (deferred to v2.2). Conservative fallback: if any
+        // changed file is a `.go` source at the repo root, include
+        // the entire universe. Non-Go root files (README.md, config,
+        // etc.) stay skipped because they can't affect any Go
+        // package's test outcome.
+        let mut root_go_change: Option<&str> = None;
         for path in &diff.changed_files {
             // Go-native heuristic: RELATIVE parent-dir-path (full,
             // not just the last component) against the test id's
@@ -210,10 +222,34 @@ impl ImpactSelector for GoTestImpact {
             // azoth's Linux-only operational envelope).
             let parent_path = path.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
             if parent_path.is_empty() {
+                // Root-level file. Only .go matters — anything else
+                // (README, config, non-Go toolchain files) cannot
+                // affect test outcomes, so stays skipped.
+                if path.ends_with(".go") && root_go_change.is_none() {
+                    root_go_change = Some(path.as_str());
+                }
                 continue;
             }
             if parent_seen.insert(parent_path) {
                 by_parent.push((parent_path, path.as_str()));
+            }
+        }
+        // Apply the root-level .go fallback FIRST, before parent-path
+        // matching, so the entire universe gets included deterministically
+        // and the regular matching loop below only adds additional
+        // provenance for tests that also match a specific package
+        // parent. `seen` deduplicates naturally.
+        if let Some(root_path) = root_go_change {
+            for t in &self.universe.tests {
+                let t_str = t.as_str();
+                if seen.insert(t_str) {
+                    plan.tests.push(t.clone());
+                    plan.rationale.push(format!(
+                        "root-level Go change {root_path} → conservative \
+                         select-all (go.mod module-prefix parsing deferred to v2.2)"
+                    ));
+                    plan.confidence.push(1.0);
+                }
             }
         }
         for (parent_path, path) in by_parent {
@@ -259,8 +295,13 @@ pub async fn discover_go_tests(repo_root: &Path) -> Result<TestUniverse, ImpactE
     if !out.status.success() {
         let stdout = String::from_utf8_lossy(&out.stdout).to_string();
         let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+        // Cap the error body — a broken monorepo can dump multi-MB
+        // of build errors into stderr and the TUI has to render
+        // this string (R3 gemini MED on PR #26). Same 4 KiB cap
+        // as per-test detail.
+        let merged = cap_to_max_bytes(merge_pipes(&stdout, &stderr), MAX_DETAIL_BYTES);
         return Err(ImpactError::Backend(Box::new(GoTestError::Discovery(
-            merge_pipes(&stdout, &stderr),
+            merged,
         ))));
     }
     let text = String::from_utf8_lossy(&out.stdout);
@@ -514,6 +555,11 @@ impl TestRunner for GoTestRunner {
             // per_test is non-empty and this gate is skipped.
             let exit_code = out.status.code();
             if per_test.is_empty() && exit_code != Some(0) {
+                // Cap the error body — sibling site to
+                // `discover_go_tests` (R3 gemini MED on PR #26).
+                // Build-fail dumps in a bulky package can exceed MB.
+                let merged =
+                    cap_to_max_bytes(merge_pipes(&stdout_text, &stderr_text), MAX_DETAIL_BYTES);
                 return Err(ImpactError::Backend(Box::new(GoTestError::Discovery(
                     format!(
                         "go test on `{pkg}` exited {} and produced no \
@@ -521,7 +567,7 @@ impl TestRunner for GoTestRunner {
                         exit_code
                             .map(|c| c.to_string())
                             .unwrap_or_else(|| "<signal>".into()),
-                        merge_pipes(&stdout_text, &stderr_text)
+                        merged
                     ),
                 ))));
             }
@@ -569,7 +615,21 @@ impl TestRunner for GoTestRunner {
 /// that wants subtest-granular results can look up `TestParent/Sub`
 /// and get exactly that subtest's scoped output + outcome. The
 /// parent's slot is a superset, not a substitute.
+///
+/// **Two-pass structure** (R3 gemini MED on PR #26): the naive
+/// "walk ancestors per output event" shape allocates a `String`
+/// per level per event, which adds up fast on verbose test output
+/// or deep subtest trees. R3 splits into (a) a single-pass accumulator
+/// keyed on the event's own `Test` field, then (b) a finalize pass
+/// that rolls each accumulated per-test output into its ancestors
+/// — one `to_string()` allocation per ancestor, not per event.
+/// Semantically identical; locked by the existing
+/// `parse_run_ndjson_aggregates_subtest_output_into_parent` +
+/// `parse_run_ndjson_aggregates_nested_subtest_into_every_ancestor`
+/// tests.
 fn parse_run_ndjson(text: &str) -> HashMap<String, (TestOutcome, u64, String)> {
+    // First pass: accumulate each event into the specific slot named
+    // by its own `Test` field. No ancestor walk.
     let mut state: HashMap<String, (TestOutcome, u64, String)> = HashMap::new();
     for line in text.lines() {
         let line = line.trim();
@@ -586,60 +646,55 @@ fn parse_run_ndjson(text: &str) -> HashMap<String, (TestOutcome, u64, String)> {
             Some(ref t) if !t.is_empty() => t.clone(),
             _ => continue,
         };
+        let slot = state
+            .entry(test)
+            .or_insert((TestOutcome::Unknown, 0, String::new()));
         match ev.action.as_str() {
             "output" => {
-                if let Some(ref o) = ev.output {
-                    // Append to the specific test's slot.
-                    state
-                        .entry(test.clone())
-                        .or_insert((TestOutcome::Unknown, 0, String::new()))
-                        .2
-                        .push_str(o);
-                    // Walk the full ancestor chain — every `/`-
-                    // separated prefix gets the subtest's output
-                    // appended. R2 gemini MED on PR #26: R1 only
-                    // rolled up to the top-level (`TestParent`),
-                    // missing intermediate levels. For
-                    // `Test="TestA/B/C/D"` we now append to
-                    // `TestA/B/C`, `TestA/B`, and `TestA` — so
-                    // whichever granularity the caller looks up,
-                    // forensic detail is complete. Outcomes stay
-                    // scoped per-slot: Go emits pass/fail/skip at
-                    // every level that runs, so each ancestor's
-                    // own outcome event seals its slot correctly.
-                    let mut ancestor = test.as_str();
-                    while let Some((prefix, _)) = ancestor.rsplit_once('/') {
-                        state
-                            .entry(prefix.to_string())
-                            .or_insert((TestOutcome::Unknown, 0, String::new()))
-                            .2
-                            .push_str(o);
-                        ancestor = prefix;
-                    }
+                if let Some(o) = ev.output {
+                    slot.2.push_str(&o);
                 }
             }
             "pass" => {
-                let slot = state
-                    .entry(test)
-                    .or_insert((TestOutcome::Unknown, 0, String::new()));
                 slot.0 = TestOutcome::Pass;
                 slot.1 = elapsed_to_ms(ev.elapsed);
             }
             "fail" => {
-                let slot = state
-                    .entry(test)
-                    .or_insert((TestOutcome::Unknown, 0, String::new()));
                 slot.0 = TestOutcome::Fail;
                 slot.1 = elapsed_to_ms(ev.elapsed);
             }
             "skip" => {
-                let slot = state
-                    .entry(test)
-                    .or_insert((TestOutcome::Unknown, 0, String::new()));
                 slot.0 = TestOutcome::Skip;
                 slot.1 = elapsed_to_ms(ev.elapsed);
             }
             _ => {} // "run", "pause", "cont", "bench" — ignored.
+        }
+    }
+    // Second pass: roll each subtest's accumulated output up the
+    // `/`-separated ancestor chain so TestA/B/C → TestA/B, TestA.
+    // Snapshot subtest keys + contents first so we can mutate the
+    // map while iterating. Only the output (String) is cloned; the
+    // outcome + elapsed for each ancestor are sealed by that
+    // ancestor's own terminal event (emitted by Go at every level
+    // that runs), so we never copy outcomes upward.
+    //
+    // Non-subtest entries (no `/` in the key) are skipped — they
+    // have no ancestors, and they receive rolled-up output from
+    // any descendants that DO have `/` in their key.
+    let subtest_outputs: Vec<(String, String)> = state
+        .iter()
+        .filter(|(k, _)| k.contains('/'))
+        .map(|(k, v)| (k.clone(), v.2.clone()))
+        .collect();
+    for (test, output) in subtest_outputs {
+        let mut ancestor = test.as_str();
+        while let Some((prefix, _)) = ancestor.rsplit_once('/') {
+            state
+                .entry(prefix.to_string())
+                .or_insert((TestOutcome::Unknown, 0, String::new()))
+                .2
+                .push_str(&output);
+            ancestor = prefix;
         }
     }
     state
@@ -658,18 +713,34 @@ fn elapsed_to_ms(elapsed: Option<f64>) -> u64 {
 /// Per-test detail truncation to `MAX_DETAIL_BYTES`. Empty input →
 /// `None` so the TUI knows to hide the detail pane entirely. UTF-8
 /// char-boundary walk-back matches the pytest/jest pattern.
-fn truncate_detail(mut text: String) -> Option<Arc<str>> {
+fn truncate_detail(text: String) -> Option<Arc<str>> {
     if text.is_empty() {
         return None;
     }
-    if text.len() > MAX_DETAIL_BYTES {
-        let mut cutoff = MAX_DETAIL_BYTES;
+    Some(Arc::<str>::from(cap_to_max_bytes(text, MAX_DETAIL_BYTES)))
+}
+
+/// Truncate `text` to at most `max` bytes, walking back to the nearest
+/// UTF-8 char boundary. Shared helper so the Discovery error path
+/// (`discover_go_tests` + runner `Discovery(..)` branch) and the
+/// per-test-detail path (`truncate_detail`) both cap unbounded output
+/// the same way. R3 gemini MED on PR #26: discovery error merged
+/// stdout + stderr without any limit, so a workspace with heavy build
+/// errors could dump megabytes into a single error string that the TUI
+/// would then try to render.
+///
+/// Walk-back terminates in ≤3 iterations because UTF-8 codepoints are
+/// ≤4 bytes; every byte boundary is either a char boundary or at most
+/// 3 bytes inside a 4-byte codepoint.
+fn cap_to_max_bytes(mut text: String, max: usize) -> String {
+    if text.len() > max {
+        let mut cutoff = max;
         while !text.is_char_boundary(cutoff) {
             cutoff -= 1;
         }
         text.truncate(cutoff);
     }
-    Some(Arc::<str>::from(text))
+    text
 }
 
 #[cfg(test)]
@@ -981,6 +1052,34 @@ Actual JSON error: extra } somewhere
         let out = truncate_detail(s).expect("non-empty must return Some");
         assert!(out.len() <= MAX_DETAIL_BYTES);
         assert!(std::str::from_utf8(out.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn cap_to_max_bytes_caps_and_walks_to_char_boundary() {
+        // R3 gemini MED on PR #26: helper extracted so the
+        // Discovery error path + truncate_detail share a single
+        // char-boundary-safe truncation implementation. Test locks
+        // the contract in isolation (independent of truncate_detail's
+        // Option-return wrapping).
+        let mut s = "a".repeat(1022);
+        s.push('é'); // 2 bytes, lands at byte 1024
+        s.push('é'); // 2 bytes, lands past max=1024
+        let out = cap_to_max_bytes(s, 1024);
+        assert!(out.len() <= 1024);
+        // Output valid UTF-8 — implicit since String can't carry invalid.
+        assert!(std::str::from_utf8(out.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn cap_to_max_bytes_passes_through_short_input() {
+        let s = String::from("hello");
+        assert_eq!(cap_to_max_bytes(s, 1024), "hello");
+    }
+
+    #[test]
+    fn cap_to_max_bytes_handles_empty() {
+        let s = String::new();
+        assert_eq!(cap_to_max_bytes(s, 1024), "");
     }
 
     #[test]
