@@ -78,12 +78,23 @@ impl SandboxPolicy {
             Ok("tier_a" | "a" | "A") => SandboxPolicy::TierA,
             Ok("tier_b" | "b" | "B") => SandboxPolicy::TierB,
             Ok("") | Err(_) => {
-                if crate::sandbox::probe_unprivileged_userns() {
+                // `probe_unprivileged_userns_cached` forks at most
+                // once per process, so this call is fork-free after
+                // the first hit (ideally pre-warmed from main()).
+                // The tracing::warn only fires on the first-call
+                // degradation — after that `get_or_init` returns the
+                // cached false without re-logging, which keeps the
+                // log clean even for bots / CLI that call `from_env`
+                // per tool invocation.
+                if crate::sandbox::probe_unprivileged_userns_cached() {
                     SandboxPolicy::TierA
                 } else {
-                    tracing::warn!(
-                        "unprivileged user-ns unavailable; sandbox default degrades to Off"
-                    );
+                    static WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                    WARNED.get_or_init(|| {
+                        tracing::warn!(
+                            "unprivileged user-ns unavailable; sandbox default degrades to Off"
+                        );
+                    });
                     SandboxPolicy::Off
                 }
             }

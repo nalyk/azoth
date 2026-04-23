@@ -630,7 +630,9 @@ fn build_bash_command(
     #[cfg(target_os = "linux")]
     {
         use crate::sandbox::tier_a::{build_jailed_tokio_command, SpawnOptions};
-        use crate::sandbox::{probe_fuse_overlayfs, probe_unprivileged_userns, OverlayWorkspace};
+        use crate::sandbox::{
+            probe_fuse_overlayfs, probe_unprivileged_userns_cached, OverlayWorkspace,
+        };
 
         // v2.1 codex re-review P2: Tier A requires unprivileged
         // CLONE_NEWUSER. Hosts without user-ns support (old
@@ -639,7 +641,14 @@ fn build_bash_command(
         // that environment makes the tool unusable. Tier B already
         // degrades to Tier A when fuse-overlayfs is missing; apply
         // the same pattern for Tier A → Off.
-        if !probe_unprivileged_userns() {
+        //
+        // `probe_unprivileged_userns_cached` is the tokio-safe form
+        // (PR-H R1 gemini HIGH + codex P1): the raw probe's `fork()`
+        // violates its single-threaded SAFETY invariant under the
+        // Tokio multi-thread runtime, so every probe call site in
+        // the runtime (here + `SandboxPolicy::from_env`) goes
+        // through the OnceLock cache, pre-warmed from `fn main()`.
+        if !probe_unprivileged_userns_cached() {
             tracing::warn!(
                 policy = ?policy,
                 "AZOTH_SANDBOX requested but host lacks unprivileged CLONE_NEWUSER; degrading to Off"

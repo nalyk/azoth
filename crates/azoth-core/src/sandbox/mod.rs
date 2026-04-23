@@ -38,7 +38,7 @@ pub mod tier_b;
 pub mod tier_cd;
 
 pub use policy::SandboxPolicy;
-pub use probe::probe_unprivileged_userns;
+pub use probe::{probe_unprivileged_userns, probe_unprivileged_userns_cached, warm_userns_cache};
 pub use tier_a::TierA;
 #[cfg(target_os = "linux")]
 pub use tier_b::OverlayWorkspace;
