@@ -101,6 +101,75 @@ func TestGamma(t *testing.T) { t.Fatal("boom") }
 }
 
 #[tokio::test]
+#[cfg_attr(
+    not(feature = "live-tools"),
+    ignore = "requires the `go` toolchain on PATH"
+)]
+async fn gotest_runner_preserves_plan_order_across_packages() {
+    // R6 codex P2 on PR #26: pre-R6 the runner grouped tests into a
+    // BTreeMap by package path, executed package-by-package in
+    // alphabetical order, and emitted results in that order — not
+    // in plan.tests order. Callers that zip plan metadata
+    // (rationale, confidence) with the summary by index got
+    // misaligned attribution.
+    //
+    // This fixture puts two packages in a Go module where the
+    // package names DO NOT match the plan order: package `z_last`
+    // comes alphabetically after `a_first`, but the plan lists
+    // z_last's test FIRST. The runner must emit z_last first.
+    let td = TempDir::new().unwrap();
+    std::fs::write(
+        td.path().join("go.mod"),
+        "module example.com/probe\n\ngo 1.21\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(td.path().join("a_first")).unwrap();
+    std::fs::write(
+        td.path().join("a_first/a_test.go"),
+        "package a_first\n\nimport \"testing\"\n\nfunc TestAlpha(t *testing.T) { _ = t }\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(td.path().join("z_last")).unwrap();
+    std::fs::write(
+        td.path().join("z_last/z_test.go"),
+        "package z_last\n\nimport \"testing\"\n\nfunc TestZeta(t *testing.T) { _ = t }\n",
+    )
+    .unwrap();
+
+    let runner = GoTestRunner::default();
+    // Plan order: z_last BEFORE a_first. Alphabetical package-batch
+    // order is the inverse.
+    let plan = TestPlan {
+        tests: vec![
+            TestId::new("example.com/probe/z_last::TestZeta"),
+            TestId::new("example.com/probe/a_first::TestAlpha"),
+        ],
+        rationale: vec!["z-rationale".into(), "a-rationale".into()],
+        confidence: vec![1.0; 2],
+        selector_version: 1,
+    };
+
+    let summary = runner.run(td.path(), &plan).await.unwrap();
+    assert_eq!(summary.len(), 2);
+    // Results must match plan.tests order — not package-alphabetical.
+    assert_eq!(
+        summary.results[0].id.as_str(),
+        "example.com/probe/z_last::TestZeta",
+        "first result must match plan.tests[0]: got {:?}",
+        summary.results[0].id
+    );
+    assert_eq!(
+        summary.results[1].id.as_str(),
+        "example.com/probe/a_first::TestAlpha",
+        "second result must match plan.tests[1]: got {:?}",
+        summary.results[1].id
+    );
+    // Outcomes exist (both tests pass trivially).
+    assert_eq!(summary.results[0].outcome, TestOutcome::Pass);
+    assert_eq!(summary.results[1].outcome, TestOutcome::Pass);
+}
+
+#[tokio::test]
 async fn gotest_runner_empty_plan_short_circuits() {
     // Safe without `live-tools` — `plan.is_empty()` short-circuits
     // before any `Command::spawn`.

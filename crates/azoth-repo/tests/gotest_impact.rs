@@ -230,6 +230,77 @@ async fn selector_root_level_go_change_triggers_select_all() {
 }
 
 #[tokio::test]
+async fn selector_go_mod_at_root_triggers_select_all() {
+    // R6 codex P1 on PR #26: a dependency bump in `go.mod` can
+    // change build/test behaviour across every package in the
+    // module, so it belongs in the root-level select-all bucket
+    // alongside root `.go` files. Pre-R6 the `.ends_with(".go")`
+    // gate skipped `go.mod` entirely — silent zero-test TDAD on
+    // dep upgrades.
+    let universe = TestUniverse::from_tests([
+        "example.com/m::TestBase",
+        "example.com/m/pkg/auth::TestAuth",
+    ]);
+    let sel = GoTestImpact::with_universe(std::path::PathBuf::from("/repo"), universe);
+    let plan = sel
+        .select(&Diff::from_paths(["go.mod"]), &stub_contract())
+        .await
+        .unwrap();
+    assert_eq!(
+        plan.tests.len(),
+        2,
+        "go.mod change must select the entire universe: {plan:?}"
+    );
+    assert!(plan.rationale[0].contains("go.mod"));
+}
+
+#[tokio::test]
+async fn selector_go_sum_at_root_triggers_select_all() {
+    // Sibling to go.mod: `go.sum` version-locks dependencies; any
+    // change invalidates the build on the next `go test`. Must
+    // also trigger select-all.
+    let universe =
+        TestUniverse::from_tests(["example.com/m::TestBase", "example.com/m/pkg/db::TestDb"]);
+    let sel = GoTestImpact::with_universe(std::path::PathBuf::from("/repo"), universe);
+    let plan = sel
+        .select(&Diff::from_paths(["go.sum"]), &stub_contract())
+        .await
+        .unwrap();
+    assert_eq!(
+        plan.tests.len(),
+        2,
+        "go.sum change must select the entire universe: {plan:?}"
+    );
+}
+
+#[tokio::test]
+async fn selector_nested_go_mod_does_not_trigger_select_all() {
+    // Defensive — a vendored submodule with its own `vendor/foo/go.mod`
+    // is NOT a root-level change. The helper tests for exact
+    // equality against `"go.mod"` / `"go.sum"`, not substring match,
+    // so nested module metadata falls through to the normal
+    // parent-path matching. That matches the case `rsplit_once('/')`
+    // gives parent `vendor/foo` — which word_boundary_contains
+    // against test package paths may or may not match other tests,
+    // but specifically it won't blow away the whole universe.
+    let universe = TestUniverse::from_tests([
+        "example.com/m::TestBase",
+        "example.com/m/pkg/auth::TestAuth",
+    ]);
+    let sel = GoTestImpact::with_universe(std::path::PathBuf::from("/repo"), universe);
+    let plan = sel
+        .select(&Diff::from_paths(["vendor/foo/go.mod"]), &stub_contract())
+        .await
+        .unwrap();
+    // The parent_path is `vendor/foo`, which won't match any test
+    // in the synthetic universe. Expect empty plan.
+    assert!(
+        plan.is_empty() || plan.tests.len() < 2,
+        "nested go.mod must not trigger select-all: {plan:?}"
+    );
+}
+
+#[tokio::test]
 async fn selector_root_level_go_plus_subdir_still_selects_all_dedup() {
     // Mixed diff: main.go + pkg/auth/tokens.go. The select-all path
     // fires first, then the parent-path path runs but its tests are

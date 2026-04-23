@@ -204,9 +204,18 @@ impl ImpactSelector for GoTestImpact {
         // the base package without parsing go.mod for the module
         // prefix (deferred to v2.2). Conservative fallback: if any
         // changed file is a `.go` source at the repo root, include
-        // the entire universe. Non-Go root files (README.md, config,
-        // etc.) stay skipped because they can't affect any Go
-        // package's test outcome.
+        // the entire universe.
+        //
+        // R6 codex P1 on PR #26: `go.mod` and `go.sum` belong to the
+        // same fallback bucket. A dependency version bump or a new
+        // `require` directive can change build / test behaviour
+        // across EVERY package in the module (transitively, through
+        // whatever API surface changed). Treating them as "non-Go
+        // root files" and skipping produced a false-negative: TDAD
+        // on a dep update would select zero tests, silently passing
+        // a broken upgrade. Adding them here mirrors Go's own
+        // compilation invalidation rules (`go build` reruns all
+        // packages when `go.mod` changes).
         let mut root_go_change: Option<&str> = None;
         for path in &diff.changed_files {
             // Go-native heuristic: RELATIVE parent-dir-path (full,
@@ -231,10 +240,12 @@ impl ImpactSelector for GoTestImpact {
             // azoth's Linux-only operational envelope).
             let parent_path = path.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
             if parent_path.is_empty() {
-                // Root-level file. Only .go matters — anything else
-                // (README, config, non-Go toolchain files) cannot
-                // affect test outcomes, so stays skipped.
-                if path.ends_with(".go") && root_go_change.is_none() {
+                // Root-level file. Three triggers for the select-all
+                // fallback (see block comment above): `.go` source,
+                // `go.mod`, `go.sum`. Everything else (README, CI
+                // config, docs) cannot affect Go test outcomes, so
+                // stays skipped.
+                if root_go_change.is_none() && is_root_level_go_trigger(path) {
                     root_go_change = Some(path.as_str());
                 }
                 continue;
@@ -254,8 +265,9 @@ impl ImpactSelector for GoTestImpact {
                 if seen.insert(t_str) {
                     plan.tests.push(t.clone());
                     plan.rationale.push(format!(
-                        "root-level Go change {root_path} → conservative \
-                         select-all (go.mod module-prefix parsing deferred to v2.2)"
+                        "root-level Go module change {root_path} → \
+                         conservative select-all (go.mod module-prefix \
+                         parsing deferred to v2.2)"
                     ));
                     plan.confidence.push(1.0);
                 }
@@ -280,6 +292,18 @@ impl ImpactSelector for GoTestImpact {
         debug_assert!(plan.is_well_formed());
         Ok(plan)
     }
+}
+
+/// True when `path` is a root-level change that should trigger the
+/// select-all fallback: a `.go` source (flat-project `main.go`), or
+/// `go.mod` / `go.sum` (module metadata whose changes invalidate
+/// builds across every package). R6 codex P1 on PR #26 added the
+/// `go.mod` / `go.sum` arms — Go's own build system reruns all
+/// packages when those files change, so TDAD must mirror the
+/// invalidation surface. Other root files (README, CI config, etc.)
+/// cannot affect Go test outcomes and stay out of the fallback.
+fn is_root_level_go_trigger(path: &str) -> bool {
+    path == "go.mod" || path == "go.sum" || path.ends_with(".go")
 }
 
 /// Shell out to `go test -json -list '.*' ./...` inside `repo_root`
@@ -519,7 +543,21 @@ impl TestRunner for GoTestRunner {
             }
         }
 
-        let mut results: Vec<TestRunResult> = Vec::new();
+        // R6 codex P2 on PR #26: the pre-R6 `results.push(...)` per
+        // package emitted test outcomes in `BTreeMap` iteration
+        // order (alphabetical by package path), NOT the caller's
+        // `plan.tests` order. Other runners (pytest, cargo) preserve
+        // plan order, and the `TestRunSummary` contract is that
+        // callers can zip plan metadata (rationale, confidence) with
+        // run results by index. Reordering quietly broke that zip.
+        //
+        // Fix: accumulate all per-package outcomes into a map keyed
+        // by full test id (package + `::` + name), then iterate
+        // `plan.tests` IN ORDER at the end to build the results Vec.
+        // Tests missing from the map (runner didn't emit them for
+        // any reason) land as `Unknown`, identical to the per-pkg
+        // `get().unwrap_or(Unknown)` fallback that already existed.
+        let mut outcomes: HashMap<String, (TestOutcome, u64, String)> = HashMap::new();
         for (pkg, names) in by_pkg {
             // `^(A|B|C)$` filter — `go test -run` takes a regex, so
             // anchoring with `^...$` prevents partial-name matches
@@ -587,6 +625,33 @@ impl TestRunner for GoTestRunner {
                 // Build-fail dumps in a bulky package can exceed MB.
                 let merged =
                     cap_to_max_bytes(merge_pipes(&stdout_text, &stderr_text), MAX_DETAIL_BYTES);
+                //
+                // **Partial-failure resilience deferred to v2.2**
+                // (R6 gemini MED on PR #26): we currently fail-fast
+                // on a per-package build/toolchain error, which
+                // discards results from successfully completed
+                // packages earlier in the `by_pkg` loop AND skips
+                // subsequent packages. Gemini's suggestion is to
+                // collect Unknown outcomes for failing packages,
+                // thread the error into `detail`, and continue.
+                // Reasons to defer:
+                //
+                // 1. The "every package fails" case (broken go.mod,
+                //    missing toolchain) produces N × Unknown with
+                //    N identical error bodies — strictly worse UX
+                //    than a single clear Discovery error.
+                // 2. The "one package fails, others succeed" case
+                //    does benefit from partial results, but the
+                //    v2.1 selector caps plans at ~1-3 packages per
+                //    turn so the hit rate is low.
+                // 3. Changing the failure semantic without dogfood
+                //    data risks cementing the wrong default; v2.2
+                //    with PR-J eval measures will tell us whether
+                //    partial-collection wins often enough.
+                //
+                // Revisit trigger: PR-J dogfood run showing ≥ 2
+                // plans per 10 where a single package failure
+                // blocked useful results from sibling packages.
                 return Err(ImpactError::Backend(Box::new(GoTestError::Discovery(
                     format!(
                         "go test on `{pkg}` exited {} and produced no \
@@ -600,19 +665,30 @@ impl TestRunner for GoTestRunner {
             }
 
             for name in names {
-                let id = TestId::new(format!("{pkg}{ID_SEP}{name}"));
-                let (outcome, duration_ms, detail) =
+                let id_str = format!("{pkg}{ID_SEP}{name}");
+                let entry =
                     per_test
                         .get(name)
                         .cloned()
                         .unwrap_or((TestOutcome::Unknown, 0, String::new()));
-                results.push(TestRunResult {
-                    id,
-                    outcome,
-                    duration_ms,
-                    detail: truncate_detail(detail),
-                });
+                outcomes.insert(id_str, entry);
             }
+        }
+        // Emit results in `plan.tests` order — not `BTreeMap`
+        // iteration order (R6 codex P2 on PR #26). Missing ids land
+        // as Unknown, matching the per-pkg fallback shape.
+        let mut results: Vec<TestRunResult> = Vec::with_capacity(plan.tests.len());
+        for t in &plan.tests {
+            let (outcome, duration_ms, detail) =
+                outcomes
+                    .remove(t.as_str())
+                    .unwrap_or((TestOutcome::Unknown, 0, String::new()));
+            results.push(TestRunResult {
+                id: t.clone(),
+                outcome,
+                duration_ms,
+                detail: truncate_detail(detail),
+            });
         }
         Ok(TestRunSummary { results })
     }
@@ -722,11 +798,19 @@ fn parse_run_ndjson(text: &str) -> HashMap<String, (TestOutcome, u64, String)> {
     // Non-subtest entries (no `/` in the key) are skipped — they
     // have no ancestors, and they receive rolled-up output from
     // any descendants that DO have `/` in their key.
-    let subtest_outputs: Vec<(String, String)> = state
+    let mut subtest_outputs: Vec<(String, String)> = state
         .iter()
         .filter(|(k, _)| k.contains('/'))
         .map(|(k, v)| (k.clone(), v.2.clone()))
         .collect();
+    // Sort by subtest name so the rollup appends to each parent in a
+    // deterministic order (R6 gemini MED on PR #26). `HashMap`
+    // iteration is random, which made a parent's accumulated detail
+    // vary run-to-run: `TestParent`'s slot could end with either
+    // `Sub1\nSub2\n` or `Sub2\nSub1\n`. Byte-stable forensic output
+    // matters for cache-prefix stability of the evidence lane, and
+    // also for reproducible test assertions on aggregated detail.
+    subtest_outputs.sort_by(|a, b| a.0.cmp(&b.0));
     for (test, output) in subtest_outputs {
         let mut ancestor = test.as_str();
         while let Some((prefix, _)) = ancestor.rsplit_once('/') {
@@ -793,15 +877,27 @@ fn cap_to_max_bytes(mut text: String, max: usize) -> String {
 /// Capping in-place before the snapshot bounds the clone to
 /// `MAX_DETAIL_BYTES`.
 ///
-/// Walk-back terminates in ≤3 iterations (UTF-8 codepoints are ≤4
-/// bytes) so this is O(1) per call regardless of the input length.
+/// **Keeps the TAIL, discards the head** (R6 gemini HIGH on PR #26):
+/// Go test output + build errors put the diagnostically important
+/// content — stack traces, assertion messages, `--- FAIL: TestFoo`
+/// markers, `FAIL:` summary — at the END of the buffer. `=== RUN`
+/// lines, setup prints, and irrelevant `t.Logf` noise land at the
+/// start. A head-keep strategy in a 4 KiB cap on 40 KiB of verbose
+/// `t.Logf` output would show only the setup noise and drop the
+/// assertion that actually explains the failure.
+///
+/// Implementation: walk FORWARD from `text.len() - max` to the next
+/// char boundary (≤3 iterations since UTF-8 codepoints are ≤4 bytes),
+/// then drain everything before it. O(n) in the drained prefix but
+/// linear with input size — acceptable because call sites already
+/// accept unbounded input (we're fixing that here).
 fn cap_in_place(text: &mut String, max: usize) {
     if text.len() > max {
-        let mut cutoff = max;
-        while !text.is_char_boundary(cutoff) {
-            cutoff -= 1;
+        let mut start = text.len() - max;
+        while !text.is_char_boundary(start) {
+            start += 1;
         }
-        text.truncate(cutoff);
+        text.drain(..start);
     }
 }
 
@@ -1152,6 +1248,54 @@ Actual JSON error: extra } somewhere
     }
 
     #[test]
+    fn parse_run_ndjson_subtest_rollup_is_deterministic() {
+        // R6 gemini MED on PR #26: subtest_outputs was iterated in
+        // HashMap order → parent's accumulated detail could land as
+        // `Sub1\nSub2\n` on one run and `Sub2\nSub1\n` on the next.
+        // Sort-by-key before the rollup loop ensures byte-stable
+        // output. Test: parse identical input repeatedly, assert the
+        // parent's detail string is byte-identical every time.
+        let ndjson = r#"{"Action":"run","Package":"p","Test":"TestParent"}
+{"Action":"run","Package":"p","Test":"TestParent/A"}
+{"Action":"output","Package":"p","Test":"TestParent/A","Output":"A-OUTPUT\n"}
+{"Action":"pass","Package":"p","Test":"TestParent/A","Elapsed":0}
+{"Action":"run","Package":"p","Test":"TestParent/B"}
+{"Action":"output","Package":"p","Test":"TestParent/B","Output":"B-OUTPUT\n"}
+{"Action":"pass","Package":"p","Test":"TestParent/B","Elapsed":0}
+{"Action":"run","Package":"p","Test":"TestParent/C"}
+{"Action":"output","Package":"p","Test":"TestParent/C","Output":"C-OUTPUT\n"}
+{"Action":"pass","Package":"p","Test":"TestParent/C","Elapsed":0}
+{"Action":"pass","Package":"p","Test":"TestParent","Elapsed":0}"#;
+        // Run the parser 5 times. All parent slots must be
+        // byte-identical. Without the sort, HashMap order bias could
+        // make this flaky (not guaranteed to fail, but the sort
+        // makes it guaranteed to pass).
+        let mut parents = Vec::new();
+        for _ in 0..5 {
+            let m = parse_run_ndjson(ndjson);
+            parents.push(m.get("TestParent").cloned().unwrap().2);
+        }
+        for i in 1..parents.len() {
+            assert_eq!(
+                parents[0], parents[i],
+                "parent slot must be deterministic; got {:?} vs {:?}",
+                parents[0], parents[i]
+            );
+        }
+        // Sort-by-key order is `TestParent/A` → `TestParent/B` →
+        // `TestParent/C`, so the accumulated output's A-OUTPUT must
+        // appear before B-OUTPUT, which must appear before C-OUTPUT.
+        let parent = &parents[0];
+        let pos_a = parent.find("A-OUTPUT").expect("A-OUTPUT present");
+        let pos_b = parent.find("B-OUTPUT").expect("B-OUTPUT present");
+        let pos_c = parent.find("C-OUTPUT").expect("C-OUTPUT present");
+        assert!(
+            pos_a < pos_b && pos_b < pos_c,
+            "sorted order must be A < B < C in parent; got A={pos_a} B={pos_b} C={pos_c}"
+        );
+    }
+
+    #[test]
     fn elapsed_to_ms_clamps_weird_values() {
         assert_eq!(elapsed_to_ms(None), 0);
         assert_eq!(elapsed_to_ms(Some(f64::NAN)), 0);
@@ -1191,6 +1335,60 @@ Actual JSON error: extra } somewhere
         assert!(out.len() <= 1024);
         // Output valid UTF-8 — implicit since String can't carry invalid.
         assert!(std::str::from_utf8(out.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn cap_keeps_tail_not_head() {
+        // R6 gemini HIGH on PR #26: the failure-relevant content
+        // (`--- FAIL:` marker, assertion message, stack trace) lives
+        // at the END of Go test output. Head-keeping in a 4 KiB cap
+        // would drop it whenever a test logs verbose setup noise
+        // first. This test simulates a realistic shape: 4 KiB of
+        // `t.Logf` noise followed by a 100-byte failure trailer.
+        let noise = "NOISE LINE\n".repeat(400); // ~4.4 KiB of setup noise
+        let trailer =
+            "    test.go:42: assertion failed: expected X got Y\n--- FAIL: TestFoo (0.01s)\n";
+        let full = format!("{noise}{trailer}");
+        assert!(full.len() > MAX_DETAIL_BYTES);
+
+        let capped = cap_to_max_bytes(full.clone(), MAX_DETAIL_BYTES);
+        assert!(capped.len() <= MAX_DETAIL_BYTES);
+        // The trailer (failure text) MUST survive.
+        assert!(
+            capped.contains("assertion failed"),
+            "tail-keep must preserve assertion: {capped}"
+        );
+        assert!(
+            capped.contains("--- FAIL: TestFoo"),
+            "tail-keep must preserve FAIL marker: {capped}"
+        );
+        // The noise prefix MUST be discarded (mostly).
+        assert!(
+            !capped.starts_with("NOISE LINE"),
+            "head-keep shape: the cap should have dropped the prefix"
+        );
+    }
+
+    #[test]
+    fn cap_tail_walk_forward_to_char_boundary() {
+        // When `text.len() - max` lands mid-codepoint, the walk-
+        // forward must advance to the next char boundary — never
+        // return invalid UTF-8. Construct input where the desired
+        // start position is inside a 2-byte `é`.
+        let mut s = String::new();
+        s.push('é'); // bytes 0-1
+        s.push_str(&"a".repeat(10)); // bytes 2-11
+                                     // Cap to 10: start = 12 - 10 = 2, already on boundary. No walk.
+        let out = cap_to_max_bytes(s.clone(), 10);
+        assert_eq!(out, "aaaaaaaaaa");
+
+        // Cap to 11: start = 12 - 11 = 1, mid-codepoint. Walk forward
+        // to byte 2 (past `é`), giving the 10 `a`s.
+        let out = cap_to_max_bytes(s, 11);
+        assert!(std::str::from_utf8(out.as_bytes()).is_ok());
+        assert!(out.len() <= 11);
+        // The result must not contain the broken `é` prefix.
+        assert!(!out.starts_with('\u{fffd}'));
     }
 
     #[test]
