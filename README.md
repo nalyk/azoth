@@ -55,7 +55,7 @@ Azoth was written by someone who stopped accepting those four assumptions and bu
 
 **It will not let the model decide whether to write a file.** The `AuthorityEngine` holds the capability tokens. Every tool call passes through a dispatcher that checks approvals and effect-class policy before the shell ever sees a command. `y / s / n` at the approval modal means *once / session / deny*, and the session grant is a typed token in memory, not a convention.
 
-**It will not let bash escape your filesystem when the sandbox is on.** `AZOTH_SANDBOX=tier_a` spawns bash inside an unprivileged user namespace, a net namespace, and a Landlock V2 policy. `tier_b` adds a `fuse-overlayfs` merged mount so writes stage on success and discard on failure. Tested against symlink escape, absolute-target escape, and FIFO stage-back hangs. See the tests section for names.
+**It will not let bash escape your filesystem.** v2.1 flipped the default — `AZOTH_SANDBOX` is `tier_a` unless you explicitly opt out with `AZOTH_SANDBOX=off`. `tier_a` spawns bash inside an unprivileged user namespace, a net namespace, and a Landlock V2 policy. `tier_b` adds a `fuse-overlayfs` merged mount so writes stage on success and discard on failure. Tested against symlink escape, absolute-target escape, and FIFO stage-back hangs. See the tests section for names.
 
 **It will not forget what it did.** Every turn emits `turn_started` and exactly one of `turn_committed`, `turn_aborted`, or `turn_interrupted`. Tool outputs, packet evidence, and artifacts over a few kilobytes are content-addressed by SHA256 and stored out of band. `azoth replay <run_id> --forensic` reconstructs the whole run, including aborted turns, with `non_replayable: true` annotations where reuse would be unsafe.
 
@@ -150,11 +150,16 @@ A contract that says `budget: { apply_local: 3, apply_repo: 0 }` means the model
 
 ### Sandbox tiers
 
-Opt in via `AZOTH_SANDBOX`.
+Select tier via `AZOTH_SANDBOX`.
+
+#### v2.1 default change
+
+`AZOTH_SANDBOX` now defaults to `tier_a` (was `off` in v2.0.x). Bash executions route through the user-ns + Landlock jail unless you opt out with `AZOTH_SANDBOX=off`. On hosts without unprivileged user-namespace support (old kernels, locked-down containers, some CI runners), the runtime logs a warning and falls back to `off` automatically.
 
 | Value             | Mechanism                                                                                                                                  |
 |-------------------|--------------------------------------------------------------------------------------------------------------------------------------------|
-| (unset) / `off`   | No sandbox. Tools run in the azoth process. (Default.)                                                                                     |
+| (unset) / empty   | **Default (v2.1).** `tier_a` on hosts with unprivileged user-ns; `off` with a warning otherwise.                                           |
+| `off`             | No sandbox. Tools run in the azoth process. Explicit opt-out.                                                                              |
 | `tier_a`          | Unprivileged user-ns + net-ns + Landlock V2 FS rules.                                                                                      |
 | `tier_b`          | Tier A + `fuse-overlayfs` merged mount of the repo; bash's cwd is the merged view. Writes stage back on success; failed runs discard.      |
 
@@ -185,14 +190,14 @@ This section exists because the rest of the README is confident and you deserve 
 - Drive a real coding agent from a terminal against Anthropic, OpenAI, OpenRouter, or a local Ollama endpoint.
 - Contract-driven turns commit or abort. Sessions persist as JSONL. `/resume` brings back a prior session with full forensic detail.
 - Four-lane composite retrieval (FTS5 full-text, tree-sitter symbols, ripgrep, co-edit graph) with RRF fusion and per-lane token budget.
-- Opt-in Linux sandbox (`AZOTH_SANDBOX=tier_a|tier_b`) puts bash inside user-ns + net-ns + Landlock, with optional `fuse-overlayfs` for Tier-B stage-and-commit.
+- Linux sandbox is on by default (v2.1): bash runs inside user-ns + net-ns + Landlock, with `AZOTH_SANDBOX=tier_b` opting into `fuse-overlayfs` stage-and-commit, and `AZOTH_SANDBOX=off` opting out entirely.
 - TDAD test-impact selection via `cargo test --list` (opt-in, `AZOTH_IMPACT_ENABLED=true`) surfaces only the tests a given diff actually exercises.
 - `azoth eval run --live-retrieval <repo>` scores the retrieval plane against a seed corpus with localization@k.
 
 ### What is deliberately limited
 
 - **Retrieval is keyword-grade for prose queries.** The composite works well when the prompt contains identifiers or paths. Natural-language "explain what happens when X" prompts lose signal. A query-planning and embedding lane is v2.5 scope.
-- **`AZOTH_SANDBOX` defaults to off.** The jail imposes a ~100 ms overhead per tool call and needs unprivileged user namespaces (check with `unshare -U true`). Opt in when you want the enforcement.
+- **Sandbox imposes ~100 ms overhead per tool call** and needs unprivileged user namespaces (check with `unshare -U true`). v2.1 flips the default on; set `AZOTH_SANDBOX=off` to opt back out. Hosts without user-ns support degrade to `off` automatically with a warning.
 - **Tree-sitter symbols: Rust only.** Python, TypeScript, Go, and Java grammars are v2.1 scope. Other languages still get FTS, ripgrep, and co-edit graph.
 - **TDAD: `cargo test` only.** pytest, jest, and `go test` adapters are v2.1 scope.
 - **Linux only.** Sandbox tiers and `fuse-overlayfs` are Linux-specific. macOS and Windows builds currently fail at the `sandbox` module. WSL2 works.

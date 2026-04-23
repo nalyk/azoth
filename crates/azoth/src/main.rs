@@ -113,6 +113,15 @@ enum EvalCommand {
 
 fn main() {
     let cli = Cli::parse();
+
+    // v2.1-H: pre-warm the user-ns probe cache from single-threaded
+    // startup context. Every downstream sandbox call site
+    // (`SandboxPolicy::from_env`, `bash::build_bash_command`) reads
+    // through the cache, so no tokio worker thread ever pays the
+    // fork — respecting the probe's SAFETY precondition.
+    // First call pays one fork; subsequent calls are atomic loads.
+    azoth_core::sandbox::warm_userns_cache();
+
     let is_tui = matches!(
         cli.command,
         None | Some(Command::Tui) | Some(Command::Resume { .. })
