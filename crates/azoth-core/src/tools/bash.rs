@@ -860,9 +860,11 @@ mod tests {
     //
     // Three tests prove the sandbox wiring actually enforces rather
     // than compiling cleanly and doing nothing:
-    //   1. Default policy (AZOTH_SANDBOX unset) writes to the real
-    //      repo root. Regression guard against accidentally flipping
-    //      the default.
+    //   1. Explicit `AZOTH_SANDBOX=off` writes to the real repo root.
+    //      Pins Off semantics (direct host command, no jail). v2.0.x
+    //      this guarded the "don't accidentally flip the default"
+    //      contract; v2.1-H deliberately flipped the default to
+    //      TierA, so the test now pins the explicit opt-out path.
     //   2. Tier A blocks a write to /etc/passwd via Landlock. This
     //      is the load-bearing "sandbox actually enforces" assertion.
     //   3. Tier B isolates writes in the fuse-overlayfs upper layer
@@ -888,8 +890,16 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn bash_default_policy_still_writes_to_repo_root_regression_guard() {
-        std::env::remove_var("AZOTH_SANDBOX");
+    async fn bash_explicit_off_still_writes_to_repo_root_regression_guard() {
+        // v2.1-H: the default flipped from Off → TierA. Pre-setting
+        // AZOTH_SANDBOX=off here preserves this test's intent — it
+        // pins Off semantics (direct host command, no jail) against
+        // accidental regressions in the Off branch of
+        // `build_bash_command` / `execute`. The "default writes to
+        // repo root" contract was the pre-v2.1-H assertion; it moved
+        // to `sandbox_default_tier_a.rs` (integration test) once the
+        // flip shipped.
+        std::env::set_var("AZOTH_SANDBOX", "off");
 
         let dir = tempdir().unwrap();
         let root = tokio::fs::canonicalize(dir.path()).await.unwrap();
@@ -902,10 +912,11 @@ mod tests {
             json!({ "command": "echo hello > marker.txt" }),
         );
         let out = dispatch_tool(&disp, "bash", raw, &ctx).await.unwrap();
+        std::env::remove_var("AZOTH_SANDBOX");
         assert_eq!(out["exit_code"], 0);
         assert!(
             root.join("marker.txt").exists(),
-            "default policy must write to the real repo root"
+            "explicit AZOTH_SANDBOX=off must write to the real repo root"
         );
     }
 

@@ -1,9 +1,13 @@
 //! Runtime sandbox policy — what tools should actually enforce
 //! when the dispatcher hands them an `ApplyLocal` / `ApplyRepo`
-//! effect class. Driven by the `AZOTH_SANDBOX` env var so the
-//! default (OFF) preserves the 349-green-tests invariant v2.0.0
-//! shipped with; operators explicitly opt in to subprocess
-//! isolation.
+//! effect class. Driven by the `AZOTH_SANDBOX` env var.
+//!
+//! v2.0.x default was `Off` (opt-in isolation). v2.1-H flipped it:
+//! when the env var is unset or empty, the runtime now routes bash
+//! through TierA (user-ns + Landlock) if the host supports
+//! unprivileged `CLONE_NEWUSER`, and falls back to `Off` with a
+//! `tracing::warn` otherwise. Operators opt OUT via
+//! `AZOTH_SANDBOX=off`.
 //!
 //! ## Why this lives on a free enum rather than `ExecutionContext`
 //!
@@ -16,8 +20,11 @@
 //!
 //! ## Semantics
 //!
-//! `Off` is the default (empty / missing / `off` env value). Tools
-//! run in-process, same as v2.0.0.
+//! Unset / empty env → `TierA` on hosts with unprivileged user-ns,
+//! `Off` otherwise (with a `tracing::warn` on degradation). Explicit
+//! `off` → `Off`. Explicit `tier_a` / `tier_b` → that tier.
+//!
+//! `Off` routes tools through a direct host command, same as v2.0.0.
 //!
 //! `TierA` sends out-of-process tools (bash today; future scripted
 //! writes) through the user-ns + net-ns + Landlock + (permissive)
@@ -51,15 +58,35 @@ pub enum SandboxPolicy {
 }
 
 impl SandboxPolicy {
-    /// Read `AZOTH_SANDBOX`. Unknown values and parse errors both
-    /// degrade to `Off` with a warning — the v2.0.0 default wins
-    /// when in doubt. Operators who care will see the warning in
-    /// the TUI log and fix their env var.
+    /// Read `AZOTH_SANDBOX`.
+    ///
+    /// - `off` → `Off` (explicit opt-out).
+    /// - `tier_a` / `a` / `A` → `TierA`.
+    /// - `tier_b` / `b` / `B` → `TierB`.
+    /// - unset / empty → v2.1-H default: `TierA` if the host supports
+    ///   unprivileged `CLONE_NEWUSER`, else `Off` with a
+    ///   `tracing::warn`. This degradation matches how bash.rs
+    ///   already falls back when `spawn_jailed` can't construct a
+    ///   user-namespace — "best-effort with tracing::warn on
+    ///   missing deps".
+    /// - any other value → `Off` with a warning (unknown setting is
+    ///   safer to treat as "operator-intended opt-out" than to
+    ///   silently route through an unexpected tier).
     pub fn from_env() -> Self {
         match std::env::var("AZOTH_SANDBOX").as_deref() {
-            Ok("" | "off") | Err(_) => SandboxPolicy::Off,
+            Ok("off") => SandboxPolicy::Off,
             Ok("tier_a" | "a" | "A") => SandboxPolicy::TierA,
             Ok("tier_b" | "b" | "B") => SandboxPolicy::TierB,
+            Ok("") | Err(_) => {
+                if crate::sandbox::probe_unprivileged_userns() {
+                    SandboxPolicy::TierA
+                } else {
+                    tracing::warn!(
+                        "unprivileged user-ns unavailable; sandbox default degrades to Off"
+                    );
+                    SandboxPolicy::Off
+                }
+            }
             Ok(other) => {
                 tracing::warn!(
                     value = other,
@@ -90,17 +117,28 @@ mod tests {
     /// Running multi-threaded would still be safe thanks to the
     /// per-test cleanup, but we match the repo-wide convention.
     #[test]
-    fn from_env_defaults_to_off_when_unset() {
+    fn from_env_defaults_to_tier_a_when_userns_available() {
+        // v2.1-H: default flipped Off → TierA (with graceful Off
+        // fallback on hosts that can't `unshare(CLONE_NEWUSER)`).
+        // We can't force-disable user-ns for the "else" branch in a
+        // unit test, so the assertion is probe-conditional.
         std::env::remove_var("AZOTH_SANDBOX");
-        assert_eq!(SandboxPolicy::from_env(), SandboxPolicy::Off);
-        assert!(SandboxPolicy::from_env().is_off());
+        let got = SandboxPolicy::from_env();
+        let want = if crate::sandbox::probe_unprivileged_userns() {
+            SandboxPolicy::TierA
+        } else {
+            SandboxPolicy::Off
+        };
+        assert_eq!(got, want);
+        std::env::set_var("AZOTH_SANDBOX", "");
+        let got = SandboxPolicy::from_env();
+        assert_eq!(got, want, "empty env should behave the same as unset");
+        std::env::remove_var("AZOTH_SANDBOX");
     }
 
     #[test]
-    fn from_env_parses_off_empty_and_unknown_as_off() {
+    fn from_env_parses_explicit_off_and_unknown_as_off() {
         std::env::set_var("AZOTH_SANDBOX", "off");
-        assert_eq!(SandboxPolicy::from_env(), SandboxPolicy::Off);
-        std::env::set_var("AZOTH_SANDBOX", "");
         assert_eq!(SandboxPolicy::from_env(), SandboxPolicy::Off);
         std::env::set_var("AZOTH_SANDBOX", "garbage");
         assert_eq!(SandboxPolicy::from_env(), SandboxPolicy::Off);
