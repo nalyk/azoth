@@ -176,6 +176,17 @@ impl ImpactSelector for GoTestImpact {
         // `HashSet<&str>` borrows from `self.universe` — zero-alloc
         // dedupe, same as PR-E/F.
         let mut seen: HashSet<&str> = HashSet::new();
+        // Dedupe parent_name → representative changed-file path. R1
+        // gemini MED on PR #26: N changed files × M tests is O(N*M)
+        // with repeated redundant work when multiple changed files
+        // map to the same package directory. Collapsing to
+        // unique-parent-names first drops the outer loop to
+        // O(unique_parents × M) without changing the semantic — the
+        // dedupe on `seen` already kept only the FIRST changed file's
+        // rationale for each matched test, so recording the
+        // representative path here is behaviourally identical.
+        let mut by_parent: Vec<(&str, &str)> = Vec::new();
+        let mut parent_seen: HashSet<&str> = HashSet::new();
         for path in &diff.changed_files {
             // Go-native heuristic: parent-dir-name against package path.
             // See module doc for why this differs from jest/pytest's
@@ -184,6 +195,11 @@ impl ImpactSelector for GoTestImpact {
             if parent_name.is_empty() {
                 continue;
             }
+            if parent_seen.insert(parent_name) {
+                by_parent.push((parent_name, path.as_str()));
+            }
+        }
+        for (parent_name, path) in by_parent {
             for t in &self.universe.tests {
                 let t_str = t.as_str();
                 // Package path is everything left of `::`. Missing
@@ -276,27 +292,42 @@ struct GoTestEvent {
     elapsed: Option<f64>,
 }
 
-/// True when `line` matches a Go test function name — `TestFoo`,
-/// `BenchmarkFoo`, or `ExampleFoo` with a Go-identifier-start char
-/// after the prefix. Looser checks like `starts_with("Test")` would
-/// accept `"Testing helper: ..."` or `"TestMain with "` (the magic
-/// function) which aren't real test listings.
+/// True when `line` matches a Go test function name that is
+/// RUNNABLE via `go test -run`. Looser checks like `starts_with("Test")`
+/// would accept `"Testing helper: ..."` or `"TestMain with "` (the
+/// magic function) which aren't real test listings.
+///
+/// Rules per `go help testflag` and the testing package source:
+///
+/// - `TestXxx` / `FuzzXxx` — tail char must be uppercase, digit, or
+///   underscore. Bare `Test` / `Fuzz` (no tail) are rejected by Go's
+///   own test matcher, so we reject them here too.
+/// - `ExampleXxx` OR bare `Example` — the bare form is a package-
+///   level runnable example and is a first-class `go test -list`
+///   output (codex P2 on PR #26). Tail char, if present, follows the
+///   same uppercase/digit/underscore rule.
+/// - `Benchmark*` — excluded entirely. `go test -run` does NOT execute
+///   benchmarks (only `-bench` does per `go help testflag`). Including
+///   them in discovery makes the runner report every benchmark as
+///   `Unknown` with stdout "no tests to run" (codex P2 on PR #26).
+///   Re-visit in v2.2 when a `-bench`-aware runner path is wired.
 fn is_test_name_line(line: &str) -> bool {
-    for prefix in ["Test", "Benchmark", "Example", "Fuzz"] {
-        if let Some(tail) = line.strip_prefix(prefix) {
-            // `TestFoo` requires the char after `Test` to be an
-            // uppercase letter, underscore, or digit (Go test naming
-            // convention — see testing.matchTests). `Test` alone or
-            // `Testx` (lowercase) are rejected by `go test` itself.
-            // Underscore permitted for subtest table names (rare but
-            // legal).
-            if let Some(c) = tail.chars().next() {
-                if c.is_ascii_uppercase() || c == '_' || c.is_ascii_digit() {
-                    return true;
-                }
-            }
-            return false;
+    for prefix in ["Test", "Example", "Fuzz"] {
+        let Some(tail) = line.strip_prefix(prefix) else {
+            continue;
+        };
+        // Bare `Example` is a valid package-level runnable example.
+        // Bare `Test` / `Fuzz` are not. Short-circuit on empty tail
+        // for Example only.
+        if tail.is_empty() {
+            return prefix == "Example";
         }
+        if let Some(c) = tail.chars().next() {
+            if c.is_ascii_uppercase() || c == '_' || c.is_ascii_digit() {
+                return true;
+            }
+        }
+        return false;
     }
     false
 }
@@ -385,6 +416,29 @@ impl TestRunner for GoTestRunner {
         // Group tests by package so we issue one `go test -json -run`
         // per package. BTreeMap for deterministic iteration (matters
         // for the integration test's ordering asserts).
+        //
+        // **Parallel execution deferred to v2.2** (gemini MED on
+        // PR #26 R0). Running packages sequentially is
+        // `N_packages × per-package-runtime` on the wall clock. A
+        // `join_all` / concurrent-stream rewrite would cut that to
+        // `max(per-package-runtime) + dispatch overhead`, a real win
+        // when plans span many packages. Reasons to defer:
+        //
+        // 1. v2.1 plans are single-digit packages typically (selector
+        //    emits ≤100 tests, batched by parent-dir ≈ 1-3 packages).
+        //    Serial cost is ~1-5s total — below user-perceptible
+        //    friction. The parallel version pays a complexity tax
+        //    (tokio::spawn per pkg, ordered `results` merge, error
+        //    propagation across tasks) that isn't earning its keep.
+        // 2. `go test` itself already parallelizes within a package
+        //    via `t.Parallel()`. Cross-package parallelism mainly
+        //    helps when each package's test suite is fast-but-numerous,
+        //    which is a pattern we haven't seen in dogfood yet.
+        // 3. Revisit trigger: dogfood eval seed (PR-J) will measure
+        //    real plan shapes; if avg packages-per-plan exceeds 4 OR
+        //    p95 wall-time exceeds 10s, rewrite with a bounded-
+        //    concurrency stream (not naive join_all — that lets a
+        //    slow package starve `results` ordering).
         let mut by_pkg: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
         for t in &plan.tests {
             if let Some((pkg, name)) = t.as_str().split_once(ID_SEP) {
@@ -437,12 +491,24 @@ impl TestRunner for GoTestRunner {
             // outcomes, so `per_test` stays empty and every plan id
             // would otherwise silently degrade to Unknown — making
             // the caller unable to distinguish "tests not run" from
-            // "tests ran and passed". Exit 0/1 are the sanctioned
-            // pass/any-fail codes; anything else signals a toolchain
-            // problem (see `cmd/go` source: errExitCode uses 2 for
-            // usage errors, 1 for test failure).
+            // "tests ran and passed".
+            //
+            // R1 gemini HIGH + codex P1 on PR #26: Go returns exit
+            // code 1 for BOTH test failures AND build failures. My
+            // R0 gate `!= Some(1)` skipped the error path in the
+            // build-fail case (empty per_test + exit=1 → gate
+            // bypassed → all plan ids silently became Unknown).
+            // Verified empirically with an `undefined: X` fixture:
+            // stdout carries `build-output` + `build-fail` +
+            // package-level `fail` events, no `Test` field
+            // anywhere, exit code = 1.
+            //
+            // Fix: any non-zero exit with empty per_test is a
+            // Discovery error. Test-failure case stays correct
+            // because failing tests DO emit per-test events, so
+            // per_test is non-empty and this gate is skipped.
             let exit_code = out.status.code();
-            if per_test.is_empty() && exit_code != Some(0) && exit_code != Some(1) {
+            if per_test.is_empty() && exit_code != Some(0) {
                 return Err(ImpactError::Backend(Box::new(GoTestError::Discovery(
                     format!(
                         "go test on `{pkg}` exited {} and produced no \
@@ -482,6 +548,22 @@ impl TestRunner for GoTestRunner {
 /// Per-test `detail` is accumulated from `output` events that carry
 /// the test's name. Final `pass`/`fail`/`skip` event seals the outcome
 /// and records `Elapsed` (Go emits seconds as f64; we convert to ms).
+///
+/// **Subtest aggregation** (gemini HIGH on PR #26 R0): Go's `t.Run`
+/// emits events with `Test="Parent/Sub"`. The caller looks up results
+/// by the top-level name (from `-list`, which only emits top-level),
+/// so subtest `output` events (which carry the actual failure text
+/// `    test.go:7: sub boom`) would be invisible to the TUI if we only
+/// keyed on the full name. Fix: for every event, ALSO append its
+/// `output` into the top-level parent's slot. Outcome events
+/// (`pass`/`fail`/`skip`) stay scoped to their own test — parent
+/// outcomes are sealed by Go's own parent-level event that always
+/// fires after the last subtest.
+///
+/// Both slots are still populated independently, so a future caller
+/// that wants subtest-granular results can look up `TestParent/Sub`
+/// and get exactly that subtest's scoped output + outcome. The
+/// parent's slot is a superset, not a substitute.
 fn parse_run_ndjson(text: &str) -> HashMap<String, (TestOutcome, u64, String)> {
     let mut state: HashMap<String, (TestOutcome, u64, String)> = HashMap::new();
     for line in text.lines() {
@@ -499,24 +581,49 @@ fn parse_run_ndjson(text: &str) -> HashMap<String, (TestOutcome, u64, String)> {
             Some(ref t) if !t.is_empty() => t.clone(),
             _ => continue,
         };
-        let slot = state
-            .entry(test)
-            .or_insert((TestOutcome::Unknown, 0, String::new()));
+        // Top-level name: everything before the first `/`. For
+        // non-subtest events this equals `test`. For `TestParent/Sub`
+        // it's `TestParent`.
+        let top_level = test.split_once('/').map(|(p, _)| p.to_string());
+
         match ev.action.as_str() {
             "output" => {
-                if let Some(o) = ev.output {
-                    slot.2.push_str(&o);
+                if let Some(ref o) = ev.output {
+                    // Append to the specific test's slot.
+                    state
+                        .entry(test.clone())
+                        .or_insert((TestOutcome::Unknown, 0, String::new()))
+                        .2
+                        .push_str(o);
+                    // Also append to the parent's slot so the
+                    // top-level lookup sees subtest output.
+                    if let Some(ref parent) = top_level {
+                        state
+                            .entry(parent.clone())
+                            .or_insert((TestOutcome::Unknown, 0, String::new()))
+                            .2
+                            .push_str(o);
+                    }
                 }
             }
             "pass" => {
+                let slot = state
+                    .entry(test)
+                    .or_insert((TestOutcome::Unknown, 0, String::new()));
                 slot.0 = TestOutcome::Pass;
                 slot.1 = elapsed_to_ms(ev.elapsed);
             }
             "fail" => {
+                let slot = state
+                    .entry(test)
+                    .or_insert((TestOutcome::Unknown, 0, String::new()));
                 slot.0 = TestOutcome::Fail;
                 slot.1 = elapsed_to_ms(ev.elapsed);
             }
             "skip" => {
+                let slot = state
+                    .entry(test)
+                    .or_insert((TestOutcome::Unknown, 0, String::new()));
                 slot.0 = TestOutcome::Skip;
                 slot.1 = elapsed_to_ms(ev.elapsed);
             }
@@ -560,13 +667,47 @@ mod tests {
     #[test]
     fn is_test_name_line_accepts_canonical_prefixes() {
         assert!(is_test_name_line("TestFoo"));
-        assert!(is_test_name_line("BenchmarkBar"));
         assert!(is_test_name_line("ExampleBaz"));
         assert!(is_test_name_line("FuzzQux"));
         // Subtest-style underscore (rare but legal).
         assert!(is_test_name_line("Test_foo"));
         // Digit after prefix (some test-generator conventions).
         assert!(is_test_name_line("Test2"));
+    }
+
+    #[test]
+    fn is_test_name_line_accepts_bare_example() {
+        // R1 codex P2 on PR #26: `func Example()` is a valid
+        // package-level runnable example. `go test -list` emits the
+        // bare `Example` name; my R0 parser rejected it because the
+        // tail-char rule required a suffix. Verified empirically
+        // with go 1.25.6: a package containing a bare `Example()`
+        // with valid `// Output:` comment lists cleanly as `Example`.
+        assert!(is_test_name_line("Example"));
+    }
+
+    #[test]
+    fn is_test_name_line_rejects_bare_test_and_fuzz() {
+        // Unlike Example, bare `Test` / `Fuzz` are not valid test
+        // function names — Go's testing package requires a tail char
+        // for those. Rejecting them protects against false positives
+        // on prose that happens to start with `Test`/`Fuzz`.
+        assert!(!is_test_name_line("Test"));
+        assert!(!is_test_name_line("Fuzz"));
+    }
+
+    #[test]
+    fn is_test_name_line_rejects_benchmarks() {
+        // R1 codex P2 on PR #26: `go test -run` does NOT execute
+        // benchmarks (only `-bench` does per `go help testflag`).
+        // My R0 discovery included `BenchmarkXxx` in the universe,
+        // which meant the runner would then report every selected
+        // benchmark id as `Unknown` with stdout "no tests to run"
+        // (verified with go 1.25.6 on PR #26). Until v2.2 adds a
+        // `-bench`-aware runner path, benchmarks are excluded from
+        // discovery entirely.
+        assert!(!is_test_name_line("BenchmarkFoo"));
+        assert!(!is_test_name_line("Benchmark"));
     }
 
     #[test]
@@ -579,16 +720,23 @@ mod tests {
         assert!(!is_test_name_line("Testx"));
         // Empty.
         assert!(!is_test_name_line(""));
-        // Just the prefix with nothing after.
-        assert!(!is_test_name_line("Test"));
     }
 
     #[test]
     fn parse_list_ndjson_extracts_named_tests_with_package_prefix() {
         // Canonical `go test -json -list .*` stream (abbreviated).
+        // `BenchmarkGamma` MUST NOT appear in the universe — R1
+        // codex P2 on PR #26: benchmarks need `-bench` not `-run`,
+        // so including them in discovery just pollutes the plan
+        // with ids the runner can't execute.
+        // `Example` (bare) MUST appear — R1 codex P2 on PR #26: it's
+        // a first-class package-level example.
         let ndjson = r#"{"Action":"start","Package":"example.com/foo"}
 {"Action":"output","Package":"example.com/foo","Output":"TestAlpha\n"}
 {"Action":"output","Package":"example.com/foo","Output":"TestBeta\n"}
+{"Action":"output","Package":"example.com/foo","Output":"Example\n"}
+{"Action":"output","Package":"example.com/foo","Output":"ExampleFoo\n"}
+{"Action":"output","Package":"example.com/foo","Output":"FuzzBaz\n"}
 {"Action":"output","Package":"example.com/foo","Output":"ok  \texample.com/foo\t0.003s\n"}
 {"Action":"pass","Package":"example.com/foo","Elapsed":0.004}
 {"Action":"start","Package":"example.com/bar"}
@@ -601,8 +749,12 @@ mod tests {
             vec![
                 "example.com/foo::TestAlpha".to_string(),
                 "example.com/foo::TestBeta".to_string(),
-                "example.com/bar::BenchmarkGamma".to_string(),
-            ]
+                "example.com/foo::Example".to_string(),
+                "example.com/foo::ExampleFoo".to_string(),
+                "example.com/foo::FuzzBaz".to_string(),
+                // BenchmarkGamma deliberately absent — see comment.
+            ],
+            "benchmarks must be excluded + bare Example must be present"
         );
     }
 
@@ -688,6 +840,70 @@ Actual JSON error: extra } somewhere
 {"Action":"fail","Package":"p","Elapsed":0.005}"#;
         let m = parse_run_ndjson(ndjson);
         assert!(m.is_empty());
+    }
+
+    #[test]
+    fn parse_run_ndjson_aggregates_subtest_output_into_parent() {
+        // R1 gemini HIGH on PR #26: `t.Run` emits subtest events
+        // with `Test="Parent/Sub"`. The `TestPlan` only carries
+        // top-level names (from `-list`), so subtest `output` events
+        // — which carry the ACTUAL failure text (`sub_test.go:7: sub
+        // boom`) — were dropped when the runner looked up results
+        // by the top-level name. Fix: append subtest output into the
+        // parent's slot too, so the top-level lookup sees the full
+        // forensic trace.
+        //
+        // Captured verbatim from go 1.25.6 on PR #26 verification:
+        // TestParent with two subtests Sub1 (pass) and Sub2 (fail),
+        // where Sub2 calls `t.Fatal("sub boom")`.
+        let ndjson = r#"{"Action":"run","Package":"p","Test":"TestParent"}
+{"Action":"output","Package":"p","Test":"TestParent","Output":"=== RUN   TestParent\n"}
+{"Action":"run","Package":"p","Test":"TestParent/Sub1"}
+{"Action":"output","Package":"p","Test":"TestParent/Sub1","Output":"=== RUN   TestParent/Sub1\n"}
+{"Action":"output","Package":"p","Test":"TestParent/Sub1","Output":"--- PASS: TestParent/Sub1 (0.00s)\n"}
+{"Action":"pass","Package":"p","Test":"TestParent/Sub1","Elapsed":0}
+{"Action":"run","Package":"p","Test":"TestParent/Sub2"}
+{"Action":"output","Package":"p","Test":"TestParent/Sub2","Output":"    sub_test.go:7: sub boom\n"}
+{"Action":"output","Package":"p","Test":"TestParent/Sub2","Output":"--- FAIL: TestParent/Sub2 (0.00s)\n"}
+{"Action":"fail","Package":"p","Test":"TestParent/Sub2","Elapsed":0}
+{"Action":"output","Package":"p","Test":"TestParent","Output":"--- FAIL: TestParent (0.00s)\n"}
+{"Action":"fail","Package":"p","Test":"TestParent","Elapsed":0.003}"#;
+        let m = parse_run_ndjson(ndjson);
+
+        // Parent's outcome sealed by Go's parent-level `fail` event.
+        let parent = m.get("TestParent").expect("parent must be present");
+        assert_eq!(parent.0, TestOutcome::Fail);
+        assert_eq!(parent.1, 3);
+        // Parent detail must carry the SUBTEST failure text — that's
+        // the regression this test locks.
+        assert!(
+            parent.2.contains("sub boom"),
+            "parent detail missing subtest failure text: {:?}",
+            parent.2
+        );
+        assert!(
+            parent.2.contains("--- FAIL: TestParent/Sub2"),
+            "parent detail missing subtest fail marker: {:?}",
+            parent.2
+        );
+        // And it must still carry the parent's own events.
+        assert!(
+            parent.2.contains("=== RUN   TestParent\n"),
+            "parent detail missing its own run marker: {:?}",
+            parent.2
+        );
+
+        // Subtest slots are still populated independently — a
+        // future caller doing subtest-granular lookup gets accurate
+        // scoped results. Sub1 passes, Sub2 fails.
+        let sub1 = m.get("TestParent/Sub1").expect("sub1 must be present");
+        assert_eq!(sub1.0, TestOutcome::Pass);
+        let sub2 = m.get("TestParent/Sub2").expect("sub2 must be present");
+        assert_eq!(sub2.0, TestOutcome::Fail);
+        assert!(
+            sub2.2.contains("sub boom"),
+            "subtest-scoped detail must contain its own failure text"
+        );
     }
 
     #[test]
