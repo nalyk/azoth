@@ -357,10 +357,11 @@ async fn indexer_origin_is_accepted_by_tool_that_explicitly_permits_it() {
 
 #[tokio::test]
 async fn dispatcher_refuses_tier_d_effect_via_sandbox_gate() {
-    // AZOTH_SANDBOX=off must not short-circuit the test; ensure it's
-    // unset. Tests run `--test-threads=1` per workspace policy so this
-    // is safe.
-    std::env::remove_var("AZOTH_SANDBOX");
+    // AZOTH_SANDBOX=off must not short-circuit the test. Pre-2026-04-24
+    // the comment here claimed `--test-threads=1` as the invariant — that
+    // was a lie: cargo test defaults to parallel, and the parallel-safe
+    // fix is the crate-wide env guard at `crate::test_support`.
+    let _env = crate::test_support::SandboxEnvGuard::unset();
 
     struct TierDOnly;
 
@@ -414,7 +415,7 @@ async fn dispatcher_sandbox_off_env_skips_the_check() {
     // Opt-out path: `AZOTH_SANDBOX=off` bypasses the gate. This is
     // load-bearing for dev/test hosts that can't initialise the real
     // sandbox layer (CI containers, WSL variants).
-    std::env::set_var("AZOTH_SANDBOX", "off");
+    let _env = crate::test_support::SandboxEnvGuard::tier("off");
 
     struct TierDAllowed;
 
@@ -449,10 +450,9 @@ async fn dispatcher_sandbox_off_env_skips_the_check() {
     let raw = Tainted::new(Origin::ModelOutput, json!({}));
     let out = dispatch_tool(&disp, "tier_d_allowed_under_off", raw, &ctx).await;
 
-    // Cleanup BEFORE any assertion so failures don't leak env state
-    // into the remaining tests in this process.
-    std::env::remove_var("AZOTH_SANDBOX");
-
+    // `_env` drops at scope exit and cleans AZOTH_SANDBOX under the
+    // shared lock — no explicit remove_var needed. Previously a
+    // panicking assertion could skip cleanup and leak env state.
     let out = out.expect("AZOTH_SANDBOX=off must bypass the gate");
     assert_eq!(out, json!("ran"));
 }
@@ -462,7 +462,7 @@ async fn dispatcher_allows_tier_a_observe_tools() {
     // Positive companion: a tool with `EffectClass::Observe` (Tier A)
     // MUST NOT be blocked. Pins the gate as "deny unavailable tiers",
     // not "deny all tools".
-    std::env::remove_var("AZOTH_SANDBOX");
+    let _env = crate::test_support::SandboxEnvGuard::unset();
 
     struct ObserveNoop;
 

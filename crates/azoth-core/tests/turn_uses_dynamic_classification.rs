@@ -79,14 +79,28 @@ fn capped_contract(goal: &str) -> Contract {
     c
 }
 
+/// Tiny inline cleanup guard. This file has a single test today
+/// and is its own integration-test binary — no cross-binary race
+/// is possible because cargo runs each `tests/*.rs` in its own
+/// process, and within the binary there is only one test. The
+/// guard is here so adding a second test tomorrow doesn't
+/// silently regress into a parallel-env race; see the crate-wide
+/// env guard at `src/test_support.rs` for the lib unit-test path.
+struct SandboxEnvCleanup;
+impl Drop for SandboxEnvCleanup {
+    fn drop(&mut self) {
+        std::env::remove_var("AZOTH_SANDBOX");
+    }
+}
+
 #[tokio::test]
 async fn bare_bash_read_only_does_not_bump_budget() {
-    // SAFETY: set BEFORE any parallel test reads it. `cargo test`
-    // runs integration tests each in their own process, so env-var
-    // bleed into sibling *_ctx.rs tests is impossible here — and
-    // even if a dispatcher retry fired on a container path, `off`
-    // is the safest default.
+    // `off` is load-bearing: with the v2.1-H default of `tier_a`,
+    // the dispatcher would spin up user-namespace sandboxing, which
+    // is irrelevant to what this test validates (the bash classifier
+    // should mark `ls` as `observe` regardless of sandbox tier).
     std::env::set_var("AZOTH_SANDBOX", "off");
+    let _sandbox_cleanup = SandboxEnvCleanup;
 
     let dir = tempdir().unwrap();
     let repo_root = tokio::fs::canonicalize(dir.path()).await.unwrap();

@@ -792,6 +792,13 @@ mod tests {
         .build()
     }
 
+    // Shared env-guard lives in `crate::test_support` so every lib unit
+    // test (bash.rs, red_team.rs, sandbox/policy.rs) takes the same
+    // static Mutex. Sibling sweep 2026-04-24 — pre-fix red_team.rs + policy.rs
+    // still raced against these tier-B tests because they only
+    // cooperated with each other. See `pattern_audit_sibling_sites_on_class_bugs`.
+    use crate::test_support::SandboxEnvGuard;
+
     #[tokio::test]
     async fn echo_hello() {
         let dir = tempdir().unwrap();
@@ -936,7 +943,7 @@ mod tests {
         // repo root" contract was the pre-v2.1-H assertion; it moved
         // to `sandbox_default_tier_a.rs` (integration test) once the
         // flip shipped.
-        std::env::set_var("AZOTH_SANDBOX", "off");
+        let _env = SandboxEnvGuard::tier("off");
 
         let dir = tempdir().unwrap();
         let root = tokio::fs::canonicalize(dir.path()).await.unwrap();
@@ -949,7 +956,6 @@ mod tests {
             json!({ "command": "echo hello > marker.txt" }),
         );
         let out = dispatch_tool(&disp, "bash", raw, &ctx).await.unwrap();
-        std::env::remove_var("AZOTH_SANDBOX");
         assert_eq!(out["exit_code"], 0);
         assert!(
             root.join("marker.txt").exists(),
@@ -963,7 +969,7 @@ mod tests {
         if sandbox_skip() {
             return;
         }
-        std::env::set_var("AZOTH_SANDBOX", "tier_a");
+        let _env = SandboxEnvGuard::tier("tier_a");
 
         let dir = tempdir().unwrap();
         let root = tokio::fs::canonicalize(dir.path()).await.unwrap();
@@ -978,7 +984,6 @@ mod tests {
             }),
         );
         let out = dispatch_tool(&disp, "bash", raw, &ctx).await.unwrap();
-        std::env::remove_var("AZOTH_SANDBOX");
 
         // Load-bearing assertion: the host file must not exist.
         // The bash may exit 0 because `echo done` follows the
@@ -1018,7 +1023,7 @@ mod tests {
             eprintln!("skip: fuse-overlayfs not on PATH");
             return;
         }
-        std::env::set_var("AZOTH_SANDBOX", "tier_b");
+        let _env = SandboxEnvGuard::tier("tier_b");
 
         let dir = tempdir().unwrap();
         let root = tokio::fs::canonicalize(dir.path()).await.unwrap();
@@ -1036,7 +1041,6 @@ mod tests {
             }),
         );
         let out = dispatch_tool(&disp, "bash", raw, &ctx).await.unwrap();
-        std::env::remove_var("AZOTH_SANDBOX");
 
         assert_eq!(out["exit_code"], 0, "bash succeeded");
         assert!(
@@ -1076,7 +1080,7 @@ mod tests {
             eprintln!("skip: fuse-overlayfs not on PATH");
             return;
         }
-        std::env::set_var("AZOTH_SANDBOX", "tier_b");
+        let _env = SandboxEnvGuard::tier("tier_b");
 
         let dir = tempdir().unwrap();
         let root = tokio::fs::canonicalize(dir.path()).await.unwrap();
@@ -1094,7 +1098,6 @@ mod tests {
             }),
         );
         let out = dispatch_tool(&disp, "bash", raw, &ctx).await.unwrap();
-        std::env::remove_var("AZOTH_SANDBOX");
 
         assert_eq!(out["exit_code"], 17);
         assert!(
@@ -1128,7 +1131,7 @@ mod tests {
             eprintln!("skip: fuse-overlayfs not on PATH");
             return;
         }
-        std::env::set_var("AZOTH_SANDBOX", "tier_b");
+        let _env = SandboxEnvGuard::tier("tier_b");
 
         let dir = tempdir().unwrap();
         let root = tokio::fs::canonicalize(dir.path()).await.unwrap();
@@ -1146,7 +1149,6 @@ mod tests {
             json!({ "command": "rm to_delete.txt && echo gone" }),
         );
         let out = dispatch_tool(&disp, "bash", raw, &ctx).await.unwrap();
-        std::env::remove_var("AZOTH_SANDBOX");
 
         assert_eq!(out["exit_code"], 0, "bash rm succeeded");
         assert!(
@@ -1189,7 +1191,7 @@ mod tests {
             eprintln!("skip: fuse-overlayfs not on PATH");
             return;
         }
-        std::env::set_var("AZOTH_SANDBOX", "tier_b");
+        let _env = SandboxEnvGuard::tier("tier_b");
 
         let dir = tempdir().unwrap();
         let root = tokio::fs::canonicalize(dir.path()).await.unwrap();
@@ -1206,7 +1208,6 @@ mod tests {
             json!({ "command": "ln -s target.txt link.txt" }),
         );
         let out = dispatch_tool(&disp, "bash", raw, &ctx).await.unwrap();
-        std::env::remove_var("AZOTH_SANDBOX");
 
         assert_eq!(out["exit_code"], 0, "bash ln -s succeeded");
         // Real repo must now have a symlink at link.txt, not a
@@ -1256,7 +1257,7 @@ mod tests {
             eprintln!("skip: fuse-overlayfs not on PATH");
             return;
         }
-        std::env::set_var("AZOTH_SANDBOX", "tier_b");
+        let _env = SandboxEnvGuard::tier("tier_b");
 
         let dir = tempdir().unwrap();
         let root = tokio::fs::canonicalize(dir.path()).await.unwrap();
@@ -1275,7 +1276,6 @@ mod tests {
             json!({ "command": "ln -s /etc leak && ls leak/passwd >/dev/null 2>&1 || true" }),
         );
         let out = dispatch_tool(&disp, "bash", raw, &ctx).await.unwrap();
-        std::env::remove_var("AZOTH_SANDBOX");
 
         assert_eq!(out["exit_code"], 0, "bash ln -s succeeded");
         // Load-bearing assertion: the symlink may exist in the
@@ -1329,7 +1329,7 @@ mod tests {
             eprintln!("skip: fuse-overlayfs not on PATH");
             return;
         }
-        std::env::set_var("AZOTH_SANDBOX", "tier_b");
+        let _env = SandboxEnvGuard::tier("tier_b");
 
         let dir = tempdir().unwrap();
         let root = tokio::fs::canonicalize(dir.path()).await.unwrap();
@@ -1339,7 +1339,6 @@ mod tests {
         disp.register(BashTool);
         let raw = Tainted::new(Origin::ModelOutput, json!({ "command": "ln -s /etc leak" }));
         let out = dispatch_tool(&disp, "bash", raw, &ctx).await.unwrap();
-        std::env::remove_var("AZOTH_SANDBOX");
 
         assert_eq!(out["exit_code"], 0, "bash ln -s succeeded");
 
@@ -1388,7 +1387,7 @@ mod tests {
             eprintln!("skip: fuse-overlayfs not on PATH");
             return;
         }
-        std::env::set_var("AZOTH_SANDBOX", "tier_b");
+        let _env = SandboxEnvGuard::tier("tier_b");
 
         let dir = tempdir().unwrap();
         let root = tokio::fs::canonicalize(dir.path()).await.unwrap();
@@ -1404,7 +1403,6 @@ mod tests {
             json!({ "command": "ln -s ../../../../../../../../../../../../../../../../../../../../etc escaped" }),
         );
         let out = dispatch_tool(&disp, "bash", raw, &ctx).await.unwrap();
-        std::env::remove_var("AZOTH_SANDBOX");
 
         assert_eq!(out["exit_code"], 0, "bash ln -s succeeded");
 
@@ -1450,7 +1448,7 @@ mod tests {
             eprintln!("skip: fuse-overlayfs not on PATH");
             return;
         }
-        std::env::set_var("AZOTH_SANDBOX", "tier_b");
+        let _env = SandboxEnvGuard::tier("tier_b");
 
         let dir = tempdir().unwrap();
         let root = tokio::fs::canonicalize(dir.path()).await.unwrap();
@@ -1470,7 +1468,6 @@ mod tests {
             json!({ "command": "echo payload > foo.txt && ln -s foo.txt link" }),
         );
         let out = dispatch_tool(&disp, "bash", raw, &ctx).await.unwrap();
-        std::env::remove_var("AZOTH_SANDBOX");
 
         assert_eq!(out["exit_code"], 0, "bash echo+ln succeeded");
 
@@ -1537,7 +1534,7 @@ mod tests {
             eprintln!("skip: fuse-overlayfs not on PATH");
             return;
         }
-        std::env::set_var("AZOTH_SANDBOX", "tier_b");
+        let _env = SandboxEnvGuard::tier("tier_b");
 
         let dir = tempdir().unwrap();
         let root = tokio::fs::canonicalize(dir.path()).await.unwrap();
@@ -1554,7 +1551,6 @@ mod tests {
             json!({ "command": "echo payload > foo.txt && ln -s \"$PWD/foo.txt\" link" }),
         );
         let out = dispatch_tool(&disp, "bash", raw, &ctx).await.unwrap();
-        std::env::remove_var("AZOTH_SANDBOX");
 
         assert_eq!(out["exit_code"], 0, "bash echo+ln succeeded");
 
@@ -1614,7 +1610,7 @@ mod tests {
             eprintln!("skip: fuse-overlayfs not on PATH");
             return;
         }
-        std::env::set_var("AZOTH_SANDBOX", "tier_b");
+        let _env = SandboxEnvGuard::tier("tier_b");
 
         let dir = tempdir().unwrap();
         let root = tokio::fs::canonicalize(dir.path()).await.unwrap();
@@ -1640,7 +1636,6 @@ mod tests {
         .await
         .expect("stage-back hung — did we regress FIFO skip?")
         .unwrap();
-        std::env::remove_var("AZOTH_SANDBOX");
 
         assert_eq!(out["exit_code"], 0);
         let staged = out["staged_files"].as_array().expect("staged_files");
