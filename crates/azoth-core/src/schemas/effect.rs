@@ -94,6 +94,70 @@ pub struct EffectCounter {
     pub amends_this_run: u32,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reset_for_new_contract_zeroes_bonus_and_run_amends_only() {
+        let mut c = EffectCounter {
+            apply_local: 17,
+            apply_repo: 4,
+            network_reads: 2,
+            apply_local_ceiling_bonus: 50,
+            apply_repo_ceiling_bonus: 3,
+            network_reads_ceiling_bonus: 1,
+            amends_this_turn: 2,
+            amends_this_run: 5,
+        };
+        c.reset_for_new_contract();
+        // Zeroed: the contract-scoped amend state.
+        assert_eq!(c.apply_local_ceiling_bonus, 0);
+        assert_eq!(c.apply_repo_ceiling_bonus, 0);
+        assert_eq!(c.network_reads_ceiling_bonus, 0);
+        assert_eq!(c.amends_this_run, 0);
+        // Preserved: effect tallies + per-turn counter (drive_turn
+        // handles amends_this_turn via its own reset on entry).
+        assert_eq!(c.apply_local, 17);
+        assert_eq!(c.apply_repo, 4);
+        assert_eq!(c.network_reads, 2);
+        assert_eq!(c.amends_this_turn, 2);
+    }
+}
+
+impl EffectCounter {
+    /// R4 (PR #31 codex P1): clear contract-scoped amend state that
+    /// must NOT leak across a mid-session `ContractAccepted`. Zeros
+    /// the three `*_ceiling_bonus` fields and `amends_this_run`; the
+    /// effect-count tallies (`apply_local`, `apply_repo`,
+    /// `network_reads`) and per-turn amend counter
+    /// (`amends_this_turn`, reset on `drive_turn` entry) are left
+    /// alone.
+    ///
+    /// Call site contract: a worker that accepts a fresh contract
+    /// mid-session MUST call this on its owned `EffectCounter`
+    /// before reconstructing the `TurnDriver` — otherwise amend
+    /// bonuses granted under the prior contract would silently
+    /// inflate the new contract's effective ceiling and over-permit
+    /// effects (e.g., old contract amended by +20, new contract
+    /// max=5 evaluates as 25). The replay-side equivalent is in
+    /// `JsonlReader::fold_progress`, which resets the same fields on
+    /// every `ContractAccepted` it walks; this method keeps the
+    /// live-driver path symmetric.
+    ///
+    /// β scope: the built-in TUI worker does NOT currently support
+    /// mid-session contract replacement (contracts are accepted once
+    /// at run start). This method exists so a future worker or
+    /// harness that DOES swap contracts can keep live enforcement in
+    /// lockstep with the replay projection.
+    pub fn reset_for_new_contract(&mut self) {
+        self.apply_local_ceiling_bonus = 0;
+        self.apply_repo_ceiling_bonus = 0;
+        self.network_reads_ceiling_bonus = 0;
+        self.amends_this_run = 0;
+    }
+}
+
 /// One recorded effect against the world. Emitted on every tool dispatch.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EffectRecord {

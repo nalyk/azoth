@@ -413,6 +413,146 @@ async fn second_amend_in_same_turn_clamps_against_pending_inclusive_ceiling() {
 }
 
 #[tokio::test]
+async fn amend_grant_that_does_not_clear_budget_aborts_before_tool_dispatch() {
+    // R4 (PR #31 codex P2): if the amend grant raises the ceiling
+    // but `used` is STILL above the new effective max, the driver
+    // must NOT fall through to per-tool authorization. Falling
+    // through would let the tool execute while over budget.
+    //
+    // Scenario: max_apply_local=1, counter pre-seeded to apply_local=50
+    // (simulating a resume into a stricter contract, or a harness
+    // pre-seed). Budget check: used=50, effective_max=1 → amend offered.
+    // Grant: proposed=2, clamp(2, base+bonus+pending=1+0+0=1) = 1.
+    // applied=1. new_effective_max = 1+0+1 = 2. 50 >= 2 → abort
+    // with "effect budget still exhausted after amend".
+    //
+    // The ContractAmended event was written before the post-grant
+    // abort (audit trail); because the turn aborts, the replayable
+    // projection drops it whole, and the live pending vars drop via
+    // stack scope. Counter is unchanged on exit.
+    let dir = tempdir().unwrap();
+    let repo_root = tokio::fs::canonicalize(dir.path()).await.unwrap();
+    let session_path = repo_root.join(".azoth/sessions/run_amend_insufficient.jsonl");
+    let artifacts_root = repo_root.join(".azoth/artifacts");
+
+    let mut writer = JsonlWriter::open(&session_path).unwrap();
+    let (tap_tx, mut tap_rx) = mpsc::unbounded_channel::<SessionEvent>();
+    writer.set_tap(tap_tx);
+
+    let artifacts = ArtifactStore::open(&artifacts_root).unwrap();
+    let mut dispatcher = ToolDispatcher::new();
+    dispatcher.register(FsWriteTool);
+
+    let adapter = MockAdapter::new(
+        ProviderProfile::anthropic_default("claude-sonnet-4-6"),
+        one_fs_write_then_end(),
+    );
+
+    let contract_val = budget_1_contract("amend insufficient");
+    let run_id = RunId::from("run_insufficient".to_string());
+    let turn_id = TurnId::from("t_insufficient".to_string());
+    let ctx = ExecutionContext::builder(
+        run_id.clone(),
+        turn_id.clone(),
+        artifacts,
+        repo_root.clone(),
+    )
+    .build();
+
+    let (approval_tx, mut approval_rx) = mpsc::channel::<ApprovalRequestMsg>(8);
+    let responder = tokio::spawn(async move {
+        while let Some(req) = approval_rx.recv().await {
+            let _ = req.responder.send(ApprovalResponse::Grant {
+                scope: ApprovalScope::Once,
+            });
+        }
+    });
+
+    let mut caps = CapabilityStore::new();
+    // Counter is wildly over the cap — as if a resume into a stricter
+    // contract, or a test harness pre-seed.
+    let mut effects = EffectCounter {
+        apply_local: 50,
+        ..Default::default()
+    };
+
+    {
+        let mut driver = TurnDriver {
+            run_id: run_id.clone(),
+            adapter: &adapter,
+            dispatcher: &dispatcher,
+            writer: &mut writer,
+            ctx: &ctx,
+            capabilities: &mut caps,
+            approval_bridge: approval_tx,
+            contract: Some(&contract_val),
+            turns_completed: 0,
+            run_started_tokio: None,
+            kernel: None,
+            validators: &[],
+            effects_consumed: &mut effects,
+            evidence_collector: None,
+            impact_validators: &[],
+            diff_source: None,
+        };
+        driver
+            .drive_turn(
+                turn_id.clone(),
+                "system".into(),
+                vec![Message::user_text("try amend but still over")],
+            )
+            .await
+            .expect("abort path returns Ok");
+    }
+    drop(writer);
+    responder.abort();
+
+    let mut events = Vec::new();
+    while let Ok(ev) = tap_rx.try_recv() {
+        events.push(ev);
+    }
+
+    // ContractAmended MUST be present (grant happened, audit trail).
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, SessionEvent::ContractAmended { .. })),
+        "amend grant must be recorded even when it doesn't clear budget"
+    );
+    // Turn MUST have aborted (no TurnCommitted).
+    let aborted_reason = events.iter().find_map(|e| match e {
+        SessionEvent::TurnAborted { reason, detail, .. } => Some((*reason, detail.clone())),
+        _ => None,
+    });
+    let (reason, detail) = aborted_reason.expect("TurnAborted required");
+    assert_eq!(reason, azoth_core::schemas::AbortReason::RuntimeError);
+    let detail = detail.expect("detail populated");
+    assert!(
+        detail.contains("still exhausted after amend"),
+        "expected 'still exhausted after amend' detail; got: {detail}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, SessionEvent::TurnCommitted { .. })),
+        "turn must NOT commit — the amend didn't clear the budget"
+    );
+    // No EffectRecord — tool never ran.
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, SessionEvent::EffectRecord { .. })),
+        "tool must NOT have dispatched"
+    );
+
+    // Counter stays at pre-turn values (no pending flush).
+    assert_eq!(effects.apply_local, 50);
+    assert_eq!(effects.apply_local_ceiling_bonus, 0);
+    assert_eq!(effects.amends_this_run, 0);
+    assert_eq!(effects.amends_this_turn, 0);
+}
+
+#[tokio::test]
 async fn aborted_turn_after_amend_does_not_persist_amend_state() {
     // R2 (codex PR #31 P1): if a turn grants an amend and then
     // aborts — e.g. the user denies the subsequent per-tool

@@ -1214,6 +1214,67 @@ impl<'a> TurnDriver<'a> {
                                                         );
                                                     pending_amend_count =
                                                         pending_amend_count.saturating_add(1);
+                                                    // R4 (PR #31 codex P2):
+                                                    // re-check after
+                                                    // applying the delta.
+                                                    // If the amend wasn't
+                                                    // enough (e.g., the
+                                                    // counter was already
+                                                    // well above cap from
+                                                    // a resume into a
+                                                    // stricter contract,
+                                                    // or from a harness
+                                                    // pre-seed), falling
+                                                    // through would let
+                                                    // the tool execute
+                                                    // while still over
+                                                    // budget. Abort with
+                                                    // a distinct message
+                                                    // so the operator can
+                                                    // tell "grant didn't
+                                                    // help" from "grant
+                                                    // brake-declined".
+                                                    //
+                                                    // ContractAmended
+                                                    // above was written
+                                                    // before this abort —
+                                                    // that's intentional:
+                                                    // the grant DID
+                                                    // happen (audit
+                                                    // trail), even if
+                                                    // it didn't clear
+                                                    // the budget.
+                                                    // Replayable drops
+                                                    // the aborted turn
+                                                    // whole anyway, so
+                                                    // the persisted
+                                                    // grant evaporates
+                                                    // on resume.
+                                                    let new_pending_for_class = match effect_class {
+                                                        EffectClass::ApplyLocal => {
+                                                            pending_amend_apply_local
+                                                        }
+                                                        EffectClass::ApplyRepo => {
+                                                            pending_amend_apply_repo
+                                                        }
+                                                        _ => 0,
+                                                    };
+                                                    let new_effective_max = max_base
+                                                        .saturating_add(bonus)
+                                                        .saturating_add(new_pending_for_class);
+                                                    if used >= new_effective_max {
+                                                        self.record_abort(
+                                                            &turn_id,
+                                                            AbortReason::RuntimeError,
+                                                            Some(format!(
+                                                                "effect budget still exhausted after amend: {label} {used}/{new_effective_max}"
+                                                            )),
+                                                            total_usage.clone(),
+                                                        )?;
+                                                        return Ok(TurnOutcome::aborted(
+                                                            total_usage,
+                                                        ));
+                                                    }
                                                     // Fall through to normal
                                                     // per-tool authorization
                                                     // below. The amend only
