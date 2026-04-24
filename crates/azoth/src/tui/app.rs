@@ -394,12 +394,24 @@ impl AppState {
                 // context_overflow aborts from one /continue). The
                 // context is the problem; a repeat turn is not the
                 // remediation.
-                let last_was_context_overflow = self.cards.last().is_some_and(|c| {
-                    matches!(
-                        &c.state,
-                        CardState::Aborted { reason, .. } if reason == "ContextOverflow"
-                    )
-                });
+                //
+                // R3-2 gemini MED on PR #33 2026-04-25: my initial
+                // check only inspected `cards.last()`. After the
+                // overflow abort, a user message would push a User
+                // card that hides the prior Agent Aborted card. Walk
+                // from the tail and find the first AGENT card — that
+                // is the turn whose outcome matters for /continue.
+                let last_was_context_overflow = self
+                    .cards
+                    .iter()
+                    .rev()
+                    .find(|c| matches!(c.role, super::card::CardRole::Agent))
+                    .is_some_and(|c| {
+                        matches!(
+                            &c.state,
+                            CardState::Aborted { reason, .. } if reason == "ContextOverflow"
+                        )
+                    });
                 if last_was_context_overflow {
                     self.notes.push(Note::warn(
                         "context full — /quit and start a fresh session, or shrink the scope",
@@ -3088,6 +3100,48 @@ mod tests {
         assert!(
             note.text.contains("context full"),
             "user must see why /continue was refused; got: {:?}",
+            note.text
+        );
+    }
+
+    #[test]
+    fn slash_continue_refuses_even_when_user_card_follows_overflow_abort() {
+        // R3-2 gemini MED on PR #33 2026-04-25: the original check
+        // only inspected cards.last() — a User card pushed between
+        // the aborted Agent card and /continue hid the abort.
+        // Fix walks back from the tail for the most recent Agent
+        // card; this test verifies that regression.
+        use azoth_core::schemas::{AbortReason, Usage};
+        let mut state = AppState::new();
+        let tid = TurnId::new();
+        state.handle_session_event(SessionEvent::TurnStarted {
+            turn_id: tid.clone(),
+            run_id: RunId::new(),
+            parent_turn: None,
+            timestamp: "2026-04-25T00:00:00Z".into(),
+        });
+        state.handle_session_event(SessionEvent::TurnAborted {
+            turn_id: tid,
+            reason: AbortReason::ContextOverflow,
+            detail: Some("estimate 40000 > 32768".into()),
+            usage: Usage::default(),
+            at: Some("2026-04-25T00:00:05Z".into()),
+        });
+        // Push a User card AFTER the overflow — the naive
+        // cards.last() check would see this and miss the abort.
+        state
+            .cards
+            .push(super::TurnCard::user("t_user", "please retry"));
+        state.run_palette_action(super::PaletteAction::Continue);
+        assert!(
+            state.pending_user_text.is_none(),
+            "/continue must still refuse with intervening user card; queued: {:?}",
+            state.pending_user_text
+        );
+        let note = state.notes.last().expect("refusal note");
+        assert!(
+            note.text.contains("context full"),
+            "user must see the refusal; got: {:?}",
             note.text
         );
     }
