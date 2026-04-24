@@ -182,9 +182,11 @@ fn empty_and_whitespace_are_apply_local() {
 #[test]
 fn bare_allowlist_positives_survive_the_gauntlet() {
     // Sanity check: the adversarial gate hasn't accidentally tanked
-    // legitimate reads.
+    // legitimate unquoted reads. (Quoted forms go to ApplyLocal
+    // after gemini R1 HIGH — see
+    // `quoted_args_are_apply_local_after_r1_gemini_high`.)
     assert_observe("grep foo src/");
-    assert_observe("rg 'pattern' crates/");
+    assert_observe("rg pattern crates/");
     assert_observe("ls -la");
     assert_observe("cat Cargo.toml");
     assert_observe("wc -l src/main.rs");
@@ -195,6 +197,17 @@ fn bare_allowlist_positives_survive_the_gauntlet() {
     assert_observe("cargo check");
     assert_observe("cargo metadata --format-version 1");
     assert_observe("rustc --version");
+}
+
+#[test]
+fn xxd_is_apply_local_after_r1_codex_p1() {
+    // codex R1 P1 (PR #30, 2026-04-24): `xxd -r` reverse mode
+    // writes binary; removed entirely from READ_ONLY_COMMANDS.
+    // Any xxd invocation now classifies as ApplyLocal.
+    assert_apply_local("xxd");
+    assert_apply_local("xxd file");
+    assert_apply_local("xxd -r dump.hex target.bin");
+    assert_apply_local("xxd -p file.bin");
 }
 
 #[test]
@@ -249,6 +262,33 @@ fn non_write_output_flags_stay_observe() {
     // common structured-read patterns don't get taxed.
     assert_observe("git log --output-indicator-new=X");
     assert_observe("git diff --output-indicator-new X");
+}
+
+#[test]
+fn quoted_args_are_apply_local_after_r1_gemini_high() {
+    // gemini R1 HIGH (PR #30, 2026-04-24): quotes let payloads
+    // sneak past flag-level checks. The shell strips quotes before
+    // exec, so `git log "--output=file"` still writes the file,
+    // but my has_write_flag sees the literal token `"--output=file"`
+    // and misses it. Rejecting every `'` / `"` byte in the raw
+    // command closes the bypass.
+    //
+    // Budget-level coverage of the specific bypass gemini cited:
+    assert_apply_local(r#"git log "--output=/tmp/evil""#);
+    assert_apply_local(r#"git diff "--output=/tmp/evil""#);
+    assert_apply_local(r#"git show "--output=/tmp/evil" HEAD"#);
+    // Single-quote variant — shell strips both forms.
+    assert_apply_local("git log '--output=/tmp/evil'");
+    assert_apply_local("git diff '--output=/tmp/evil'");
+    // Mixed quoting of the flag value only:
+    assert_apply_local(r#"git log --output="/tmp/evil""#);
+    assert_apply_local("git log --output='/tmp/evil'");
+    // Collateral: legitimate quoted patterns also classify
+    // ApplyLocal. Documented in the classifier docstring — a
+    // cost/UX bug, not a safety bug.
+    assert_apply_local(r#"grep "foo bar" src/"#);
+    assert_apply_local("rg 'pattern with space' crates/");
+    assert_apply_local(r#"ls "file with space""#);
 }
 
 #[test]

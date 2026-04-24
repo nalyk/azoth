@@ -58,14 +58,22 @@ use crate::schemas::EffectClass;
 /// here; use the per-family helper.
 const READ_ONLY_COMMANDS: &[&str] = &[
     // POSIX read-only core. Entries here must be read-only under
-    // EVERY argv combination the classifier will accept. `find` and
-    // `env` were in the R0 draft and gemini R0 HIGH (2026-04-24)
-    // flagged them: `find -exec`, `find -delete`, `find -fprintf`
-    // and similar flag families let `find` run arbitrary commands
-    // or write files, and `env VAR=val cmd` runs `cmd` directly.
-    // I removed both; the false-UPGRADE (bare `find . -name x` now
-    // counts as ApplyLocal) is acceptable per the safety model at
-    // the top of this file.
+    // EVERY argv combination the classifier will accept.
+    //
+    // gemini R0 HIGH (2026-04-24) removed `find` and `env`:
+    // `find -exec`, `find -delete`, `find -fprintf`, and
+    // `env VAR=val cmd` all let the model run arbitrary commands
+    // or write files.
+    //
+    // codex R1 P1 (2026-04-24) removed `xxd`: the `-r` reverse
+    // mode converts a hex dump to binary and writes the output
+    // file (`xxd -r dump.hex target.bin`). Any allowlist entry
+    // with a write mode, even one behind a single flag, is unsafe
+    // to keep unconditionally.
+    //
+    // The false-UPGRADE on legitimate read-only use (bare
+    // `find . -name x`, `xxd file`) is acceptable per the safety
+    // model comment at the top of this file.
     "grep",
     "rg",
     "ls",
@@ -80,7 +88,6 @@ const READ_ONLY_COMMANDS: &[&str] = &[
     "which",
     "sha256sum",
     "md5sum",
-    "xxd",
     "od",
     "date",
     "pwd",
@@ -132,13 +139,29 @@ const CARGO_READ_ONLY_SUBCOMMANDS: &[&str] = &["check", "metadata", "tree", "ver
 /// - backgrounding: `&` (bare; `&&` caught earlier)
 /// - escapes / line continuation: `\`
 /// - whitespace that can splice commands: newline (`\n`), tab (`\t`)
+/// - quoting: `'`, `"` (gemini R1 HIGH, PR #30, 2026-04-24)
 ///
-/// NOT covered (intentional): spaces (used for arg separation),
-/// single/double quotes (not metachars in the control sense — they
-/// group, they don't redirect). Quoting does not change the set of
-/// reachable commands, only how argv is split. Since we only look at
-/// argv[0] + argv[1] for family dispatch, quoting inside later args
-/// is irrelevant to the classification.
+/// ## Why quotes are rejected
+///
+/// R0 docstring claimed "quoting does not change the set of reachable
+/// commands" — that was wrong for the R1-added `has_write_flag` scan.
+/// Since the bash tool runs commands via a real shell (`sh -c`), the
+/// shell strips quotes before exec. A payload like
+/// `git log "--output=file"` splits by whitespace into argv tokens
+/// `[git, log, "--output=file"]`; my `has_write_flag` check looks for
+/// `t == "--output" || t.starts_with("--output=")` and misses the
+/// quoted token — but the shell strips the quotes and writes the
+/// file anyway. Rejecting any `'` / `"` byte closes this bypass
+/// without making me do shell-lexer work.
+///
+/// This DOES penalize common legitimate forms like `grep "foo bar"
+/// src/` — they now classify as ApplyLocal rather than Observe.
+/// False-UPGRADE per the safety model: a cost/UX bug, not a safety
+/// bug. The model can spell the same query without quotes in the
+/// overwhelming majority of cases (`grep 'foo bar'` → `grep
+/// "foo bar"` → regex alternatives / `rg -F`), and budget survival
+/// is more load-bearing than shaving one Observe token off quoted
+/// greps.
 fn has_forbidden_metachar(cmd: &str) -> bool {
     // `&&` and `||` are caught by the single-char `&` / `|` check.
     // `$(` is caught by the single-char `$` check (plus `(` — we
@@ -159,6 +182,8 @@ fn has_forbidden_metachar(cmd: &str) -> bool {
                 | b'\t'
                 | b'\\'
                 | b'\r'
+                | b'\''
+                | b'"'
         )
     })
 }
@@ -314,6 +339,23 @@ mod tests {
         assert_observe("ls -la");
         assert_observe("cat Cargo.toml");
         assert_observe("wc -l src/main.rs");
+        // Unquoted multi-char args remain fine.
+        assert_observe("grep -r pattern src");
+        assert_observe("rg --type rust Function");
+    }
+
+    #[test]
+    fn quoted_args_force_apply_local_after_r1_gemini_high() {
+        // gemini R1 HIGH (PR #30, 2026-04-24): quotes in the raw
+        // command string let a payload like
+        // `git log "--output=file"` sneak past has_write_flag, but
+        // the shell strips quotes before exec. Any `'` or `"` in
+        // the command now forces ApplyLocal.
+        assert_apply_local(r#"git log "--output=/tmp/evil""#);
+        assert_apply_local(r#"git log "--output=/tmp/evil" HEAD"#);
+        assert_apply_local("git log '--output=/tmp/evil'");
+        assert_apply_local(r#"grep "foo bar" src/"#);
+        assert_apply_local("rg 'pattern with space' crates/");
     }
 
     #[test]
@@ -321,11 +363,22 @@ mod tests {
         // Removed from allowlist after gemini R0 HIGH (2026-04-24).
         // Bare invocation would have been Observe in R0; now falls
         // through to ApplyLocal like any unknown argv0.
-        assert_apply_local("find . -name '*.rs'");
+        assert_apply_local("find . -name *.rs");
         assert_apply_local("find . -exec rm {} +");
         assert_apply_local("find . -delete");
         assert_apply_local("env");
         assert_apply_local("env VAR=val grep foo");
+    }
+
+    #[test]
+    fn xxd_classifies_as_apply_local_after_r1_codex_p1() {
+        // codex R1 P1 (PR #30, 2026-04-24): `xxd -r` reverse mode
+        // writes binary to an output file. Removed entirely from
+        // READ_ONLY_COMMANDS because a single flag flips it from
+        // read to write.
+        assert_apply_local("xxd");
+        assert_apply_local("xxd file");
+        assert_apply_local("xxd -r dump.hex target.bin");
     }
 
     #[test]
@@ -352,7 +405,10 @@ mod tests {
         assert_observe("git diff main..HEAD");
         assert_observe("git status");
         assert_observe("git rev-parse --short HEAD");
-        assert_observe("git ls-files 'src/*.rs'");
+        // Unquoted glob — quoted forms (`'src/*.rs'`) go to
+        // ApplyLocal after gemini R1 HIGH, see
+        // `quoted_args_force_apply_local_after_r1_gemini_high`.
+        assert_observe("git ls-files src");
     }
 
     #[test]
