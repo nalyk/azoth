@@ -46,11 +46,35 @@ impl Whisper {
         self.narration.is_some()
     }
 
-    /// Build the whisper line. When narrating, shows the narration +
-    /// elapsed seconds. When idle, shows the most recent note (if
-    /// any, and if <5s old), else "ready · ⌃K for commands" on zero
-    /// state.
-    pub fn render_line(&self, theme: &Theme, latest_note: Option<&Note>) -> Line<'static> {
+    /// Build the whisper line. Priority order (highest first):
+    ///
+    /// 1. `pending_approval` — an approval sheet is up and the worker is
+    ///    blocked on the user. F1 2026-04-24: previously the whisper
+    ///    continued to show "running <tool>" with an elapsed timer
+    ///    ticking, which convinced an operator the model was stuck
+    ///    (the sheet can be off-screen under narrow terminals).
+    /// 2. narration — the worker is actively doing something.
+    /// 3. the most recent note (if <5s old).
+    /// 4. zero-state hint.
+    pub fn render_line(
+        &self,
+        theme: &Theme,
+        latest_note: Option<&Note>,
+        pending_approval: Option<&azoth_core::authority::ApprovalRequestMsg>,
+    ) -> Line<'static> {
+        if let Some(req) = pending_approval {
+            let tool = req.tool_name.clone();
+            let cls = req.effect_class.to_string();
+            return Line::from(vec![
+                Span::raw("      "),
+                Span::styled("⏸", theme.ink(Palette::AMBER)),
+                Span::raw(" "),
+                Span::styled("azoth", theme.bold()),
+                Span::raw(" "),
+                Span::styled("awaiting approval", theme.bold()),
+                Span::styled(format!(" · {tool} → {cls}"), theme.italic_dim()),
+            ]);
+        }
         if let (Some(text), Some(started)) = (self.narration.as_ref(), self.narration_started) {
             let elapsed_f = started.elapsed().as_secs_f32();
             let elapsed_ms = started.elapsed().as_millis();
@@ -90,5 +114,88 @@ impl Whisper {
             Span::raw(" "),
             Span::styled("· ⌃K for commands", theme.italic_dim()),
         ])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tui::theme::Theme;
+    use azoth_core::authority::ApprovalRequestMsg;
+    use azoth_core::schemas::{ApprovalId, EffectClass, TurnId};
+    use tokio::sync::oneshot;
+
+    fn flatten(line: &Line<'static>) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    fn pending_for(tool: &str, cls: EffectClass) -> ApprovalRequestMsg {
+        let (tx, _rx) = oneshot::channel();
+        ApprovalRequestMsg {
+            turn_id: TurnId::new(),
+            approval_id: ApprovalId::new(),
+            tool_name: tool.into(),
+            effect_class: cls,
+            summary: format!("{tool} → example summary"),
+            responder: tx,
+            budget_extension: None,
+        }
+    }
+
+    #[test]
+    fn pending_approval_overrides_narration_with_awaiting_text() {
+        // F1: when the approval sheet is up, the whisper must NOT
+        // read "running bash · 30s" — that lies about worker state.
+        let mut w = Whisper::default();
+        w.set("running bash");
+        let theme = Theme::detect();
+        let req = pending_for("bash", EffectClass::ApplyLocal);
+        let line = w.render_line(&theme, None, Some(&req));
+        let flat = flatten(&line);
+        assert!(
+            flat.contains("awaiting approval"),
+            "must surface awaiting state; got: {flat:?}"
+        );
+        assert!(
+            flat.contains("bash"),
+            "must include tool name; got: {flat:?}"
+        );
+        assert!(
+            flat.contains("apply_local"),
+            "must include effect_class in snake_case (F8); got: {flat:?}"
+        );
+        assert!(
+            !flat.contains("running bash"),
+            "narration MUST be suppressed while blocked on approval; got: {flat:?}"
+        );
+    }
+
+    #[test]
+    fn pending_approval_overrides_recent_note() {
+        // Priority: approval > note. A recent error note shouldn't
+        // leak through when the user owes a decision.
+        let w = Whisper::default();
+        let note = Note::error("something exploded");
+        let theme = Theme::detect();
+        let req = pending_for("fs_write", EffectClass::ApplyLocal);
+        let line = w.render_line(&theme, Some(&note), Some(&req));
+        let flat = flatten(&line);
+        assert!(flat.contains("awaiting approval"), "got: {flat:?}");
+        assert!(
+            !flat.contains("something exploded"),
+            "note must not leak past approval gate; got: {flat:?}"
+        );
+    }
+
+    #[test]
+    fn no_approval_still_narrates() {
+        // Regression guard: approval plumbing must not break the
+        // normal narration path.
+        let mut w = Whisper::default();
+        w.set("thinking");
+        let theme = Theme::detect();
+        let line = w.render_line(&theme, None, None);
+        let flat = flatten(&line);
+        assert!(flat.contains("thinking"), "got: {flat:?}");
     }
 }
