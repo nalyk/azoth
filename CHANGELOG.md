@@ -74,6 +74,12 @@ All notable changes to azoth are documented here. Format follows
 
 - **JavaScript grammar** (`.js` / `.jsx` / `.mjs` / `.cjs`) — not in
   2.1. The TypeScript grammar handles `.ts` and `.tsx` only.
+- **Java grammar** — v2.0.2's README line 201 listed Java as part of
+  v2.1 scope; this release does not ship it. Not currently named in
+  any plan-doc roadmap; the next grammar addition will be triaged on
+  ecosystem demand. Java files fall through to FTS + ripgrep +
+  co-edit graph with no tree-sitter-level symbol extraction until
+  then.
 - **Jest workspaces / monorepo configs** — detected at selector entry
   and rejected with `JestError::UnsupportedConfig`.
 - **LSP integration** — deferred for structural reasons (turn-atomicity
