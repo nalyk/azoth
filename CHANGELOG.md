@@ -21,10 +21,14 @@ All notable changes to azoth are documented here. Format follows
 - **tree-sitter grammars for Python, TypeScript, and Go** —
   `tree-sitter-python = "0.21"`, `tree-sitter-typescript = "0.21"`
   (`.ts` via `language_typescript()`, `.tsx` via `language_tsx()`), and
-  `tree-sitter-go = "0.21"`. All three reuse an iterative preorder walker
-  in `code_graph/common.rs` (TreeCursor reuse, no recursion). `.d.ts` /
-  interface / `declare class` members extract via `function_signature` +
-  `method_signature` classifier arms.
+  `tree-sitter-go = "0.21"`. Each language ships its own iterative
+  `fn walk` (tree-sitter node kinds are grammar-specific, so the walker
+  stays per-language) — all four share the TreeCursor-reuse pattern
+  established in PR #20 round 5 to avoid stack overflow on deep
+  fixtures. `code_graph/common.rs` holds the grammar-independent
+  helpers (`short_digest`, `line_range`, `name_via_field`) reused
+  across every walker. `.d.ts` / interface / `declare class` members
+  extract via `function_signature` + `method_signature` classifier arms.
 - **TDAD test-impact backends for pytest, jest, and `go test`** —
   `PytestImpact`, `JestImpact`, `GoTestImpact` (implement `ImpactSelector`)
   plus `PytestRunner`, `JestRunner`, `GoTestRunner` (implement a new shared
