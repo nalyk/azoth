@@ -77,9 +77,14 @@ fn v2_1_seed_loads_ships_50_tasks_and_meets_localization_at_5_floor() {
         tasks
             .iter()
             .filter(|t| {
-                t.id.starts_with(prefix)
-                    && t.id.len() == prefix.len() + digits
-                    && t.id[prefix.len()..].chars().all(|c| c.is_ascii_digit())
+                // `strip_prefix` returns `Option<&str>` and handles UTF-8
+                // boundaries safely — unlike raw `t.id[prefix.len()..]` which
+                // panics if `prefix.len()` lands mid-codepoint. Current
+                // prefixes are ASCII so the panic is unreachable, but the
+                // idiom keeps the check robust against future non-ASCII ids.
+                t.id.strip_prefix(prefix).is_some_and(|rest| {
+                    rest.len() == digits && rest.chars().all(|c| c.is_ascii_digit())
+                })
             })
             .count()
     };
