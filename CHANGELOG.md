@@ -110,7 +110,7 @@ tree-sitter Rust symbols, co-edit graph from git history, TDAD impact
 selector (cargo), eval plane (localization@k + regression rate),
 sandbox Tier-A/B enforcement on bash, `--live-retrieval` flag.
 
-## [1.5] — 2026-03
+## [1.5.0] — 2026-03
 
 Adapters (Anthropic OAuth + OpenAI Chat Completions), Anthropic
 content-block protocol internally, JSONL dual projection, Tier-A/B

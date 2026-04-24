@@ -198,8 +198,8 @@ This section exists because the rest of the README is confident and you deserve 
 
 - **Retrieval is keyword-grade for prose queries.** The composite works well when the prompt contains identifiers or paths. Natural-language "explain what happens when X" prompts lose signal. A query-planning and embedding lane is v2.5 scope.
 - **Sandbox imposes ~100 ms overhead per tool call** and needs unprivileged user namespaces (check with `unshare -U true`). v2.1 flips the default on; set `AZOTH_SANDBOX=off` to opt back out. Hosts without user-ns support degrade to `off` automatically with a warning.
-- **Tree-sitter symbols: Rust, Python, TypeScript (`.ts` + `.tsx`), Go.** JavaScript (`.js` / `.jsx` / `.mjs` / `.cjs`) and Java grammars are post-2.1 scope. Other languages still get FTS, ripgrep, and co-edit graph.
-- **TDAD: `cargo test`, pytest, jest, and `go test`.** Jest monorepo / workspaces configs are rejected with `JestError::UnsupportedConfig`; go parallel per-package execution, `go.work` multi-module, and `-bench`-aware runners are v2.2 scope.
+- **Tree-sitter symbols: Rust, Python, TypeScript (`.ts` + `.tsx`), Go.** JavaScript (`.js` / `.jsx` / `.mjs` / `.cjs`) grammar is post-2.1 scope. Other languages (Java, Ruby, C++, …) still get FTS, ripgrep, and co-edit graph without tree-sitter-level symbol extraction.
+- **TDAD: `cargo test`, pytest, jest, and `go test`.** Jest monorepo / workspaces configs are rejected with `JestError::UnsupportedConfig`; Go parallel per-package execution, `go.work` multi-module, and `-bench`-aware runners are v2.2 scope.
 - **Linux only.** Sandbox tiers and `fuse-overlayfs` are Linux-specific. macOS and Windows builds currently fail at the `sandbox` module. WSL2 works.
 - Contract amendments, the policy DSL, gVisor (Tier C), Firecracker (Tier D), domain packs, and enterprise deployment modes are all post-v2 scope per `docs/draft_plan.md`.
 
