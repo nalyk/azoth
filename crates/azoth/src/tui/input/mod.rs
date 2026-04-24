@@ -13,8 +13,11 @@ pub enum SlashCommand {
     /// `/contract [goal text...]` — empty argument shows usage; a non-empty
     /// rest-of-line is treated as the contract goal.
     Contract(Option<String>),
-    /// `/approve [tool_name]` — no argument lists active capability tokens;
-    /// a tool name pre-grants a session-scoped token for that tool.
+    /// `/approve [tool_name]` — a tool name pre-grants a session-scoped
+    /// token for that tool; no argument lists the tools this session has
+    /// already approved (TUI-local roster: pre-grants + sheet grants).
+    /// Empty roster shows the usage hint. F6 2026-04-24: the empty-arg
+    /// listing was previously a doc-only claim.
     Approve(Option<String>),
     Quit,
     /// `/resume <run_id>` — the argument is `None` when no token follows.

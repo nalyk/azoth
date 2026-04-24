@@ -51,6 +51,28 @@ impl EffectClass {
                 | EffectClass::ApplyRepo
         )
     }
+
+    /// Snake-case wire name, matching the serde `rename_all` discipline.
+    /// Shared by the approval sheet header and structured logs so they agree
+    /// on one spelling (`apply_local`, not the `{:?}.to_lowercase()` squash
+    /// `applylocal` that shipped through 2026-04-24).
+    pub fn as_snake(self) -> &'static str {
+        match self {
+            EffectClass::Observe => "observe",
+            EffectClass::Stage => "stage",
+            EffectClass::ApplyLocal => "apply_local",
+            EffectClass::ApplyRepo => "apply_repo",
+            EffectClass::ApplyRemoteReversible => "apply_remote_reversible",
+            EffectClass::ApplyRemoteStateful => "apply_remote_stateful",
+            EffectClass::ApplyIrreversible => "apply_irreversible",
+        }
+    }
+}
+
+impl std::fmt::Display for EffectClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_snake())
+    }
 }
 
 /// Per-run tally of effects consumed, indexed by effect class. Owned by the
@@ -97,6 +119,44 @@ pub struct EffectCounter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn display_is_snake_case_matches_serde_rename_all() {
+        // F8 2026-04-24: the approval sheet used `format!("{:?}",
+        // req.effect_class).to_lowercase()` which squashes CamelCase
+        // to `applylocal`. Display keeps sheet + logs + serde on one
+        // spelling.
+        assert_eq!(EffectClass::Observe.to_string(), "observe");
+        assert_eq!(EffectClass::Stage.to_string(), "stage");
+        assert_eq!(EffectClass::ApplyLocal.to_string(), "apply_local");
+        assert_eq!(EffectClass::ApplyRepo.to_string(), "apply_repo");
+        assert_eq!(
+            EffectClass::ApplyRemoteReversible.to_string(),
+            "apply_remote_reversible"
+        );
+        assert_eq!(
+            EffectClass::ApplyRemoteStateful.to_string(),
+            "apply_remote_stateful"
+        );
+        assert_eq!(
+            EffectClass::ApplyIrreversible.to_string(),
+            "apply_irreversible"
+        );
+        // Serde rename_all agreement check — Display and JSON must match.
+        for ec in [
+            EffectClass::Observe,
+            EffectClass::ApplyLocal,
+            EffectClass::ApplyRemoteStateful,
+        ] {
+            let json = serde_json::to_value(ec).unwrap();
+            let wire = json.as_str().expect("EffectClass serialises as string");
+            assert_eq!(
+                wire,
+                ec.as_snake(),
+                "serde wire must match Display/as_snake"
+            );
+        }
+    }
 
     #[test]
     fn reset_for_new_contract_zeroes_bonus_only() {

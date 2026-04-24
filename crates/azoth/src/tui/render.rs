@@ -421,7 +421,11 @@ fn render_zero_state(f: &mut Frame, area: Rect, theme: &Theme) {
 
 fn render_whisper(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let latest_note = state.notes.last();
-    let line = state.whisper.render_line(theme, latest_note);
+    // F1 2026-04-24: pass pending_approval so the whisper can say
+    // "awaiting approval" instead of the narration-lies "running bash".
+    let line = state
+        .whisper
+        .render_line(theme, latest_note, state.pending_approval.as_ref());
     f.render_widget(Paragraph::new(line), area);
 }
 

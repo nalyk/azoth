@@ -95,7 +95,15 @@ impl ProviderProfile {
             tokenizer_family: TokenizerFamily::SentencepieceLlama,
             supports_native_cache: false,
             supports_strict_json_schema: false,
-            max_context_tokens: 32_768,
+            // F3 2026-04-24: bumped from 32_768 → 131_072. On 2026-04-24 E2E
+            // run_f9c7978e66de the packet compiler estimated 36 072 tokens
+            // by turn 3 on qwen3.6:27b — azoth-side budget rejected before
+            // the network call. qwen3/3.5/3.6 Modelfiles default to 128k+
+            // num_ctx; 131_072 is the floor that lets retrieval-heavy
+            // conversations run past the third exchange. Ollama-side
+            // num_ctx is a separate plumbing concern (we don't forward
+            // it in build_body today) — tracked as F3(b) follow-up.
+            max_context_tokens: 131_072,
             max_output_tokens: 8_192,
             tool_use_shape: ToolUseShape::ContentBlock,
             // See `anthropic_default` for why this is empty — the adapter
@@ -114,7 +122,8 @@ impl ProviderProfile {
             tokenizer_family: TokenizerFamily::SentencepieceLlama,
             supports_native_cache: false,
             supports_strict_json_schema: false,
-            max_context_tokens: 32_768,
+            // F3 2026-04-24: see ollama_anthropic for rationale.
+            max_context_tokens: 131_072,
             max_output_tokens: 8_192,
             tool_use_shape: ToolUseShape::FlatToolCalls,
             extra_headers: vec![],
@@ -152,6 +161,14 @@ mod tests {
         assert_eq!(p.base_url, "http://localhost:11434");
         assert_eq!(p.model_id, "qwen-9b");
         assert!(!p.supports_native_cache);
+        // F3 2026-04-24: pinned at 131_072 so qwen3/3.5/3.6
+        // conversations don't saturate azoth-side budget after 3
+        // turns. If this is lowered back to 32_768, reconcile with
+        // the E2E observation documented in .azoth/test-reports/.
+        assert_eq!(
+            p.max_context_tokens, 131_072,
+            "ollama context budget pinned at 131072 (F3 2026-04-24)"
+        );
     }
 
     #[test]
@@ -159,6 +176,10 @@ mod tests {
         let p = ProviderProfile::ollama_openai("qwen-9b");
         assert_eq!(p.tool_use_shape, ToolUseShape::FlatToolCalls);
         assert_eq!(p.base_url, "http://localhost:11434/v1");
+        assert_eq!(
+            p.max_context_tokens, 131_072,
+            "ollama context budget pinned at 131072 (F3 2026-04-24)"
+        );
     }
 
     #[test]

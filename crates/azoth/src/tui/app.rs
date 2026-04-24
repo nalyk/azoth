@@ -143,6 +143,16 @@ pub struct AppState {
     pub current_contract_id: Option<ContractId>,
     pub last_context_summary: Option<String>,
     pending_approve: Option<String>,
+    /// F6 2026-04-24: TUI-side roster of tool names the user has
+    /// granted session-scope approval for — either via `/approve
+    /// <tool>` (pre-grant) or via `s` / sheet session-grant button
+    /// on an in-flight approval. Duplicates suppressed. Rendered
+    /// by empty-arg `/approve`. The authoritative store is the
+    /// worker-side `CapabilityStore`; this mirror exists because
+    /// the TUI can't query the worker's store cheaply and the
+    /// "list what I've granted this session" signal is useful
+    /// enough to duplicate.
+    pub session_approvals: Vec<String>,
     input_history: Vec<String>,
     history_cursor: usize,
     /// Last turn's input token count — the real context window pressure.
@@ -231,6 +241,7 @@ impl AppState {
             current_contract_id: None,
             last_context_summary: None,
             pending_approve: None,
+            session_approvals: Vec::new(),
             input_history: Vec::new(),
             history_cursor: 0,
             last_input_tokens: 0,
@@ -374,16 +385,49 @@ impl AppState {
                 self.should_quit = true;
             }
             PaletteAction::Continue => {
-                self.pending_user_text = Some(
-                    "Please continue from where you left off — pick up the \
-                     partial output and finish."
-                        .to_string(),
-                );
-                // Note added in round 14 to match the slash-handler
-                // behaviour — earlier the palette path silently queued
-                // the prompt with no user feedback, while /continue
-                // showed "continue requested". Now both paths agree.
-                self.notes.push(Note::info("continue requested"));
+                // F2 2026-04-24: /continue's documented purpose is to
+                // resume from a `model_truncated` abort. I wired it
+                // without inspecting WHY the last turn aborted, so an
+                // operator running `/continue` after a context_overflow
+                // got a fresh turn that immediately re-overflowed
+                // (witnessed on run_f9c7978e66de: two back-to-back
+                // context_overflow aborts from one /continue). The
+                // context is the problem; a repeat turn is not the
+                // remediation.
+                //
+                // R3-2 gemini MED on PR #33 2026-04-25: my initial
+                // check only inspected `cards.last()`. After the
+                // overflow abort, a user message would push a User
+                // card that hides the prior Agent Aborted card. Walk
+                // from the tail and find the first AGENT card — that
+                // is the turn whose outcome matters for /continue.
+                let last_was_context_overflow = self
+                    .cards
+                    .iter()
+                    .rev()
+                    .find(|c| matches!(c.role, super::card::CardRole::Agent))
+                    .is_some_and(|c| {
+                        matches!(
+                            &c.state,
+                            CardState::Aborted { reason, .. } if reason == "ContextOverflow"
+                        )
+                    });
+                if last_was_context_overflow {
+                    self.notes.push(Note::warn(
+                        "context full — /quit and start a fresh session, or shrink the scope",
+                    ));
+                } else {
+                    self.pending_user_text = Some(
+                        "Please continue from where you left off — pick up the \
+                         partial output and finish."
+                            .to_string(),
+                    );
+                    // Note added in round 14 to match the slash-handler
+                    // behaviour — earlier the palette path silently queued
+                    // the prompt with no user feedback, while /continue
+                    // showed "continue requested". Now both paths agree.
+                    self.notes.push(Note::info("continue requested"));
+                }
             }
             PaletteAction::DraftContract(Some(goal)) => {
                 let mut draft = azoth_core::contract::draft(goal.clone());
@@ -397,11 +441,32 @@ impl AppState {
             }
             PaletteAction::Approve(Some(tool)) => {
                 self.pending_approve = Some(tool.clone());
+                // R4 codex P2 on PR #33: do NOT populate the roster
+                // here. `/approve <tool>` is pre-intent; the actual
+                // grant is gated by the worker (read-only mode drops
+                // it; unknown tools are rejected). The roster only
+                // reflects real mints via the ApprovalGranted event.
                 self.notes
                     .push(Note::info(format!("approving tool {tool} session-scope")));
             }
             PaletteAction::Approve(None) => {
-                self.notes.push(Note::help("usage: /approve <tool_name>"));
+                // F6 2026-04-24: the SlashCommand::Approve doc at
+                // `tui/input/mod.rs:16-17` claimed empty-arg "lists
+                // active capability tokens". The handler here just
+                // printed usage. I'm wiring the list (from the TUI-
+                // local `session_approvals` roster) so the docstring
+                // and behaviour agree.
+                if self.session_approvals.is_empty() {
+                    self.notes.push(Note::help(
+                        "usage: /approve <tool_name> — none granted this session yet",
+                    ));
+                } else {
+                    let list = self.session_approvals.join(", ");
+                    self.notes.push(Note::info(format!(
+                        "session-approved ({}): {list}",
+                        self.session_approvals.len()
+                    )));
+                }
             }
             PaletteAction::Resume => {
                 self.notes.push(Note::help(
@@ -606,6 +671,11 @@ impl AppState {
                     let _ = req.responder.send(ApprovalResponse::Grant {
                         scope: ApprovalScope::Session,
                     });
+                    // R4 2026-04-24: roster population is centralised
+                    // on the `SessionEvent::ApprovalGranted` handler so
+                    // the TUI mirror follows the worker's mint, not
+                    // the user's click. Sheet just forwards the user
+                    // decision down the bridge.
                     self.notes.push(Note::info("approval · granted session"));
                 }
             }
@@ -680,6 +750,8 @@ impl AppState {
                         let _ = req.responder.send(ApprovalResponse::Grant {
                             scope: ApprovalScope::Session,
                         });
+                        // R4 2026-04-24: roster update flows through
+                        // the ApprovalGranted event, see SheetApproveSession.
                         self.notes.push(Note::info("approval · granted session"));
                     }
                 }
@@ -692,6 +764,8 @@ impl AppState {
                         let _ = req.responder.send(ApprovalResponse::Grant {
                             scope: ApprovalScope::Session,
                         });
+                        // R4 2026-04-24: roster update flows through
+                        // the ApprovalGranted event, see SheetApproveSession.
                         self.notes.push(Note::info(
                             "approval · scoped-paths falls back to session in v1",
                         ));
@@ -1030,10 +1104,51 @@ impl AppState {
         self.pending_approve.take()
     }
 
+    /// Record a tool as session-approved in the TUI-local roster, deduped.
+    /// R3 gemini MED on PR #33: the dedupe-then-push two-liner was repeated
+    /// in four places (pre-grant, sheet click, keyboard 's', scoped-paths
+    /// fallback); a single method with `contains` keeps them in sync and
+    /// names the invariant ("roster dedupes on insertion").
+    ///
+    /// R3-3 gemini MED: private `fn` scope — no external callers.
+    ///
+    /// R4-1 gemini MED on PR #33 2026-04-25: take `&str` and convert
+    /// to owned only on the push path. Previously the caller's
+    /// `String` was moved in and — if the entry was already present —
+    /// dropped unused. The duplicate path is the common case once a
+    /// session accumulates several grants. `&str` lets the caller
+    /// hand the owned string to the Vec only when we actually need
+    /// storage.
+    fn record_session_approval(&mut self, tool: &str) {
+        if !self.session_approvals.iter().any(|s| s == tool) {
+            self.session_approvals.push(tool.to_string());
+        }
+    }
+
     /// Render a `SessionEvent` into the transcript. Model text is shown
     /// prominently; internal lifecycle events are suppressed or shown as
     /// compact one-liners so the conversation is readable.
     pub fn handle_session_event(&mut self, ev: SessionEvent) {
+        self.handle_session_event_with_mode(ev, /* is_replay = */ false);
+    }
+
+    /// Render a replayed event during resume hydration — same as
+    /// `handle_session_event` but ApprovalGranted does NOT populate
+    /// the `session_approvals` roster.
+    ///
+    /// R2-4 codex P2 on PR #33 2026-04-24: the worker does not
+    /// restore `CapabilityStore` tokens from history (v1 scope —
+    /// caps are session-scope and do not persist). If the TUI
+    /// mirrored historical ApprovalGranted events into the roster,
+    /// `/approve` would claim tools as session-approved while the
+    /// next tool call still prompted for approval. The roster must
+    /// track only LIVE mints. Replay updates everything else (cards,
+    /// usage, context digest, etc.) but skips the roster.
+    pub fn handle_replayed_session_event(&mut self, ev: SessionEvent) {
+        self.handle_session_event_with_mode(ev, /* is_replay = */ true);
+    }
+
+    fn handle_session_event_with_mode(&mut self, ev: SessionEvent, is_replay: bool) {
         match ev {
             SessionEvent::ContractAccepted { contract, .. } => {
                 let goal = contract.goal.clone();
@@ -1047,8 +1162,19 @@ impl AppState {
                     .push(Note::info(format!("contract accepted · {goal}")));
                 self.current_contract_id = Some(contract.id);
             }
-            SessionEvent::TurnStarted { turn_id, .. } => {
-                self.cards.push(TurnCard::agent(turn_id.to_string()));
+            SessionEvent::TurnStarted {
+                turn_id, timestamp, ..
+            } => {
+                // F4 2026-04-24: hydrate started_wall from the event
+                // timestamp (Chronon CP-1). Previously I destructured
+                // with `..` and dropped the timestamp, so every
+                // resumed card anchored to SystemTime::now() and
+                // displayed "t+0.0s" regardless of original wall time.
+                let mut card = TurnCard::agent(turn_id.to_string());
+                if let Some(wall) = parse_rfc3339_to_system_time(&timestamp) {
+                    card.started_wall = wall;
+                }
+                self.cards.push(card);
                 self.tab_order_cache = None;
                 self.tab_cursor = None;
                 self.whisper.set("thinking");
@@ -1326,15 +1452,33 @@ impl AppState {
                     }
                 }
             }
-            SessionEvent::ApprovalGranted { scope, .. } => {
+            SessionEvent::ApprovalGranted {
+                scope, tool_name, ..
+            } => {
                 let label = match &scope {
                     ApprovalScope::Once => "once",
                     ApprovalScope::Session => "session",
                     ApprovalScope::ScopedPaths { .. } => "scoped-paths",
                 };
                 self.notes.push(Note::info(format!("approval · {label}")));
+                // R4 codex P2: authoritative mint signal → roster.
+                // R2-4 codex P2: but only for LIVE grants. Historical
+                // ApprovalGranted events replayed during hydration
+                // describe tokens that no longer exist (the worker's
+                // CapabilityStore starts fresh each resume). Skipping
+                // roster update on replay keeps the TUI mirror
+                // faithful to active capabilities.
+                if !is_replay && matches!(scope, ApprovalScope::Session) {
+                    if let Some(tool) = tool_name.as_deref() {
+                        // R4-1: pass `&str` — the helper clones only
+                        // if the roster doesn't already contain it.
+                        self.record_session_approval(tool);
+                    }
+                }
             }
-            SessionEvent::TurnCommitted { turn_id, usage, .. } => {
+            SessionEvent::TurnCommitted {
+                turn_id, usage, at, ..
+            } => {
                 self.last_input_tokens = usage.input_tokens;
                 if self.max_context_tokens > 0 {
                     self.ctx_pct = ((usage.input_tokens as u64 * 100)
@@ -1359,7 +1503,15 @@ impl AppState {
                     // labels. `committed_at` stays monotonic for the
                     // bloom animation; `committed_wall` is what the
                     // header cache reads.
-                    card.committed_wall = Some(std::time::SystemTime::now());
+                    // F4 2026-04-24: honour the event's `at` field
+                    // (Chronon CP-1) when present so resumed cards
+                    // show the original commit wall time. Pre-CP-1
+                    // sessions (or malformed timestamps) fall back
+                    // to now() — forward-compat replay stays clean.
+                    card.committed_wall = at
+                        .as_deref()
+                        .and_then(parse_rfc3339_to_system_time)
+                        .or_else(|| Some(std::time::SystemTime::now()));
                 }
                 self.committed_turns = self.committed_turns.saturating_add(1);
                 self.whisper.clear();
@@ -1368,6 +1520,7 @@ impl AppState {
                 turn_id,
                 reason,
                 detail,
+                at,
                 ..
             } => {
                 let tid = turn_id.to_string();
@@ -1378,16 +1531,32 @@ impl AppState {
                         reason: reason_str.clone(),
                         detail: detail_str.clone(),
                     };
+                    // codex R1 P2 2026-04-24: aborted cards need a
+                    // terminal wall-clock anchor too, else the header
+                    // cache falls back to SystemTime::now() and the
+                    // "t+Xs" label drifts forever on a resumed failed
+                    // turn. F4 only covered TurnCommitted — extending
+                    // to both terminal-negative variants here.
+                    card.committed_wall = at
+                        .as_deref()
+                        .and_then(parse_rfc3339_to_system_time)
+                        .or_else(|| Some(std::time::SystemTime::now()));
                 }
-                self.notes.push(Note::warn(format!(
-                    "aborted · {reason_str}{}{}",
-                    if detail_str.is_empty() { "" } else { " · " },
-                    detail_str
-                )));
+                // F9 2026-04-24: whisper is a short pointer — the card's
+                // CardState::Aborted { reason, detail } already renders
+                // both on the canvas one row below this note, so
+                // including the detail here prints the same 80-col line
+                // twice. Keep the whisper at reason-only.
+                let _ = detail_str; // intentionally unused for whisper
+                self.notes
+                    .push(Note::warn(format!("aborted · {reason_str}")));
                 self.whisper.clear();
             }
             SessionEvent::TurnInterrupted {
-                turn_id, reason, ..
+                turn_id,
+                reason,
+                at,
+                ..
             } => {
                 let tid = turn_id.to_string();
                 let reason_str = format!("{reason:?}");
@@ -1395,6 +1564,11 @@ impl AppState {
                     card.state = CardState::Interrupted {
                         reason: reason_str.clone(),
                     };
+                    // codex R1 P2: same wall-clock anchor for interrupted.
+                    card.committed_wall = at
+                        .as_deref()
+                        .and_then(parse_rfc3339_to_system_time)
+                        .or_else(|| Some(std::time::SystemTime::now()));
                 }
                 self.notes
                     .push(Note::info(format!("interrupted · {reason_str}")));
@@ -1582,6 +1756,58 @@ impl Drop for ActiveCancelGuard {
     }
 }
 
+/// Build the resume / session banner shown as the first whisper-note after
+/// the TUI comes up.
+///
+/// F5 2026-04-24: was `resumed · <session_path>` (path only).
+/// `docs/draft_plan.md §Resume and session lifecycle` spec calls for
+/// contract id, last checkpoint id, and (committed, interrupted) counts.
+/// A pure function so we can test the formatting without booting a worker.
+/// Parse a Chronon CP-1 RFC3339 timestamp string into `SystemTime`.
+/// Returns `None` on malformed input (pre-CP-1 sessions carry `None`
+/// for `at` and legacy forward-compat replay must not panic).
+///
+/// R2-1 gemini MED on PR #33 2026-04-24: was a nested fn inside
+/// `handle_session_event`, logically re-defined on every event. Now a
+/// plain module-level helper — every match arm that needs it imports
+/// nothing, just calls it directly.
+fn parse_rfc3339_to_system_time(s: &str) -> Option<std::time::SystemTime> {
+    time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339)
+        .ok()
+        .map(std::time::SystemTime::from)
+}
+
+pub(crate) fn resume_summary(
+    resuming: bool,
+    as_of: Option<&str>,
+    contract_id: Option<&str>,
+    checkpoint_id: Option<&str>,
+    committed_turns: u32,
+    interrupted_turns: u32,
+) -> String {
+    if !resuming {
+        return "session".to_string();
+    }
+    let mut s = if let Some(t) = as_of {
+        format!("resumed · read-only · as-of {t}")
+    } else {
+        "resumed".to_string()
+    };
+    if let Some(c) = contract_id {
+        s.push_str(" · ");
+        s.push_str(c);
+    }
+    if let Some(k) = checkpoint_id {
+        s.push_str(" · ");
+        s.push_str(k);
+    }
+    s.push_str(&format!(" · {committed_turns} turns"));
+    if interrupted_turns > 0 {
+        s.push_str(&format!(" · {interrupted_turns} interrupted"));
+    }
+    s
+}
+
 pub async fn run_app(resume: Option<String>, as_of: Option<String>) -> io::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -1594,6 +1820,20 @@ pub async fn run_app(resume: Option<String>, as_of: Option<String>) -> io::Resul
     let (user_tx, mut user_rx) = mpsc::channel::<String>(8);
     let (contract_tx, mut contract_rx) = mpsc::channel::<Contract>(8);
     let (session_tx, mut session_rx) = mpsc::unbounded_channel::<SessionEvent>();
+    // R2-4 codex P2 on PR #33 2026-04-24: events emitted by the
+    // replay-hydration loop go through this dedicated channel so the
+    // TUI can tell them apart from live ones and skip roster updates
+    // on historical ApprovalGranted events (worker CapabilityStore
+    // starts fresh each resume — historical tokens don't exist).
+    //
+    // R3-4 gemini MED on PR #33 2026-04-25: bounded at 256 (was
+    // unbounded). The scan is already materialised in the worker's
+    // `resume_scan: Vec<SessionEvent>` — an unbounded replay channel
+    // effectively doubled that memory until the consumer drained it.
+    // 256 is enough that the send loop rarely blocks for the
+    // handle_replayed_session_event cost profile (card/cell appends,
+    // usage updates — all O(1)), while capping resume peak memory.
+    let (replay_tx, mut replay_rx) = mpsc::channel::<SessionEvent>(256);
     let (error_tx, mut error_rx) = mpsc::channel::<String>(8);
     let (approval_req_tx, mut approval_req_rx) = mpsc::channel::<ApprovalRequestMsg>(8);
     let (approve_tx, mut approve_rx) = mpsc::channel::<String>(8);
@@ -1649,6 +1889,15 @@ pub async fn run_app(resume: Option<String>, as_of: Option<String>) -> io::Resul
     let profile_max_ctx = provider_profile.max_context_tokens;
     let profile_status = format!("{} · {}", provider_profile.name, provider_profile.model_id);
 
+    // F5 + R5 2026-04-24: banner data is produced by the worker after
+    // recover_dangling() + post-recovery scan, then pushed through this
+    // channel to the parent render loop. Previously I ran the scan on
+    // the parent thread (synchronous blocking IO on TUI startup, plus
+    // a timing bug codex P2 #2 flagged: the parent scan captured
+    // pre-recovery counts, so dangling turns reclassified as
+    // interrupted didn't show up in the banner).
+    let (banner_tx, mut banner_rx) = mpsc::channel::<String>(1);
+
     // Shared handle for cooperative turn cancellation. The worker owns
     // the write path (via `ActiveCancelGuard`, defined at module level
     // so the tests in `tests` mod can exercise the panic-safety
@@ -1657,9 +1906,14 @@ pub async fn run_app(resume: Option<String>, as_of: Option<String>) -> io::Resul
     let active_cancel: Arc<Mutex<Option<CancellationToken>>> = Arc::new(Mutex::new(None));
 
     let worker_session_tx = session_tx.clone();
+    let worker_replay_tx = replay_tx;
     let worker_error_tx = error_tx.clone();
     let worker_boot_phase_tx = boot_phase_tx.clone();
     let worker_ready_tx = ready_tx.clone();
+    let worker_banner_tx = banner_tx;
+    let worker_resuming = resuming;
+    let banner_as_of = as_of.clone();
+    let banner_session_path = session_path.clone();
     let worker_run_id = run_id.clone();
     let worker_cwd = cwd.clone();
     let worker_session_path = session_path.clone();
@@ -1765,11 +2019,50 @@ pub async fn run_app(resume: Option<String>, as_of: Option<String>) -> io::Resul
 
         // Hydrate UI from the cached scan. Same replayable-only slice
         // as before, just folded without a second file read.
+        //
+        // R2-4 2026-04-24: emit through `replay_tx`, NOT `session_tx`,
+        // so the TUI routes these through `handle_replayed_session_event`
+        // and skips the roster-update arm on historical ApprovalGranted.
         if let Some(scan) = &resume_scan {
             for ev in scan.replayable() {
-                let _ = worker_session_tx.send(ev.0);
+                // R3-4 2026-04-25: bounded channel send is async —
+                // await so we actually block for capacity (backpressure
+                // against a slow consumer) instead of silently dropping
+                // the future on the floor.
+                let _ = worker_replay_tx.send(ev.0).await;
             }
         }
+
+        // R5 codex P2 2026-04-24: banner is built from the
+        // post-recovery scan here (NOT from a second parent-side
+        // scan). Dangling turns reclassified as interrupted during
+        // recover_dangling now surface correctly. Sent via the
+        // mpsc::channel<String>(1); parent's main loop picks it up
+        // and pushes to state.notes. On non-resume paths we still
+        // send the plain "session · <path>" banner for consistency.
+        let banner_text = {
+            let (contract_id, checkpoint_id, committed, interrupted) = resume_scan
+                .as_ref()
+                .map(|s| {
+                    (
+                        s.last_accepted_contract().map(|c| c.id),
+                        s.last_checkpoint_id(),
+                        s.committed_run_progress().1,
+                        s.interrupted_turn_count(),
+                    )
+                })
+                .unwrap_or((None, None, 0, 0));
+            let core = resume_summary(
+                worker_resuming,
+                banner_as_of.as_deref(),
+                contract_id.as_ref().map(|c| c.0.as_str()),
+                checkpoint_id.as_ref().map(|c| c.0.as_str()),
+                committed,
+                interrupted,
+            );
+            format!("{core} · {}", banner_session_path.display())
+        };
+        let _ = worker_banner_tx.send(banner_text).await;
 
         // Tap attaches AFTER hydration + recovery, so future live
         // events flow to the UI without double-feeding the hydration
@@ -2138,6 +2431,7 @@ pub async fn run_app(resume: Option<String>, as_of: Option<String>) -> io::Resul
                             approval_id: ApprovalId::new(),
                             token: CapabilityTokenId::new(),
                             scope: ApprovalScope::Session,
+                            tool_name: Some(tool_name.clone()),
                         });
                     } else {
                         let _ = worker_error_tx
@@ -2333,19 +2627,10 @@ pub async fn run_app(resume: Option<String>, as_of: Option<String>) -> io::Resul
     // already cloned above (see `worker_active_cancel`). Without this
     // line both sides hold distinct Arcs and Ctrl+C silently no-ops.
     state.active_cancel = active_cancel;
-    // Chronon CP-5: banner surfaces the as-of cutoff so the operator
-    // sees instantly that new turns will not fire. Deferred: a TUI Rail
-    // slider that scrubs through prior snapshots — CP-6 commit flagged
-    // it as needing its own UX round; read-only mode here is the
-    // load-bearing minimum.
-    let banner = match (resuming, as_of.as_deref()) {
-        (true, Some(t)) => format!("resumed · read-only · as-of {t}"),
-        (true, None) => "resumed".to_string(),
-        (false, _) => "session".to_string(),
-    };
-    state
-        .notes
-        .push(Note::info(format!("{banner} · {}", session_path.display())));
+    // F5 + R5 2026-04-24: the banner is now delivered by the worker
+    // through `banner_rx` once it has finished recover_dangling +
+    // post-recovery scan. A select! branch below pushes it into
+    // state.notes as soon as it arrives; no synchronous scan here.
     // 50ms tick = 20fps, fast enough for the 80ms spinner cadence to
     // land on a frame boundary without skipping. The handler below
     // only marks dirty when an animation is actually running, so a
@@ -2396,6 +2681,17 @@ pub async fn run_app(resume: Option<String>, as_of: Option<String>) -> io::Resul
                     }
                 }
             }
+            // R3-1 codex P1 on PR #33 2026-04-25: replay MUST drain
+            // before live — my R2-4 commit put `session_rx` first.
+            // Under biased ordering, a live event that landed before
+            // the replay backlog fully drained would overtake the
+            // history, painting the transcript with new content
+            // interleaved against the resumed scrollback. Pushing
+            // `replay_rx` ahead in the biased list preserves the
+            // causal ordering: worker emitted all replay events
+            // BEFORE attaching the live tap, so until replay_rx is
+            // empty the consumer should ignore session_rx.
+            Some(ev) = replay_rx.recv() => state.handle_replayed_session_event(ev),
             Some(ev) = session_rx.recv() => state.handle_session_event(ev),
             Some(req) = approval_req_rx.recv() => {
                 state.set_card_awaiting_approval(&req.turn_id);
@@ -2424,6 +2720,14 @@ pub async fn run_app(resume: Option<String>, as_of: Option<String>) -> io::Resul
             Some(_) = ready_rx.recv() => {
                 state.booting = false;
                 state.boot_phase = "ready".to_string();
+                state.dirty = true;
+            }
+            Some(banner) = banner_rx.recv() => {
+                // R5 2026-04-24: worker finished post-recovery scan;
+                // push the enriched banner now. Separate branch from
+                // ready_rx so a slow recovery doesn't block the ready
+                // transition and vice versa.
+                state.notes.push(Note::info(banner));
                 state.dirty = true;
             }
             _ = ticker.tick() => {
@@ -2457,6 +2761,483 @@ pub async fn run_app(resume: Option<String>, as_of: Option<String>) -> io::Resul
 mod tests {
     use super::*;
     use azoth_core::schemas::ContextPacketId;
+
+    #[test]
+    fn slash_approve_empty_lists_prior_session_grants() {
+        // F6 + R4 2026-04-24: the SlashCommand::Approve doc claimed
+        // empty-arg "lists active capability tokens" but the handler
+        // only printed usage. I wired the roster — BUT per codex R4
+        // on PR #33, the roster must mirror the authoritative
+        // CapabilityStore (worker-side mint), not the /approve <tool>
+        // pre-intent. So the test now feeds SessionEvent::ApprovalGranted
+        // directly (what the worker would emit after a successful mint).
+        use azoth_core::schemas::{ApprovalScope, CapabilityTokenId};
+        let mut state = AppState::new();
+        // Empty state → helpful usage + no-grants hint
+        state.run_palette_action(super::PaletteAction::Approve(None));
+        let n = state.notes.last().expect("note");
+        assert!(n.text.contains("none granted"), "got: {:?}", n.text);
+
+        // Pre-intent via /approve <tool> must NOT touch the roster
+        // until the worker confirms via ApprovalGranted.
+        state.run_palette_action(super::PaletteAction::Approve(Some("fs_write".into())));
+        assert!(
+            state.session_approvals.is_empty(),
+            "pre-intent must not populate roster; got: {:?}",
+            state.session_approvals
+        );
+
+        // Worker confirms fs_write mint → roster records.
+        for (tool, fire_twice) in [("fs_write", true), ("bash", false)] {
+            let count = if fire_twice { 2 } else { 1 };
+            for _ in 0..count {
+                state.handle_session_event(SessionEvent::ApprovalGranted {
+                    turn_id: TurnId::from("pre-approve".to_string()),
+                    approval_id: ApprovalId::new(),
+                    token: CapabilityTokenId::new(),
+                    scope: ApprovalScope::Session,
+                    tool_name: Some(tool.into()),
+                });
+            }
+        }
+
+        // Empty /approve now lists, dedupe respected.
+        state.run_palette_action(super::PaletteAction::Approve(None));
+        let n = state.notes.last().expect("list note");
+        assert!(n.text.contains("fs_write"), "got: {:?}", n.text);
+        assert!(n.text.contains("bash"), "got: {:?}", n.text);
+        assert!(
+            n.text.contains("(2)"),
+            "count must reflect deduped roster size; got: {:?}",
+            n.text
+        );
+        assert_eq!(state.session_approvals.len(), 2, "dedupe invariant");
+    }
+
+    #[test]
+    fn replayed_approval_granted_does_not_populate_roster() {
+        // R2-4 codex P2 on PR #33 2026-04-24: worker CapabilityStore
+        // starts fresh each resume. Historical ApprovalGranted events
+        // replayed during hydration describe tokens that no longer
+        // exist — mirroring them into session_approvals would lie to
+        // the operator running /approve.
+        use azoth_core::schemas::{ApprovalScope, CapabilityTokenId};
+        let mut state = AppState::new();
+        state.handle_replayed_session_event(SessionEvent::ApprovalGranted {
+            turn_id: TurnId::from("t_old".to_string()),
+            approval_id: ApprovalId::new(),
+            token: CapabilityTokenId::new(),
+            scope: ApprovalScope::Session,
+            tool_name: Some("bash".into()),
+        });
+        assert!(
+            state.session_approvals.is_empty(),
+            "replayed grants MUST NOT populate roster; got: {:?}",
+            state.session_approvals
+        );
+        // Live path still works on a fresh state.
+        state.handle_session_event(SessionEvent::ApprovalGranted {
+            turn_id: TurnId::from("t_live".to_string()),
+            approval_id: ApprovalId::new(),
+            token: CapabilityTokenId::new(),
+            scope: ApprovalScope::Session,
+            tool_name: Some("fs_write".into()),
+        });
+        assert_eq!(
+            state.session_approvals,
+            vec!["fs_write".to_string()],
+            "live grant populates; got: {:?}",
+            state.session_approvals
+        );
+    }
+
+    #[test]
+    fn approval_granted_once_scope_does_not_populate_roster() {
+        // R4 regression guard: a one-time grant is not a session
+        // grant, so the roster must stay clean.
+        use azoth_core::schemas::{ApprovalScope, CapabilityTokenId};
+        let mut state = AppState::new();
+        state.handle_session_event(SessionEvent::ApprovalGranted {
+            turn_id: TurnId::from("t_1".to_string()),
+            approval_id: ApprovalId::new(),
+            token: CapabilityTokenId::new(),
+            scope: ApprovalScope::Once,
+            tool_name: Some("bash".into()),
+        });
+        assert!(
+            state.session_approvals.is_empty(),
+            "Once scope must not populate session roster; got: {:?}",
+            state.session_approvals
+        );
+    }
+
+    #[test]
+    fn legacy_approval_granted_without_tool_name_does_not_panic() {
+        // Pre-R4 sessions (no tool_name field) must replay clean on
+        // new binaries. tool_name: None → no roster update.
+        use azoth_core::schemas::{ApprovalScope, CapabilityTokenId};
+        let mut state = AppState::new();
+        state.handle_session_event(SessionEvent::ApprovalGranted {
+            turn_id: TurnId::from("t_1".to_string()),
+            approval_id: ApprovalId::new(),
+            token: CapabilityTokenId::new(),
+            scope: ApprovalScope::Session,
+            tool_name: None,
+        });
+        assert!(
+            state.session_approvals.is_empty(),
+            "tool_name=None must be a no-op for the roster"
+        );
+    }
+
+    #[test]
+    fn resume_summary_banner_carries_contract_checkpoint_and_turn_counts() {
+        // F5 2026-04-24: the banner was `resumed · <session_path>` —
+        // no contract, no checkpoint, no turn counts. draft_plan.md
+        // §Resume and session lifecycle spec: the enriched form.
+        let b = super::resume_summary(
+            true,
+            None,
+            Some("ctr_8b2770f7f9"),
+            Some("chk_c0154ed85c78"),
+            2,
+            1,
+        );
+        assert!(b.starts_with("resumed"), "got: {b:?}");
+        assert!(b.contains("ctr_8b2770f7f9"), "contract id missing: {b:?}");
+        assert!(
+            b.contains("chk_c0154ed85c78"),
+            "checkpoint id missing: {b:?}"
+        );
+        assert!(b.contains("2 turns"), "committed count missing: {b:?}");
+        assert!(
+            b.contains("1 interrupted"),
+            "interrupted count missing: {b:?}"
+        );
+    }
+
+    #[test]
+    fn resume_summary_omits_interrupted_suffix_when_zero() {
+        // A clean run shouldn't show "· 0 interrupted" noise.
+        let b = super::resume_summary(true, None, Some("ctr_x"), Some("chk_y"), 5, 0);
+        assert!(
+            !b.contains("interrupted"),
+            "clean resume must omit the interrupted clause; got: {b:?}"
+        );
+    }
+
+    #[test]
+    fn resume_summary_non_resume_returns_session_literal() {
+        // Regression guard: the no-resume startup path (fresh session)
+        // still renders the plain "session" marker that the existing
+        // `session banner` test in this module relies on.
+        let b = super::resume_summary(false, None, None, None, 0, 0);
+        assert_eq!(b, "session");
+    }
+
+    #[test]
+    fn resume_summary_read_only_surface_preserves_as_of_prefix() {
+        // Chronon CP-5: when resuming with --as-of, the banner must
+        // tell the operator the session is read-only so they don't
+        // wonder why Enter doesn't send.
+        let b = super::resume_summary(
+            true,
+            Some("2026-04-24T20:00:00Z"),
+            Some("ctr_q"),
+            Some("chk_q"),
+            3,
+            0,
+        );
+        assert!(b.contains("read-only"), "got: {b:?}");
+        assert!(b.contains("as-of 2026-04-24T20:00:00Z"), "got: {b:?}");
+    }
+
+    #[test]
+    fn resume_hydrates_wall_clocks_from_turn_event_timestamps() {
+        // F4 2026-04-24: CLAUDE.md §"Dual-clock fields (R27 pattern)"
+        // warns that `committed_wall: SystemTime` must carry through
+        // JSONL so resumed cards show the original "t+Xs" elapsed.
+        // I destructured TurnStarted/TurnCommitted with `..` and
+        // dropped the timestamps — every resumed card anchored to
+        // SystemTime::now() at resume time, so every t+ read 0.0s.
+        use azoth_core::schemas::{CommitOutcome, Usage};
+        let mut state = AppState::new();
+        let tid = TurnId::new();
+        state.handle_session_event(SessionEvent::TurnStarted {
+            turn_id: tid.clone(),
+            run_id: RunId::new(),
+            parent_turn: None,
+            timestamp: "2026-04-24T20:00:00Z".into(),
+        });
+        state.handle_session_event(SessionEvent::TurnCommitted {
+            turn_id: tid,
+            outcome: CommitOutcome::Success,
+            usage: Usage::default(),
+            user_input: None,
+            final_assistant: None,
+            at: Some("2026-04-24T20:00:42Z".into()),
+        });
+        let card = state.cards.last().expect("card exists");
+        let sw = card.started_wall;
+        let cw = card
+            .committed_wall
+            .expect("committed_wall populated by TurnCommitted");
+        // The delta MUST reflect the 42s that elapsed on the
+        // original turn, not the ~µs between two synchronous test
+        // calls. If this assertion fails the TUI is anchoring to
+        // SystemTime::now() instead of the event timestamps.
+        let delta = cw
+            .duration_since(sw)
+            .expect("committed_wall ≥ started_wall");
+        assert_eq!(
+            delta.as_secs(),
+            42,
+            "wall-clock delta must survive resume; got {}s",
+            delta.as_secs()
+        );
+    }
+
+    #[test]
+    fn resume_hydrates_committed_wall_for_aborted_and_interrupted_cards() {
+        // codex R1 P2 2026-04-24: F4 covered TurnCommitted. Aborted
+        // / Interrupted cards need the same wall-clock freeze or
+        // the header-cache SystemTime::now() fallback makes their
+        // elapsed label drift on resumed failed turns.
+        use azoth_core::schemas::{AbortReason, Usage, UsageDelta};
+        let mut state = AppState::new();
+        let t_abort = TurnId::new();
+        let t_intr = TurnId::new();
+        // aborted turn
+        state.handle_session_event(SessionEvent::TurnStarted {
+            turn_id: t_abort.clone(),
+            run_id: RunId::new(),
+            parent_turn: None,
+            timestamp: "2026-04-24T20:00:00Z".into(),
+        });
+        state.handle_session_event(SessionEvent::TurnAborted {
+            turn_id: t_abort.clone(),
+            reason: AbortReason::ContextOverflow,
+            detail: None,
+            usage: Usage::default(),
+            at: Some("2026-04-24T20:00:13Z".into()),
+        });
+        let card = state.cards.last().expect("aborted card");
+        let cw = card
+            .committed_wall
+            .expect("TurnAborted must anchor committed_wall");
+        let delta = cw.duration_since(card.started_wall).unwrap();
+        assert_eq!(delta.as_secs(), 13, "aborted elapsed frozen at 13s");
+
+        // interrupted turn
+        state.handle_session_event(SessionEvent::TurnStarted {
+            turn_id: t_intr.clone(),
+            run_id: RunId::new(),
+            parent_turn: None,
+            timestamp: "2026-04-24T21:00:00Z".into(),
+        });
+        state.handle_session_event(SessionEvent::TurnInterrupted {
+            turn_id: t_intr,
+            reason: AbortReason::UserCancel,
+            partial_usage: UsageDelta::default(),
+            at: Some("2026-04-24T21:00:07Z".into()),
+        });
+        let card = state.cards.last().expect("interrupted card");
+        let cw = card
+            .committed_wall
+            .expect("TurnInterrupted must anchor committed_wall");
+        let delta = cw.duration_since(card.started_wall).unwrap();
+        assert_eq!(delta.as_secs(), 7, "interrupted elapsed frozen at 7s");
+    }
+
+    #[test]
+    fn malformed_timestamp_falls_back_to_now_instead_of_panicking() {
+        // Regression guard: a pre-CP-1 session (missing `at`) or a
+        // mangled timestamp must not panic the hydrator. We fall
+        // back to SystemTime::now() — the old behaviour — so
+        // forward-compat replay stays clean.
+        use azoth_core::schemas::{CommitOutcome, Usage};
+        let mut state = AppState::new();
+        let tid = TurnId::new();
+        state.handle_session_event(SessionEvent::TurnStarted {
+            turn_id: tid.clone(),
+            run_id: RunId::new(),
+            parent_turn: None,
+            timestamp: "not-rfc3339".into(),
+        });
+        state.handle_session_event(SessionEvent::TurnCommitted {
+            turn_id: tid,
+            outcome: CommitOutcome::Success,
+            usage: Usage::default(),
+            user_input: None,
+            final_assistant: None,
+            at: None,
+        });
+        let card = state.cards.last().expect("card");
+        assert!(
+            card.committed_wall.is_some(),
+            "fallback must still set committed_wall (to now)"
+        );
+    }
+
+    #[test]
+    fn slash_continue_after_context_overflow_refuses_and_does_not_queue_turn() {
+        // F2 2026-04-24: I wired /continue to always queue a
+        // continuation prompt, never checking why the last turn
+        // aborted. A context_overflow abort means the CONTEXT is
+        // the problem — running /continue immediately re-overflows.
+        // Witnessed in E2E run_f9c7978e66de: two back-to-back
+        // context_overflow aborts from one /continue.
+        use azoth_core::schemas::{AbortReason, Usage};
+        let mut state = AppState::new();
+        let tid = TurnId::new();
+        state.handle_session_event(SessionEvent::TurnStarted {
+            turn_id: tid.clone(),
+            run_id: RunId::new(),
+            parent_turn: None,
+            timestamp: "2026-04-24T20:00:00Z".into(),
+        });
+        state.handle_session_event(SessionEvent::TurnAborted {
+            turn_id: tid,
+            reason: AbortReason::ContextOverflow,
+            detail: Some("estimate 40000 > 32768".into()),
+            usage: Usage::default(),
+            at: Some("2026-04-24T20:00:05Z".into()),
+        });
+        state.run_palette_action(super::PaletteAction::Continue);
+        assert!(
+            state.pending_user_text.is_none(),
+            "/continue after context_overflow must NOT queue a new turn"
+        );
+        let note = state.notes.last().expect("refusal note");
+        assert!(
+            note.text.contains("context full"),
+            "user must see why /continue was refused; got: {:?}",
+            note.text
+        );
+    }
+
+    #[test]
+    fn slash_continue_refuses_even_when_user_card_follows_overflow_abort() {
+        // R3-2 gemini MED on PR #33 2026-04-25: the original check
+        // only inspected cards.last() — a User card pushed between
+        // the aborted Agent card and /continue hid the abort.
+        // Fix walks back from the tail for the most recent Agent
+        // card; this test verifies that regression.
+        use azoth_core::schemas::{AbortReason, Usage};
+        let mut state = AppState::new();
+        let tid = TurnId::new();
+        state.handle_session_event(SessionEvent::TurnStarted {
+            turn_id: tid.clone(),
+            run_id: RunId::new(),
+            parent_turn: None,
+            timestamp: "2026-04-25T00:00:00Z".into(),
+        });
+        state.handle_session_event(SessionEvent::TurnAborted {
+            turn_id: tid,
+            reason: AbortReason::ContextOverflow,
+            detail: Some("estimate 40000 > 32768".into()),
+            usage: Usage::default(),
+            at: Some("2026-04-25T00:00:05Z".into()),
+        });
+        // Push a User card AFTER the overflow — the naive
+        // cards.last() check would see this and miss the abort.
+        state
+            .cards
+            .push(super::TurnCard::user("t_user", "please retry"));
+        state.run_palette_action(super::PaletteAction::Continue);
+        assert!(
+            state.pending_user_text.is_none(),
+            "/continue must still refuse with intervening user card; queued: {:?}",
+            state.pending_user_text
+        );
+        let note = state.notes.last().expect("refusal note");
+        assert!(
+            note.text.contains("context full"),
+            "user must see the refusal; got: {:?}",
+            note.text
+        );
+    }
+
+    #[test]
+    fn slash_continue_after_model_truncated_still_queues_turn() {
+        // Regression guard: /continue's original purpose is exactly
+        // to resume from a model_truncated abort. Don't break it.
+        use azoth_core::schemas::{AbortReason, Usage};
+        let mut state = AppState::new();
+        let tid = TurnId::new();
+        state.handle_session_event(SessionEvent::TurnStarted {
+            turn_id: tid.clone(),
+            run_id: RunId::new(),
+            parent_turn: None,
+            timestamp: "2026-04-24T20:00:00Z".into(),
+        });
+        state.handle_session_event(SessionEvent::TurnAborted {
+            turn_id: tid,
+            reason: AbortReason::ModelTruncated,
+            detail: None,
+            usage: Usage::default(),
+            at: Some("2026-04-24T20:00:05Z".into()),
+        });
+        state.run_palette_action(super::PaletteAction::Continue);
+        assert!(
+            state.pending_user_text.is_some(),
+            "/continue after model_truncated MUST queue the continuation turn"
+        );
+    }
+
+    #[test]
+    fn slash_continue_with_no_cards_still_queues_turn() {
+        // Regression guard: empty history (no prior turn yet) ⇒
+        // /continue is a no-op historically but should still queue
+        // (the worker will produce something sensible even if the
+        // model has nothing to resume from). Don't tighten beyond
+        // the documented context_overflow case.
+        let mut state = AppState::new();
+        state.run_palette_action(super::PaletteAction::Continue);
+        assert!(
+            state.pending_user_text.is_some(),
+            "empty history /continue stays functional"
+        );
+    }
+
+    #[test]
+    fn turn_aborted_whisper_note_is_reason_only_not_full_detail() {
+        // F9 2026-04-24: the TurnAborted handler was pushing
+        // reason+detail as a warn-note while simultaneously setting
+        // the card to CardState::Aborted { reason, detail } — the
+        // same 80-col error printed twice on adjacent rows. Whisper
+        // is a "look at your card" hint; the card owns the detail.
+        use azoth_core::schemas::{AbortReason, Usage};
+        let mut state = AppState::new();
+        let tid = TurnId::new();
+        state.handle_session_event(SessionEvent::TurnStarted {
+            turn_id: tid.clone(),
+            run_id: RunId::new(),
+            parent_turn: None,
+            timestamp: "2026-04-24T20:00:00Z".into(),
+        });
+        state.handle_session_event(SessionEvent::TurnAborted {
+            turn_id: tid,
+            reason: AbortReason::ContextOverflow,
+            detail: Some("estimate 36072 tokens > profile max_context_tokens 32768".into()),
+            usage: Usage::default(),
+            at: Some("2026-04-24T20:00:05Z".into()),
+        });
+        let note = state
+            .notes
+            .last()
+            .expect("TurnAborted pushes a whisper note");
+        assert!(
+            note.text.starts_with("aborted · ContextOverflow"),
+            "whisper leads with reason; got: {:?}",
+            note.text
+        );
+        assert!(
+            !note.text.contains("36072"),
+            "whisper MUST NOT repeat the card's detail text; got: {:?}",
+            note.text
+        );
+    }
 
     #[test]
     fn slash_contract_with_goal_queues_draft_for_worker() {

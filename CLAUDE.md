@@ -77,7 +77,7 @@ The interactive TUI lives in `crates/azoth/src/tui/`. Design system: **PAPER** �
 | `inspector.rs` | ⌃2 right drawer. `InspectorData { ctx_pct, ctx_history, packet_digest, contract_goal, contract_budget, evidence_lanes, tools, turn_id }`. `render_section_header` takes `&'static str` (all call sites literals). |
 | `rail.rs` | ⌃1 left drawer. Turn miniatures — role + ts + prose excerpt per card. |
 | `whisper.rs` | Single-row narrator above composer. Three states: narrating (spinner + text + elapsed), recent note (<5s old), default "ready · ⌃K for commands". |
-| `input/` | `tui-textarea-2 0.10` wrapper (for ratatui 0.30 — DO NOT use `tui-textarea 0.7`). Slash parser, @file completion, history nav. |
+| `input/` | `tui-textarea-2 0.10` wrapper (for ratatui 0.30 — DO NOT use `tui-textarea 0.7`). Slash parser, history nav. (@file completion is NOT wired — see Known deferred below.) |
 
 ### Render loop (app.rs)
 
@@ -307,6 +307,7 @@ Future Claude: these have been examined multiple times. Each is tracked in-code 
 - **render.rs:317 within-card virtualisation** — cards taller than remaining viewport materialise rows that get cropped. Shares emission refactor with RefCell round.
 - **card.rs:512 render_rows Vec-return signature** — shares refactor.
 - **tint_code multi-byte** — byte-tokenizer is UTF-8 safe; multi-byte identifiers fall through to plain ink. Regression test `tint_code_handles_mixed_ascii_and_multi_byte_content` covers no-panic + no-dropped-chars. Acceptable as-is.
+- **@file completion widget** (F7 2026-04-24 dogfood) — ergonomics favour it: type `@`, fuzzy-match repo files against `ignore::WalkBuilder` results, Tab to accept. This earlier `input/` row claimed the feature existed; it never did. Implementing it properly needs a full sprint: trigger detection on `@` inside `tui-textarea-2` edits, popup widget drawing with `render::frame` z-order above composer, fuzzy matcher + caching, Tab / Arrow / Esc nav, pending-token render inside the composer, and test coverage for each of those. Model-side workaround today: users type `@path` as literal text; the model can still act on it via `repo_read_file`. Do NOT half-ship.
 
 ## Test Patterns
 

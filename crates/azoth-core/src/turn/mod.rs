@@ -1466,6 +1466,7 @@ impl<'a> TurnDriver<'a> {
                                                 approval_id: approval_id.clone(),
                                                 token: tok_id,
                                                 scope: scope.clone(),
+                                                tool_name: Some(tool_name.clone()),
                                             })?;
                                             telemetry::emit_approval_granted(
                                                 &self.run_id.0,

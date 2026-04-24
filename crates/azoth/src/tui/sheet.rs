@@ -81,10 +81,18 @@ pub fn render(
             ),
         ])
     } else {
-        let effect_label = format!("{:?}", req.effect_class).to_lowercase();
+        // F8 2026-04-24: was `format!("{:?}", ...).to_lowercase()` which
+        // produces `applylocal` — mashed CamelCase. `as_snake()` returns
+        // `&'static str` matching serde + schemas everywhere else.
+        //
+        // R2 gemini MED on PR #33 (PAPER R24/R26): earlier I used
+        // `.to_string()` here which allocated a `String` per render
+        // frame while the sheet was visible. Swapping to the borrowed
+        // `&'static str` drops the alloc.
+        let effect_label: &'static str = req.effect_class.as_snake();
         Line::from(vec![
             Span::styled(" approve · ", theme.bold()),
-            Span::styled(effect_label.clone(), theme.ink(Colors::AMBER)),
+            Span::styled(effect_label, theme.ink(Colors::AMBER)),
             Span::styled(
                 format!(" · {} ", truncate_for_title(&req.summary, 48)),
                 theme.dim(),

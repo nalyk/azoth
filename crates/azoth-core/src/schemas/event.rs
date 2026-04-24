@@ -136,6 +136,15 @@ pub enum SessionEvent {
         approval_id: ApprovalId,
         token: CapabilityTokenId,
         scope: ApprovalScope,
+        /// R4 (codex P2, PR #33 2026-04-24): tool name the grant
+        /// covers, so TUI surfaces can mirror the authoritative
+        /// `CapabilityStore` without a dedicated query channel.
+        /// `#[serde(default)]` for backward compat — pre-R4
+        /// sessions have no tool_name, and resumed sessions
+        /// simply don't populate the TUI-local roster from
+        /// historical grants (which is already the v1 semantic).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_name: Option<String>,
     },
     ApprovalDenied {
         turn_id: TurnId,
