@@ -143,6 +143,16 @@ pub struct AppState {
     pub current_contract_id: Option<ContractId>,
     pub last_context_summary: Option<String>,
     pending_approve: Option<String>,
+    /// F6 2026-04-24: TUI-side roster of tool names the user has
+    /// granted session-scope approval for — either via `/approve
+    /// <tool>` (pre-grant) or via `s` / sheet session-grant button
+    /// on an in-flight approval. Duplicates suppressed. Rendered
+    /// by empty-arg `/approve`. The authoritative store is the
+    /// worker-side `CapabilityStore`; this mirror exists because
+    /// the TUI can't query the worker's store cheaply and the
+    /// "list what I've granted this session" signal is useful
+    /// enough to duplicate.
+    pub session_approvals: Vec<String>,
     input_history: Vec<String>,
     history_cursor: usize,
     /// Last turn's input token count — the real context window pressure.
@@ -231,6 +241,7 @@ impl AppState {
             current_contract_id: None,
             last_context_summary: None,
             pending_approve: None,
+            session_approvals: Vec::new(),
             input_history: Vec::new(),
             history_cursor: 0,
             last_input_tokens: 0,
@@ -418,11 +429,32 @@ impl AppState {
             }
             PaletteAction::Approve(Some(tool)) => {
                 self.pending_approve = Some(tool.clone());
+                // F6 2026-04-24: track the grant so empty /approve
+                // can list what we've given away this session.
+                if !self.session_approvals.iter().any(|t| t == &tool) {
+                    self.session_approvals.push(tool.clone());
+                }
                 self.notes
                     .push(Note::info(format!("approving tool {tool} session-scope")));
             }
             PaletteAction::Approve(None) => {
-                self.notes.push(Note::help("usage: /approve <tool_name>"));
+                // F6 2026-04-24: the SlashCommand::Approve doc at
+                // `tui/input/mod.rs:16-17` claimed empty-arg "lists
+                // active capability tokens". The handler here just
+                // printed usage. I'm wiring the list (from the TUI-
+                // local `session_approvals` roster) so the docstring
+                // and behaviour agree.
+                if self.session_approvals.is_empty() {
+                    self.notes.push(Note::help(
+                        "usage: /approve <tool_name> — none granted this session yet",
+                    ));
+                } else {
+                    let list = self.session_approvals.join(", ");
+                    self.notes.push(Note::info(format!(
+                        "session-approved ({}): {list}",
+                        self.session_approvals.len()
+                    )));
+                }
             }
             PaletteAction::Resume => {
                 self.notes.push(Note::help(
@@ -624,9 +656,15 @@ impl AppState {
             }
             ClickTarget::SheetApproveSession => {
                 if let Some(req) = self.take_pending_approval() {
+                    let tool = req.tool_name.clone();
                     let _ = req.responder.send(ApprovalResponse::Grant {
                         scope: ApprovalScope::Session,
                     });
+                    // F6 2026-04-24: sheet-side session-grant feeds
+                    // the same roster as /approve <tool>.
+                    if !self.session_approvals.iter().any(|t| t == &tool) {
+                        self.session_approvals.push(tool);
+                    }
                     self.notes.push(Note::info("approval · granted session"));
                 }
             }
@@ -698,9 +736,15 @@ impl AppState {
                 }
                 (KeyCode::Char('s'), _) | (KeyCode::Char('S'), _) => {
                     if let Some(req) = self.take_pending_approval() {
+                        let tool = req.tool_name.clone();
                         let _ = req.responder.send(ApprovalResponse::Grant {
                             scope: ApprovalScope::Session,
                         });
+                        // F6 2026-04-24: keyboard 's' session-grant
+                        // also feeds the roster.
+                        if !self.session_approvals.iter().any(|t| t == &tool) {
+                            self.session_approvals.push(tool);
+                        }
                         self.notes.push(Note::info("approval · granted session"));
                     }
                 }
@@ -710,9 +754,15 @@ impl AppState {
                     // the user knows the batch-plan sheet isn't in this
                     // build yet. Bona-fide ScopedPaths lands in v2.1.
                     if let Some(req) = self.take_pending_approval() {
+                        let tool = req.tool_name.clone();
                         let _ = req.responder.send(ApprovalResponse::Grant {
                             scope: ApprovalScope::Session,
                         });
+                        // F6: scoped-paths-fallback IS a session grant
+                        // in v1 semantics, so the roster includes it.
+                        if !self.session_approvals.iter().any(|t| t == &tool) {
+                            self.session_approvals.push(tool);
+                        }
                         self.notes.push(Note::info(
                             "approval · scoped-paths falls back to session in v1",
                         ));
@@ -2580,6 +2630,36 @@ pub async fn run_app(resume: Option<String>, as_of: Option<String>) -> io::Resul
 mod tests {
     use super::*;
     use azoth_core::schemas::ContextPacketId;
+
+    #[test]
+    fn slash_approve_empty_lists_prior_session_grants() {
+        // F6 2026-04-24: the SlashCommand::Approve doc claimed empty-arg
+        // "lists active capability tokens" but the handler only printed
+        // usage. I'm wiring the roster the docstring advertised.
+        let mut state = AppState::new();
+        // Empty state → helpful usage + no-grants hint
+        state.run_palette_action(super::PaletteAction::Approve(None));
+        let n = state.notes.last().expect("note");
+        assert!(n.text.contains("none granted"), "got: {:?}", n.text);
+
+        // Pre-grant two tools via /approve <tool>
+        state.run_palette_action(super::PaletteAction::Approve(Some("fs_write".into())));
+        state.run_palette_action(super::PaletteAction::Approve(Some("bash".into())));
+        // Duplicate grant — must not double-list
+        state.run_palette_action(super::PaletteAction::Approve(Some("fs_write".into())));
+
+        // Empty /approve now lists
+        state.run_palette_action(super::PaletteAction::Approve(None));
+        let n = state.notes.last().expect("list note");
+        assert!(n.text.contains("fs_write"), "got: {:?}", n.text);
+        assert!(n.text.contains("bash"), "got: {:?}", n.text);
+        assert!(
+            n.text.contains("(2)"),
+            "count must reflect deduped roster size; got: {:?}",
+            n.text
+        );
+        assert_eq!(state.session_approvals.len(), 2, "dedupe invariant");
+    }
 
     #[test]
     fn resume_summary_banner_carries_contract_checkpoint_and_turn_counts() {
