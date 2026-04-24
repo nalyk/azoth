@@ -429,11 +429,9 @@ impl AppState {
             }
             PaletteAction::Approve(Some(tool)) => {
                 self.pending_approve = Some(tool.clone());
-                // F6 2026-04-24: track the grant so empty /approve
-                // can list what we've given away this session.
-                if !self.session_approvals.iter().any(|t| t == &tool) {
-                    self.session_approvals.push(tool.clone());
-                }
+                // F6 2026-04-24 · R3 refactor: dedupe-then-push via the
+                // `record_session_approval` helper.
+                self.record_session_approval(tool.clone());
                 self.notes
                     .push(Note::info(format!("approving tool {tool} session-scope")));
             }
@@ -660,11 +658,8 @@ impl AppState {
                     let _ = req.responder.send(ApprovalResponse::Grant {
                         scope: ApprovalScope::Session,
                     });
-                    // F6 2026-04-24: sheet-side session-grant feeds
-                    // the same roster as /approve <tool>.
-                    if !self.session_approvals.iter().any(|t| t == &tool) {
-                        self.session_approvals.push(tool);
-                    }
+                    // F6 · R3 refactor.
+                    self.record_session_approval(tool);
                     self.notes.push(Note::info("approval · granted session"));
                 }
             }
@@ -740,11 +735,8 @@ impl AppState {
                         let _ = req.responder.send(ApprovalResponse::Grant {
                             scope: ApprovalScope::Session,
                         });
-                        // F6 2026-04-24: keyboard 's' session-grant
-                        // also feeds the roster.
-                        if !self.session_approvals.iter().any(|t| t == &tool) {
-                            self.session_approvals.push(tool);
-                        }
+                        // F6 · R3 refactor.
+                        self.record_session_approval(tool);
                         self.notes.push(Note::info("approval · granted session"));
                     }
                 }
@@ -759,10 +751,8 @@ impl AppState {
                             scope: ApprovalScope::Session,
                         });
                         // F6: scoped-paths-fallback IS a session grant
-                        // in v1 semantics, so the roster includes it.
-                        if !self.session_approvals.iter().any(|t| t == &tool) {
-                            self.session_approvals.push(tool);
-                        }
+                        // in v1 semantics. R3 refactor via helper.
+                        self.record_session_approval(tool);
                         self.notes.push(Note::info(
                             "approval · scoped-paths falls back to session in v1",
                         ));
@@ -1099,6 +1089,17 @@ impl AppState {
     /// Drain any tool name the `/approve` handler queued for pre-approval.
     pub fn take_pending_approve(&mut self) -> Option<String> {
         self.pending_approve.take()
+    }
+
+    /// Record a tool as session-approved in the TUI-local roster, deduped.
+    /// R3 gemini MED on PR #33: the dedupe-then-push two-liner was repeated
+    /// in four places (pre-grant, sheet click, keyboard 's', scoped-paths
+    /// fallback); a single method with `contains` keeps them in sync and
+    /// names the invariant ("roster dedupes on insertion").
+    pub fn record_session_approval(&mut self, tool: String) {
+        if !self.session_approvals.contains(&tool) {
+            self.session_approvals.push(tool);
+        }
     }
 
     /// Render a `SessionEvent` into the transcript. Model text is shown
