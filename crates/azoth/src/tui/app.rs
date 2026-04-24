@@ -429,9 +429,11 @@ impl AppState {
             }
             PaletteAction::Approve(Some(tool)) => {
                 self.pending_approve = Some(tool.clone());
-                // F6 2026-04-24 · R3 refactor: dedupe-then-push via the
-                // `record_session_approval` helper.
-                self.record_session_approval(tool.clone());
+                // R4 codex P2 on PR #33: do NOT populate the roster
+                // here. `/approve <tool>` is pre-intent; the actual
+                // grant is gated by the worker (read-only mode drops
+                // it; unknown tools are rejected). The roster only
+                // reflects real mints via the ApprovalGranted event.
                 self.notes
                     .push(Note::info(format!("approving tool {tool} session-scope")));
             }
@@ -654,12 +656,14 @@ impl AppState {
             }
             ClickTarget::SheetApproveSession => {
                 if let Some(req) = self.take_pending_approval() {
-                    let tool = req.tool_name.clone();
                     let _ = req.responder.send(ApprovalResponse::Grant {
                         scope: ApprovalScope::Session,
                     });
-                    // F6 · R3 refactor.
-                    self.record_session_approval(tool);
+                    // R4 2026-04-24: roster population is centralised
+                    // on the `SessionEvent::ApprovalGranted` handler so
+                    // the TUI mirror follows the worker's mint, not
+                    // the user's click. Sheet just forwards the user
+                    // decision down the bridge.
                     self.notes.push(Note::info("approval · granted session"));
                 }
             }
@@ -731,12 +735,11 @@ impl AppState {
                 }
                 (KeyCode::Char('s'), _) | (KeyCode::Char('S'), _) => {
                     if let Some(req) = self.take_pending_approval() {
-                        let tool = req.tool_name.clone();
                         let _ = req.responder.send(ApprovalResponse::Grant {
                             scope: ApprovalScope::Session,
                         });
-                        // F6 · R3 refactor.
-                        self.record_session_approval(tool);
+                        // R4 2026-04-24: roster update flows through
+                        // the ApprovalGranted event, see SheetApproveSession.
                         self.notes.push(Note::info("approval · granted session"));
                     }
                 }
@@ -746,13 +749,11 @@ impl AppState {
                     // the user knows the batch-plan sheet isn't in this
                     // build yet. Bona-fide ScopedPaths lands in v2.1.
                     if let Some(req) = self.take_pending_approval() {
-                        let tool = req.tool_name.clone();
                         let _ = req.responder.send(ApprovalResponse::Grant {
                             scope: ApprovalScope::Session,
                         });
-                        // F6: scoped-paths-fallback IS a session grant
-                        // in v1 semantics. R3 refactor via helper.
-                        self.record_session_approval(tool);
+                        // R4 2026-04-24: roster update flows through
+                        // the ApprovalGranted event, see SheetApproveSession.
                         self.notes.push(Note::info(
                             "approval · scoped-paths falls back to session in v1",
                         ));
@@ -1417,13 +1418,27 @@ impl AppState {
                     }
                 }
             }
-            SessionEvent::ApprovalGranted { scope, .. } => {
+            SessionEvent::ApprovalGranted {
+                scope, tool_name, ..
+            } => {
                 let label = match &scope {
                     ApprovalScope::Once => "once",
                     ApprovalScope::Session => "session",
                     ApprovalScope::ScopedPaths { .. } => "scoped-paths",
                 };
                 self.notes.push(Note::info(format!("approval · {label}")));
+                // R4 codex P2 on PR #33 2026-04-24: the authoritative
+                // signal that a session token was minted is this event.
+                // I used to populate the roster at /approve <tool>
+                // pre-intent time, which diverged on read-only drops
+                // (no mint) and unknown tools (rejected). Now the
+                // roster reflects the worker's actual mint; the
+                // pre-intent path doesn't touch the roster.
+                if matches!(scope, ApprovalScope::Session) {
+                    if let Some(tool) = tool_name {
+                        self.record_session_approval(tool);
+                    }
+                }
             }
             SessionEvent::TurnCommitted {
                 turn_id, usage, at, ..
@@ -2327,6 +2342,7 @@ pub async fn run_app(resume: Option<String>, as_of: Option<String>) -> io::Resul
                             approval_id: ApprovalId::new(),
                             token: CapabilityTokenId::new(),
                             scope: ApprovalScope::Session,
+                            tool_name: Some(tool_name.clone()),
                         });
                     } else {
                         let _ = worker_error_tx
@@ -2652,22 +2668,44 @@ mod tests {
 
     #[test]
     fn slash_approve_empty_lists_prior_session_grants() {
-        // F6 2026-04-24: the SlashCommand::Approve doc claimed empty-arg
-        // "lists active capability tokens" but the handler only printed
-        // usage. I'm wiring the roster the docstring advertised.
+        // F6 + R4 2026-04-24: the SlashCommand::Approve doc claimed
+        // empty-arg "lists active capability tokens" but the handler
+        // only printed usage. I wired the roster — BUT per codex R4
+        // on PR #33, the roster must mirror the authoritative
+        // CapabilityStore (worker-side mint), not the /approve <tool>
+        // pre-intent. So the test now feeds SessionEvent::ApprovalGranted
+        // directly (what the worker would emit after a successful mint).
+        use azoth_core::schemas::{ApprovalScope, CapabilityTokenId};
         let mut state = AppState::new();
         // Empty state → helpful usage + no-grants hint
         state.run_palette_action(super::PaletteAction::Approve(None));
         let n = state.notes.last().expect("note");
         assert!(n.text.contains("none granted"), "got: {:?}", n.text);
 
-        // Pre-grant two tools via /approve <tool>
+        // Pre-intent via /approve <tool> must NOT touch the roster
+        // until the worker confirms via ApprovalGranted.
         state.run_palette_action(super::PaletteAction::Approve(Some("fs_write".into())));
-        state.run_palette_action(super::PaletteAction::Approve(Some("bash".into())));
-        // Duplicate grant — must not double-list
-        state.run_palette_action(super::PaletteAction::Approve(Some("fs_write".into())));
+        assert!(
+            state.session_approvals.is_empty(),
+            "pre-intent must not populate roster; got: {:?}",
+            state.session_approvals
+        );
 
-        // Empty /approve now lists
+        // Worker confirms fs_write mint → roster records.
+        for (tool, fire_twice) in [("fs_write", true), ("bash", false)] {
+            let count = if fire_twice { 2 } else { 1 };
+            for _ in 0..count {
+                state.handle_session_event(SessionEvent::ApprovalGranted {
+                    turn_id: TurnId::from("pre-approve".to_string()),
+                    approval_id: ApprovalId::new(),
+                    token: CapabilityTokenId::new(),
+                    scope: ApprovalScope::Session,
+                    tool_name: Some(tool.into()),
+                });
+            }
+        }
+
+        // Empty /approve now lists, dedupe respected.
         state.run_palette_action(super::PaletteAction::Approve(None));
         let n = state.notes.last().expect("list note");
         assert!(n.text.contains("fs_write"), "got: {:?}", n.text);
@@ -2678,6 +2716,45 @@ mod tests {
             n.text
         );
         assert_eq!(state.session_approvals.len(), 2, "dedupe invariant");
+    }
+
+    #[test]
+    fn approval_granted_once_scope_does_not_populate_roster() {
+        // R4 regression guard: a one-time grant is not a session
+        // grant, so the roster must stay clean.
+        use azoth_core::schemas::{ApprovalScope, CapabilityTokenId};
+        let mut state = AppState::new();
+        state.handle_session_event(SessionEvent::ApprovalGranted {
+            turn_id: TurnId::from("t_1".to_string()),
+            approval_id: ApprovalId::new(),
+            token: CapabilityTokenId::new(),
+            scope: ApprovalScope::Once,
+            tool_name: Some("bash".into()),
+        });
+        assert!(
+            state.session_approvals.is_empty(),
+            "Once scope must not populate session roster; got: {:?}",
+            state.session_approvals
+        );
+    }
+
+    #[test]
+    fn legacy_approval_granted_without_tool_name_does_not_panic() {
+        // Pre-R4 sessions (no tool_name field) must replay clean on
+        // new binaries. tool_name: None → no roster update.
+        use azoth_core::schemas::{ApprovalScope, CapabilityTokenId};
+        let mut state = AppState::new();
+        state.handle_session_event(SessionEvent::ApprovalGranted {
+            turn_id: TurnId::from("t_1".to_string()),
+            approval_id: ApprovalId::new(),
+            token: CapabilityTokenId::new(),
+            scope: ApprovalScope::Session,
+            tool_name: None,
+        });
+        assert!(
+            state.session_approvals.is_empty(),
+            "tool_name=None must be a no-op for the roster"
+        );
     }
 
     #[test]
