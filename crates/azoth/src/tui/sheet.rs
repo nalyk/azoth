@@ -81,7 +81,10 @@ pub fn render(
             ),
         ])
     } else {
-        let effect_label = format!("{:?}", req.effect_class).to_lowercase();
+        // F8 2026-04-24: was `format!("{:?}", ...).to_lowercase()` which
+        // produces `applylocal` — mashed CamelCase. Display impl keeps us
+        // on `apply_local`, matching serde + schemas everywhere else.
+        let effect_label = req.effect_class.to_string();
         Line::from(vec![
             Span::styled(" approve · ", theme.bold()),
             Span::styled(effect_label.clone(), theme.ink(Colors::AMBER)),
