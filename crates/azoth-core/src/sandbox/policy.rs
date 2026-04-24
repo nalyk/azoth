@@ -135,7 +135,7 @@ mod tests {
         // the thread-id guard otherwise fail-closes from this
         // test-harness thread.
         crate::sandbox::warm_userns_cache();
-        std::env::remove_var("AZOTH_SANDBOX");
+        let env = crate::test_support::SandboxEnvGuard::unset();
         let got = SandboxPolicy::from_env();
         let want = if crate::sandbox::probe_unprivileged_userns() {
             SandboxPolicy::TierA
@@ -143,28 +143,26 @@ mod tests {
             SandboxPolicy::Off
         };
         assert_eq!(got, want);
-        std::env::set_var("AZOTH_SANDBOX", "");
+        env.set_tier("");
         let got = SandboxPolicy::from_env();
         assert_eq!(got, want, "empty env should behave the same as unset");
-        std::env::remove_var("AZOTH_SANDBOX");
+        // `env` drops at scope exit → clears AZOTH_SANDBOX.
     }
 
     #[test]
     fn from_env_parses_explicit_off_and_unknown_as_off() {
-        std::env::set_var("AZOTH_SANDBOX", "off");
+        let env = crate::test_support::SandboxEnvGuard::tier("off");
         assert_eq!(SandboxPolicy::from_env(), SandboxPolicy::Off);
-        std::env::set_var("AZOTH_SANDBOX", "garbage");
+        env.set_tier("garbage");
         assert_eq!(SandboxPolicy::from_env(), SandboxPolicy::Off);
-        std::env::remove_var("AZOTH_SANDBOX");
     }
 
     #[test]
     fn from_env_parses_tier_a_and_tier_b() {
-        std::env::set_var("AZOTH_SANDBOX", "tier_a");
+        let env = crate::test_support::SandboxEnvGuard::tier("tier_a");
         assert_eq!(SandboxPolicy::from_env(), SandboxPolicy::TierA);
-        std::env::set_var("AZOTH_SANDBOX", "tier_b");
+        env.set_tier("tier_b");
         assert_eq!(SandboxPolicy::from_env(), SandboxPolicy::TierB);
         assert!(SandboxPolicy::from_env().is_tier_b());
-        std::env::remove_var("AZOTH_SANDBOX");
     }
 }

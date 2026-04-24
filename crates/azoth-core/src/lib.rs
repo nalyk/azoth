@@ -35,4 +35,11 @@ pub mod validators;
 #[cfg(test)]
 mod red_team;
 
+/// Test-only helpers (parallel-safe env mutation guard). Lives under
+/// `#[cfg(test)]` so nothing leaks into the published crate surface.
+/// Integration tests in `tests/*.rs` compile as separate binaries and
+/// cannot import this module — they declare their own inline guard.
+#[cfg(test)]
+mod test_support;
+
 pub use schemas::*;

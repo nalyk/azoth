@@ -221,6 +221,30 @@ rg 'Span::(styled|raw)\("[^"]+"\.to_string\(\)' crates/azoth/src/tui/
 - Slash parser lives in `input/mod.rs`, not `app.rs`. `handle_slash` → `run_palette_action` for every variant that has a palette equivalent (R14 unified pattern — prevents drift between keyboard and palette code paths; the one-time drift left `/continue` silent while the palette version showed a note).
 - `Shift+Enter` = newline (via `tui-textarea-2` default); `Enter` alone sends.
 
+### Ctrl+C / Ctrl+D cancellation wiring
+
+- `AppState.active_cancel: Arc<Mutex<Option<CancellationToken>>>` is the
+  shared per-turn cancellation handle. The worker sets `Some(token)` before
+  every `drive_turn` (passes the same token into `ExecutionContext::builder`
+  via `.cancellation(token)`) and clears to `None` after the future
+  resolves, regardless of outcome.
+- Ctrl+C handler (`app.rs::handle_key`, the `KeyCode::Char('c')` arm): if
+  `active_cancel` holds `Some(token)`, calls `token.cancel()` + pushes a
+  whisper-adjacent note "cancelling turn…", does NOT flip `should_quit`.
+  If `None`, falls through to `should_quit = true` (legacy idle quit).
+- Ctrl+D is unconditional quit — the escape hatch, does NOT route
+  through the cancel branch. This lets a user always exit even if the
+  worker is wedged and the cancel path is stuck.
+- Core side does the rest: `TurnDriver::drive_turn` polls
+  `ctx.cancelled()` pre-invoke (`turn/mod.rs:545`) and mid-stream
+  (`:669`), emitting `TurnInterrupted { reason: UserCancel, partial_usage }`
+  through the JSONL writer. Preserves streamed output tokens in the
+  `partial_usage` field — crash-recovery synthetic on resume would lose them.
+- Regression tests: three unit tests in `app.rs::tests::ctrl_c_*` +
+  `ctrl_d_always_quits_even_mid_turn`, plus the existing
+  `tests/abort_preserves_streamed_usage.rs::user_cancel_interrupt_preserves_streamed_output_tokens`
+  integration test on the core side. Both sides are green.
+
 ### Session events → TUI state updates
 
 The worker task (`app.rs::handle_session_event`) is the only writer to visible state. Event → mutation mapping:

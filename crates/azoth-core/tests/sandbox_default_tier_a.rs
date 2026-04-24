@@ -20,13 +20,61 @@
 //! thread-id guard (added to catch library embedders who forgot
 //! to warm) would fail-closed on the first-call from a cold cache
 //! and force every test to see `Off`, masking the real branches.
+//!
+//! Parallel safety: cargo compiles every `tests/*.rs` file into its
+//! own binary (its own process), so this file's tests share a
+//! process with each other but NOT with the lib's unit tests.
+//! The env-var race therefore only needs a within-binary Mutex,
+//! which we declare locally. The lib's `crate::test_support` guard
+//! is `#[cfg(test)]` and lives in a different crate compilation,
+//! so we can't `use` it here — it would force the test-support
+//! module out of `#[cfg(test)]` visibility.
 
 use azoth_core::sandbox::{probe_unprivileged_userns, warm_userns_cache, SandboxPolicy};
+use std::sync::Mutex;
+
+/// Serialise `AZOTH_SANDBOX` mutations across the three tests in
+/// this binary. Without this, `cargo test` in its default parallel
+/// mode races the set_var / remove_var pairs and one test briefly
+/// sees another's env state, producing nondeterministic results.
+static SANDBOX_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+/// RAII guard — takes the lock, sets env on entry, cleans on Drop.
+/// Drop runs under the still-held lock, so the full set_var →
+/// test body → remove_var sequence is atomic against any other
+/// guard-using test in this binary. Survives panic (Rust RAII).
+struct SandboxEnvGuard {
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+impl SandboxEnvGuard {
+    fn tier(tier: &str) -> Self {
+        let guard = SANDBOX_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("AZOTH_SANDBOX", tier);
+        Self { _guard: guard }
+    }
+
+    fn unset() -> Self {
+        let guard = SANDBOX_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("AZOTH_SANDBOX");
+        Self { _guard: guard }
+    }
+
+    fn set_tier(&self, tier: &str) {
+        std::env::set_var("AZOTH_SANDBOX", tier);
+    }
+}
+
+impl Drop for SandboxEnvGuard {
+    fn drop(&mut self) {
+        std::env::remove_var("AZOTH_SANDBOX");
+    }
+}
 
 #[test]
 fn unset_env_yields_tier_a_when_userns_supported() {
     warm_userns_cache();
-    std::env::remove_var("AZOTH_SANDBOX");
+    let _env = SandboxEnvGuard::unset();
     let got = SandboxPolicy::from_env();
     let want = if probe_unprivileged_userns() {
         SandboxPolicy::TierA
@@ -39,17 +87,15 @@ fn unset_env_yields_tier_a_when_userns_supported() {
 #[test]
 fn empty_env_matches_unset_env() {
     warm_userns_cache();
-    std::env::remove_var("AZOTH_SANDBOX");
+    let env = SandboxEnvGuard::unset();
     let unset = SandboxPolicy::from_env();
-    std::env::set_var("AZOTH_SANDBOX", "");
+    env.set_tier("");
     let empty = SandboxPolicy::from_env();
-    std::env::remove_var("AZOTH_SANDBOX");
     assert_eq!(unset, empty);
 }
 
 #[test]
 fn explicit_off_always_yields_off() {
-    std::env::set_var("AZOTH_SANDBOX", "off");
+    let _env = SandboxEnvGuard::tier("off");
     assert_eq!(SandboxPolicy::from_env(), SandboxPolicy::Off);
-    std::env::remove_var("AZOTH_SANDBOX");
 }
