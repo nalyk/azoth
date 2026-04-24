@@ -1107,6 +1107,26 @@ impl AppState {
     /// prominently; internal lifecycle events are suppressed or shown as
     /// compact one-liners so the conversation is readable.
     pub fn handle_session_event(&mut self, ev: SessionEvent) {
+        self.handle_session_event_with_mode(ev, /* is_replay = */ false);
+    }
+
+    /// Render a replayed event during resume hydration — same as
+    /// `handle_session_event` but ApprovalGranted does NOT populate
+    /// the `session_approvals` roster.
+    ///
+    /// R2-4 codex P2 on PR #33 2026-04-24: the worker does not
+    /// restore `CapabilityStore` tokens from history (v1 scope —
+    /// caps are session-scope and do not persist). If the TUI
+    /// mirrored historical ApprovalGranted events into the roster,
+    /// `/approve` would claim tools as session-approved while the
+    /// next tool call still prompted for approval. The roster must
+    /// track only LIVE mints. Replay updates everything else (cards,
+    /// usage, context digest, etc.) but skips the roster.
+    pub fn handle_replayed_session_event(&mut self, ev: SessionEvent) {
+        self.handle_session_event_with_mode(ev, /* is_replay = */ true);
+    }
+
+    fn handle_session_event_with_mode(&mut self, ev: SessionEvent, is_replay: bool) {
         match ev {
             SessionEvent::ContractAccepted { contract, .. } => {
                 let goal = contract.goal.clone();
@@ -1419,14 +1439,14 @@ impl AppState {
                     ApprovalScope::ScopedPaths { .. } => "scoped-paths",
                 };
                 self.notes.push(Note::info(format!("approval · {label}")));
-                // R4 codex P2 on PR #33 2026-04-24: the authoritative
-                // signal that a session token was minted is this event.
-                // I used to populate the roster at /approve <tool>
-                // pre-intent time, which diverged on read-only drops
-                // (no mint) and unknown tools (rejected). Now the
-                // roster reflects the worker's actual mint; the
-                // pre-intent path doesn't touch the roster.
-                if matches!(scope, ApprovalScope::Session) {
+                // R4 codex P2: authoritative mint signal → roster.
+                // R2-4 codex P2: but only for LIVE grants. Historical
+                // ApprovalGranted events replayed during hydration
+                // describe tokens that no longer exist (the worker's
+                // CapabilityStore starts fresh each resume). Skipping
+                // roster update on replay keeps the TUI mirror
+                // faithful to active capabilities.
+                if !is_replay && matches!(scope, ApprovalScope::Session) {
                     if let Some(tool) = tool_name {
                         self.record_session_approval(tool);
                     }
@@ -1776,6 +1796,12 @@ pub async fn run_app(resume: Option<String>, as_of: Option<String>) -> io::Resul
     let (user_tx, mut user_rx) = mpsc::channel::<String>(8);
     let (contract_tx, mut contract_rx) = mpsc::channel::<Contract>(8);
     let (session_tx, mut session_rx) = mpsc::unbounded_channel::<SessionEvent>();
+    // R2-4 codex P2 on PR #33 2026-04-24: events emitted by the
+    // replay-hydration loop go through this dedicated channel so the
+    // TUI can tell them apart from live ones and skip roster updates
+    // on historical ApprovalGranted events (worker CapabilityStore
+    // starts fresh each resume — historical tokens don't exist).
+    let (replay_tx, mut replay_rx) = mpsc::unbounded_channel::<SessionEvent>();
     let (error_tx, mut error_rx) = mpsc::channel::<String>(8);
     let (approval_req_tx, mut approval_req_rx) = mpsc::channel::<ApprovalRequestMsg>(8);
     let (approve_tx, mut approve_rx) = mpsc::channel::<String>(8);
@@ -1848,6 +1874,7 @@ pub async fn run_app(resume: Option<String>, as_of: Option<String>) -> io::Resul
     let active_cancel: Arc<Mutex<Option<CancellationToken>>> = Arc::new(Mutex::new(None));
 
     let worker_session_tx = session_tx.clone();
+    let worker_replay_tx = replay_tx;
     let worker_error_tx = error_tx.clone();
     let worker_boot_phase_tx = boot_phase_tx.clone();
     let worker_ready_tx = ready_tx.clone();
@@ -1960,9 +1987,13 @@ pub async fn run_app(resume: Option<String>, as_of: Option<String>) -> io::Resul
 
         // Hydrate UI from the cached scan. Same replayable-only slice
         // as before, just folded without a second file read.
+        //
+        // R2-4 2026-04-24: emit through `replay_tx`, NOT `session_tx`,
+        // so the TUI routes these through `handle_replayed_session_event`
+        // and skips the roster-update arm on historical ApprovalGranted.
         if let Some(scan) = &resume_scan {
             for ev in scan.replayable() {
-                let _ = worker_session_tx.send(ev.0);
+                let _ = worker_replay_tx.send(ev.0);
             }
         }
 
@@ -2615,6 +2646,7 @@ pub async fn run_app(resume: Option<String>, as_of: Option<String>) -> io::Resul
                 }
             }
             Some(ev) = session_rx.recv() => state.handle_session_event(ev),
+            Some(ev) = replay_rx.recv() => state.handle_replayed_session_event(ev),
             Some(req) = approval_req_rx.recv() => {
                 state.set_card_awaiting_approval(&req.turn_id);
                 state.pending_approval = Some(req);
@@ -2734,6 +2766,43 @@ mod tests {
             n.text
         );
         assert_eq!(state.session_approvals.len(), 2, "dedupe invariant");
+    }
+
+    #[test]
+    fn replayed_approval_granted_does_not_populate_roster() {
+        // R2-4 codex P2 on PR #33 2026-04-24: worker CapabilityStore
+        // starts fresh each resume. Historical ApprovalGranted events
+        // replayed during hydration describe tokens that no longer
+        // exist — mirroring them into session_approvals would lie to
+        // the operator running /approve.
+        use azoth_core::schemas::{ApprovalScope, CapabilityTokenId};
+        let mut state = AppState::new();
+        state.handle_replayed_session_event(SessionEvent::ApprovalGranted {
+            turn_id: TurnId::from("t_old".to_string()),
+            approval_id: ApprovalId::new(),
+            token: CapabilityTokenId::new(),
+            scope: ApprovalScope::Session,
+            tool_name: Some("bash".into()),
+        });
+        assert!(
+            state.session_approvals.is_empty(),
+            "replayed grants MUST NOT populate roster; got: {:?}",
+            state.session_approvals
+        );
+        // Live path still works on a fresh state.
+        state.handle_session_event(SessionEvent::ApprovalGranted {
+            turn_id: TurnId::from("t_live".to_string()),
+            approval_id: ApprovalId::new(),
+            token: CapabilityTokenId::new(),
+            scope: ApprovalScope::Session,
+            tool_name: Some("fs_write".into()),
+        });
+        assert_eq!(
+            state.session_approvals,
+            vec!["fs_write".to_string()],
+            "live grant populates; got: {:?}",
+            state.session_approvals
+        );
     }
 
     #[test]
