@@ -1109,7 +1109,13 @@ impl AppState {
     /// in four places (pre-grant, sheet click, keyboard 's', scoped-paths
     /// fallback); a single method with `contains` keeps them in sync and
     /// names the invariant ("roster dedupes on insertion").
-    pub fn record_session_approval(&mut self, tool: String) {
+    ///
+    /// R3-3 gemini MED on PR #33 2026-04-25: I shipped this `pub`; since
+    /// R4 centralised the call path through `handle_session_event_with_mode`
+    /// the only external caller would be a test — and even in tests we
+    /// drive through the public `handle_session_event` path, so
+    /// private scope is correct.
+    fn record_session_approval(&mut self, tool: String) {
         if !self.session_approvals.contains(&tool) {
             self.session_approvals.push(tool);
         }
