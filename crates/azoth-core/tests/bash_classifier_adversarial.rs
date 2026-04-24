@@ -198,6 +198,70 @@ fn bare_allowlist_positives_survive_the_gauntlet() {
 }
 
 #[test]
+fn find_and_env_are_apply_local_after_r0_gemini_high() {
+    // gemini R0 HIGH (PR #30, 2026-04-24): `find` (via `-exec`,
+    // `-delete`, `-fprint*`) and `env VAR=val cmd` both provide
+    // flag-level escapes to run arbitrary commands or write files.
+    // Both removed from the bare allowlist.
+    assert_apply_local("find . -name '*.rs'");
+    assert_apply_local("find . -exec rm {} +");
+    assert_apply_local("find . -delete");
+    assert_apply_local("find / -fprintf /tmp/evil %p");
+    assert_apply_local("env");
+    assert_apply_local("env PATH=/evil grep foo");
+    assert_apply_local("env -i rm -rf /");
+}
+
+#[test]
+fn git_branch_and_tag_are_apply_local_after_r0_gemini_high() {
+    // gemini R0 HIGH (PR #30, 2026-04-24): `git branch` / `git tag`
+    // mutate refs by default (`-D` delete, bare-name create).
+    // Removed from GIT_READ_ONLY_SUBCOMMANDS.
+    assert_apply_local("git branch");
+    assert_apply_local("git branch -D dead");
+    assert_apply_local("git branch new-feature");
+    assert_apply_local("git tag");
+    assert_apply_local("git tag v1.0");
+    assert_apply_local("git tag -d v0");
+}
+
+#[test]
+fn write_flag_scan_catches_output_family() {
+    // gemini R0 HIGH (PR #30, 2026-04-24): `git log --output=<file>`
+    // writes regardless of how otherwise-read-only the subcommand
+    // is. The scan matches on `--output` exactly or the
+    // `--output=` prefix — catches the write forms without
+    // over-rejecting legitimate non-write `--output-*` flags
+    // (`--output-format`, `--output-indicator-new`).
+    assert_apply_local("git log --output=/tmp/evil");
+    assert_apply_local("git log --output /tmp/evil");
+    assert_apply_local("git show --output=/tmp/evil HEAD");
+    assert_apply_local("git diff --output=/tmp/evil");
+    assert_apply_local("git diff main..HEAD --output /tmp/evil");
+}
+
+#[test]
+fn non_write_output_flags_stay_observe() {
+    // `--output-format`, `--output-indicator-new`, and friends are
+    // NOT write flags — they change output formatting, not
+    // destination. The tightened matcher (`== "--output" ||
+    // starts_with "--output="`) preserves them as Observe so
+    // common structured-read patterns don't get taxed.
+    assert_observe("git log --output-indicator-new=X");
+    assert_observe("git diff --output-indicator-new X");
+}
+
+#[test]
+fn dash_o_short_flag_remains_observe() {
+    // `-o` is NOT rejected — in POSIX tools it usually means
+    // "only-match" (grep), "or" (find expression), or "long
+    // format w/o group" (ls), not "output to file". Must stay
+    // Observe or we kill common read flows.
+    assert_observe("grep -o foo src/");
+    assert_observe("ls -o");
+}
+
+#[test]
 fn allowlist_argv0_plus_metachar_falls_back() {
     // A command that STARTS with an allowlisted argv0 but also
     // contains a metachar MUST fall back — the metachar smuggles

@@ -57,10 +57,17 @@ use crate::schemas::EffectClass;
 /// different side effects (`git`, `cargo`), do NOT put the bare name
 /// here; use the per-family helper.
 const READ_ONLY_COMMANDS: &[&str] = &[
-    // POSIX read-only core
+    // POSIX read-only core. Entries here must be read-only under
+    // EVERY argv combination the classifier will accept. `find` and
+    // `env` were in the R0 draft and gemini R0 HIGH (2026-04-24)
+    // flagged them: `find -exec`, `find -delete`, `find -fprintf`
+    // and similar flag families let `find` run arbitrary commands
+    // or write files, and `env VAR=val cmd` runs `cmd` directly.
+    // I removed both; the false-UPGRADE (bare `find . -name x` now
+    // counts as ApplyLocal) is acceptable per the safety model at
+    // the top of this file.
     "grep",
     "rg",
-    "find",
     "ls",
     "cat",
     "head",
@@ -75,7 +82,6 @@ const READ_ONLY_COMMANDS: &[&str] = &[
     "md5sum",
     "xxd",
     "od",
-    "env",
     "date",
     "pwd",
     "test",
@@ -92,6 +98,13 @@ const READ_ONLY_COMMANDS: &[&str] = &[
 /// (defaults to setting). `git log`/`show`/`diff`/`status`/`blame`/
 /// `rev-parse`/`branch`/`tag`/`ls-files`/`ls-tree` read refs or the
 /// objects DB.
+// gemini R0 HIGH (2026-04-24) removed `branch` and `tag`: both
+// mutate refs by default (`git branch -D foo`, `git tag -d foo`).
+// Listing them as read-only let the model delete branches at
+// Observe cost. The remaining entries don't mutate state on their
+// own — but `log`, `show`, and `diff` accept `--output=<file>` /
+// `--output <file>` which writes to disk; the per-invocation
+// `has_write_flag` scan below catches that family.
 const GIT_READ_ONLY_SUBCOMMANDS: &[&str] = &[
     "log",
     "show",
@@ -99,8 +112,6 @@ const GIT_READ_ONLY_SUBCOMMANDS: &[&str] = &[
     "status",
     "blame",
     "rev-parse",
-    "branch",
-    "tag",
     "ls-files",
     "ls-tree",
 ];
@@ -152,12 +163,42 @@ fn has_forbidden_metachar(cmd: &str) -> bool {
     })
 }
 
+/// Detect flag-level write escapes in an argv sequence.
+///
+/// Several otherwise-read-only tools expose a `--output`-family
+/// flag that writes to an arbitrary file without using shell
+/// redirection. `git log --output=<file>`, `git diff --output
+/// <file>`, `git show --output=<file>` all fall here. gemini R0
+/// HIGH (PR #30, 2026-04-24) flagged the git forms.
+///
+/// The match is two-shaped, NOT a bare prefix:
+///   - token exactly `--output` → the file arg is argv[n+1]
+///   - token begins with `--output=` → filename is embedded
+///
+/// Naive `starts_with("--output")` would over-reject legitimate
+/// read-only flags like `--output-format json` (cargo tree, jq, …)
+/// and `--output-indicator-new=X` (git diff), turning common
+/// structured-read patterns into ApplyLocal. The tightened form
+/// preserves those as Observe.
+///
+/// `-o` is intentionally NOT rejected — in POSIX it usually means
+/// "only-match" (grep), "or" (find), or "long format w/o group"
+/// (ls), not "output to file." If a specific tool ever uses `-o
+/// <file>` for output in an allowlisted position, add a targeted
+/// check rather than broadening this prefix.
+fn has_write_flag<'a, I: IntoIterator<Item = &'a str>>(args: I) -> bool {
+    args.into_iter()
+        .any(|t| t == "--output" || t.starts_with("--output="))
+}
+
 /// Classify a raw `bash` command string.
 ///
 /// Returns `Observe` for bare invocations of a read-only command
 /// from the allowlist. Returns `ApplyLocal` for anything else: any
 /// metacharacter, any unknown command, any unknown subcommand of
-/// a family-gated command, or an empty / whitespace-only string.
+/// a family-gated command, any token past argv0 that begins with
+/// `--output` (write-flag escape per `has_write_flag`), or an
+/// empty / whitespace-only string.
 ///
 /// This is pure and deterministic — no I/O, no side effects. Unit
 /// tested below + adversarial-tested in
@@ -167,8 +208,8 @@ pub fn classify_bash_command(cmd: &str) -> EffectClass {
         return EffectClass::ApplyLocal;
     }
 
-    let mut tokens = cmd.split_whitespace();
-    let Some(argv0) = tokens.next() else {
+    let tokens: Vec<&str> = cmd.split_whitespace().collect();
+    let Some((argv0, rest)) = tokens.split_first() else {
         // Empty or whitespace-only command: fall through to worst-
         // case. The tool itself will almost certainly error, but we
         // still don't want to downgrade it — avoids a weird "we
@@ -176,24 +217,33 @@ pub fn classify_bash_command(cmd: &str) -> EffectClass {
         return EffectClass::ApplyLocal;
     };
 
+    // Flag-level write escape — rejected regardless of which
+    // allowlist entry argv0 hits. Catches `git log --output=...`,
+    // `git diff --output=...`, and the same family across any
+    // other read-only entry that ever acquires a write-flag
+    // option in a future ecosystem version.
+    if has_write_flag(rest.iter().copied()) {
+        return EffectClass::ApplyLocal;
+    }
+
     // `git <subcommand>` and `cargo <subcommand>` require an argv[1]
     // match against the per-family allowlist. Bare `git` / `cargo`
     // with no subcommand prints usage — still read-only, but the
     // downstream model might just be probing; keep it cheap.
-    match argv0 {
+    match *argv0 {
         "git" => {
-            let Some(sub) = tokens.next() else {
+            let Some((sub, git_rest)) = rest.split_first() else {
                 return EffectClass::Observe;
             };
-            if GIT_READ_ONLY_SUBCOMMANDS.contains(&sub) {
+            if GIT_READ_ONLY_SUBCOMMANDS.contains(sub) {
                 return EffectClass::Observe;
             }
             // `git config --get <key>` is read-only. `git config` or
             // `git config --set` mutates .git/config. Keep the gate
             // narrow: require `--get` as argv[2].
-            if sub == "config" {
-                if let Some(flag) = tokens.next() {
-                    if flag == "--get" {
+            if *sub == "config" {
+                if let Some(flag) = git_rest.first() {
+                    if *flag == "--get" {
                         return EffectClass::Observe;
                     }
                 }
@@ -201,10 +251,10 @@ pub fn classify_bash_command(cmd: &str) -> EffectClass {
             EffectClass::ApplyLocal
         }
         "cargo" => {
-            let Some(sub) = tokens.next() else {
+            let Some((sub, _)) = rest.split_first() else {
                 return EffectClass::Observe;
             };
-            if CARGO_READ_ONLY_SUBCOMMANDS.contains(&sub) {
+            if CARGO_READ_ONLY_SUBCOMMANDS.contains(sub) {
                 return EffectClass::Observe;
             }
             EffectClass::ApplyLocal
@@ -212,7 +262,7 @@ pub fn classify_bash_command(cmd: &str) -> EffectClass {
         "rustc" => {
             // `rustc --version` is read-only. `rustc <srcfile>`
             // compiles. Require an explicit `--version`.
-            if tokens.next() == Some("--version") {
+            if rest.first().copied() == Some("--version") {
                 return EffectClass::Observe;
             }
             EffectClass::ApplyLocal
@@ -258,10 +308,24 @@ mod tests {
     fn read_only_commands_with_args_classify_as_observe() {
         assert_observe("grep foo src/");
         assert_observe("rg pattern crates/");
-        assert_observe("find . -name '*.rs'");
+        // `find` deliberately omitted — see READ_ONLY_COMMANDS note
+        // (gemini R0 HIGH 2026-04-24): `find -exec`/`-delete` are
+        // write escapes.
         assert_observe("ls -la");
         assert_observe("cat Cargo.toml");
         assert_observe("wc -l src/main.rs");
+    }
+
+    #[test]
+    fn find_and_env_classify_as_apply_local() {
+        // Removed from allowlist after gemini R0 HIGH (2026-04-24).
+        // Bare invocation would have been Observe in R0; now falls
+        // through to ApplyLocal like any unknown argv0.
+        assert_apply_local("find . -name '*.rs'");
+        assert_apply_local("find . -exec rm {} +");
+        assert_apply_local("find . -delete");
+        assert_apply_local("env");
+        assert_apply_local("env VAR=val grep foo");
     }
 
     #[test]
@@ -301,6 +365,43 @@ mod tests {
         assert_apply_local("git rebase main");
         assert_apply_local("git fetch");
         assert_apply_local("git merge main");
+        // Removed from allowlist after gemini R0 HIGH (2026-04-24):
+        // `git branch -D` / `git tag -d` mutate refs.
+        assert_apply_local("git branch");
+        assert_apply_local("git branch -D stale");
+        assert_apply_local("git tag");
+        assert_apply_local("git tag -d v0");
+    }
+
+    #[test]
+    fn git_log_show_diff_with_output_flag_classify_as_apply_local() {
+        // gemini R0 HIGH (2026-04-24): `git log --output=<file>`
+        // writes regardless of subcommand being otherwise read-only.
+        // `has_write_flag` matches `--output` exactly OR the
+        // `--output=` prefix (filename embedded).
+        assert_apply_local("git log --output=/tmp/evil");
+        assert_apply_local("git log --output /tmp/evil");
+        assert_apply_local("git diff --output=/tmp/evil");
+        assert_apply_local("git diff --output /tmp/evil");
+        assert_apply_local("git show --output=/tmp/evil HEAD");
+    }
+
+    #[test]
+    fn non_write_output_prefix_flags_stay_observe() {
+        // `--output-format` (cargo tree, jq), `--output-indicator-new`
+        // (git diff) etc. change formatting, not destination. The
+        // tight matcher must not over-reject these.
+        assert_observe("git diff --output-indicator-new=X");
+        assert_observe("git log --output-indicator-new=X");
+    }
+
+    #[test]
+    fn dash_o_short_flag_is_not_over_rejected() {
+        // `-o` is commonly non-write (grep only-match, ls long w/o
+        // group). Conservative-but-narrow: we reject `--output`,
+        // not every `-o`. These must stay Observe.
+        assert_observe("grep -o foo src/");
+        assert_observe("ls -o");
     }
 
     #[test]
