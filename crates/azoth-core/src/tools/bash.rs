@@ -33,6 +33,8 @@ use serde_json::{json, Value};
 use std::process::Stdio;
 use tokio::process::Command;
 
+pub mod classifier;
+
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 const MAX_OUTPUT_BYTES: usize = 256 * 1024;
 
@@ -97,6 +99,21 @@ impl Tool for BashTool {
 
     fn effect_class(&self) -> EffectClass {
         EffectClass::ApplyLocal
+    }
+
+    /// Per-invocation budget-accounting refinement. The static
+    /// `effect_class()` above stays `ApplyLocal` because the sandbox
+    /// tier must plan for the worst case; this hook lets the turn
+    /// driver downgrade a KNOWN-READ-ONLY invocation (bare `grep`,
+    /// `git log`, etc.) to `Observe` so pure-triage rounds don't
+    /// consume the apply_local budget. See
+    /// `tools/bash/classifier.rs` for the allowlist + metachar
+    /// guard, and the v2.1.0 post-merge dogfood memo
+    /// (`project_azoth_status_apr24_v86_v2_1_0_dogfood_budget_gap.md`)
+    /// for the motivation.
+    fn effect_class_for(&self, raw: &Value) -> Option<EffectClass> {
+        let cmd = raw.get("command")?.as_str()?;
+        Some(classifier::classify_bash_command(cmd))
     }
 
     fn schema(&self) -> Value {

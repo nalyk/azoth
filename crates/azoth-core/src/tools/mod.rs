@@ -1,7 +1,13 @@
 //! v1 built-in tools. Every tool is a concrete `Tool` impl with a typed
 //! input struct.
 
-mod bash;
+// `bash` is public because its `classifier` submodule is part of the
+// public API surface — external crates and integration tests invoke
+// `classify_bash_command` to verify policy-layer budget
+// classification without paying the cost of building and dispatching
+// the real tool. Other tools stay `mod` — open them only when they
+// grow a similar hook.
+pub mod bash;
 mod clock;
 mod fs_write;
 mod repo_read_file;

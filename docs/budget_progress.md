@@ -1,39 +1,39 @@
 # Budget Plan — Progress Tracker
 
-**Current sequence:** α (not started)
-**Last updated:** 2026-04-24 by planning session
+**Current sequence:** α (in-review; PR opened, awaiting bot review rounds)
+**Last updated:** 2026-04-24 by α implementation session
 **Plan reference:** [`docs/budget_plan.md`](./budget_plan.md)
 
 ---
 
 ## Sprint α — Classifier + prompt discipline
 
-**Status:** not-started
-**Branch:** _(open a feature branch when starting: `feat/budget-alpha-classifier`)_
-**PR:** _(link when pushed)_
+**Status:** in-review (PR open, R0 pushed, awaiting bot review rounds)
+**Branch:** `feat/budget-alpha-classifier`
+**PR:** _(link populated on first push)_
 **Merged at:** _(commit SHA + date)_
 
 ### Subtasks
 
-- [ ] Open feature branch `feat/budget-alpha-classifier` from `main`
-- [ ] Add `fn effect_class_for(&self, _raw: &Value) -> Option<EffectClass> { None }` default to `Tool` trait (`crates/azoth-core/src/execution/dispatcher.rs:35`)
-- [ ] Add `fn effect_class_for(&self, raw: &Value) -> Option<EffectClass>;` to `ErasedTool` trait (no default) at `dispatcher.rs:57`
-- [ ] Route in `impl<T: Tool + 'static> ErasedTool for T` at `dispatcher.rs:68`
-- [ ] Create `crates/azoth-core/src/tools/bash/` module dir + `classifier.rs`
-- [ ] Implement `classify_bash_command(cmd: &str) -> EffectClass` per allowlist in plan §α
-- [ ] Override `BashTool::effect_class_for` in `tools/bash.rs`
-- [ ] Wire into budget-check at `crates/azoth-core/src/turn/mod.rs:798-802`
-- [ ] Add `crates/azoth-core/tests/bash_classifier_adversarial.rs` with ≥30 payloads
-- [ ] Add inline unit tests in `classifier.rs` (per-command allowlist membership)
-- [ ] Add `crates/azoth-core/tests/turn_uses_dynamic_classification.rs`
-- [ ] Add system-prompt behavior rules (δ) to constitution lane — locate the tool-schema render site via grep
-- [ ] Run `cargo fmt --check` clean
-- [ ] Run `cargo clippy --workspace -- -D warnings` clean
-- [ ] Run `cargo test --workspace` — all green (existing 330+ tests + new)
-- [ ] Adversarial self-review pass per `feedback_adversarial_self_review_before_push.md` (check sibling sites, check SAFETY docstrings, check for DRY smells, check metachar coverage)
-- [ ] Update this tracker: check off subtasks, add session log entries
+- [x] Open feature branch `feat/budget-alpha-classifier` from `main`
+- [x] Add `fn effect_class_for(&self, _raw: &Value) -> Option<EffectClass> { None }` default to `Tool` trait (`crates/azoth-core/src/execution/dispatcher.rs:35`)
+- [x] Add `fn effect_class_for(&self, raw: &Value) -> Option<EffectClass>;` to `ErasedTool` trait (no default) at `dispatcher.rs:57`
+- [x] Route in `impl<T: Tool + 'static> ErasedTool for T` at `dispatcher.rs:68`
+- [x] Create `crates/azoth-core/src/tools/bash/` module dir + `classifier.rs`
+- [x] Implement `classify_bash_command(cmd: &str) -> EffectClass` per allowlist in plan §α
+- [x] Override `BashTool::effect_class_for` in `tools/bash.rs`
+- [x] Wire into budget-check at `crates/azoth-core/src/turn/mod.rs:798-802`
+- [x] Add `crates/azoth-core/tests/bash_classifier_adversarial.rs` with ≥30 payloads (17 test fns / ~93 payloads)
+- [x] Add inline unit tests in `classifier.rs` (13 per-command allowlist membership tests)
+- [x] Add `crates/azoth-core/tests/turn_uses_dynamic_classification.rs` (bash `ls` at apply_local cap does not abort)
+- [x] Add system-prompt behavior rules (δ) to constitution lane — `crates/azoth-core/src/context/discipline.rs` + injected into `turn/mod.rs` constitution formatter
+- [x] Run `cargo fmt --check` clean
+- [x] Run `cargo clippy --workspace -- -D warnings` clean
+- [x] Run `cargo test --workspace` — 795 passed, 0 failed (serial `--test-threads=1`; parallel mode has the pre-existing WSL2 Tier-B overlay flake, unrelated)
+- [x] Adversarial self-review pass per `feedback_adversarial_self_review_before_push.md` — null-safety ladder on `raw.get("command")?.as_str()?`, bytewise metachar check safe for Unicode, quoted metachars conservatively fall through to ApplyLocal, two-layer safety preserved (sandbox from static class / budget+authority from dynamic)
+- [x] Update this tracker: subtasks ticked, session log appended
 - [ ] Commit + push + open PR
-- [ ] Trigger bot review: `@gemini review` and `@codex review` top-level comments
+- [ ] Trigger bot review: `/gemini review` and `@codex review` top-level comments
 - [ ] Wait ≥5 min after trigger (per `feedback_wait_for_bot_processing_after_rereview.md`)
 - [ ] DUAL-query PR reviewThreads (GraphQL + REST) per `feedback_dual_query_immediately_before_every_push.md`
 - [ ] Address findings; push rounds; re-trigger; re-query
@@ -53,6 +53,7 @@
 ### Session log
 
 - **2026-04-24 (planning)** — Plan drafted in `docs/budget_plan.md`. Awaiting first kickoff session.
+- **2026-04-24 (α R0 build)** — implemented classifier + hook + wiring + δ rules in one commit. Baseline tests clean minus two pre-existing WSL2 Tier-B flakes under `--test-threads>1` (documented in memory). Post-implementation: 795 passed / 0 failed serial, `cargo clippy -D warnings` clean, `cargo fmt --check` clean. Files touched: `execution/dispatcher.rs` (trait hooks), `tools/mod.rs` (bash pub), `tools/bash.rs` (hook override), `tools/bash/classifier.rs` (new), `turn/mod.rs` (dynamic class + discipline injection), `context/mod.rs` (discipline export), `context/discipline.rs` (new), 2 new integration tests, 13 inline unit tests. Awaiting user consent to push main + feature branch.
 
 ---
 
