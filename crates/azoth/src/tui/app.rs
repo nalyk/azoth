@@ -1517,7 +1517,10 @@ impl AppState {
                 self.whisper.clear();
             }
             SessionEvent::TurnInterrupted {
-                turn_id, reason, at, ..
+                turn_id,
+                reason,
+                at,
+                ..
             } => {
                 let tid = turn_id.to_string();
                 let reason_str = format!("{reason:?}");
