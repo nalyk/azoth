@@ -1468,6 +1468,7 @@ impl AppState {
                 turn_id,
                 reason,
                 detail,
+                at,
                 ..
             } => {
                 let tid = turn_id.to_string();
@@ -1478,6 +1479,16 @@ impl AppState {
                         reason: reason_str.clone(),
                         detail: detail_str.clone(),
                     };
+                    // codex R1 P2 2026-04-24: aborted cards need a
+                    // terminal wall-clock anchor too, else the header
+                    // cache falls back to SystemTime::now() and the
+                    // "t+Xs" label drifts forever on a resumed failed
+                    // turn. F4 only covered TurnCommitted — extending
+                    // to both terminal-negative variants here.
+                    card.committed_wall = at
+                        .as_deref()
+                        .and_then(parse_rfc3339_to_system_time)
+                        .or_else(|| Some(std::time::SystemTime::now()));
                 }
                 // F9 2026-04-24: whisper is a short pointer — the card's
                 // CardState::Aborted { reason, detail } already renders
@@ -1490,7 +1501,7 @@ impl AppState {
                 self.whisper.clear();
             }
             SessionEvent::TurnInterrupted {
-                turn_id, reason, ..
+                turn_id, reason, at, ..
             } => {
                 let tid = turn_id.to_string();
                 let reason_str = format!("{reason:?}");
@@ -1498,6 +1509,11 @@ impl AppState {
                     card.state = CardState::Interrupted {
                         reason: reason_str.clone(),
                     };
+                    // codex R1 P2: same wall-clock anchor for interrupted.
+                    card.committed_wall = at
+                        .as_deref()
+                        .and_then(parse_rfc3339_to_system_time)
+                        .or_else(|| Some(std::time::SystemTime::now()));
                 }
                 self.notes
                     .push(Note::info(format!("interrupted · {reason_str}")));
@@ -2768,6 +2784,58 @@ mod tests {
             "wall-clock delta must survive resume; got {}s",
             delta.as_secs()
         );
+    }
+
+    #[test]
+    fn resume_hydrates_committed_wall_for_aborted_and_interrupted_cards() {
+        // codex R1 P2 2026-04-24: F4 covered TurnCommitted. Aborted
+        // / Interrupted cards need the same wall-clock freeze or
+        // the header-cache SystemTime::now() fallback makes their
+        // elapsed label drift on resumed failed turns.
+        use azoth_core::schemas::{AbortReason, Usage, UsageDelta};
+        let mut state = AppState::new();
+        let t_abort = TurnId::new();
+        let t_intr = TurnId::new();
+        // aborted turn
+        state.handle_session_event(SessionEvent::TurnStarted {
+            turn_id: t_abort.clone(),
+            run_id: RunId::new(),
+            parent_turn: None,
+            timestamp: "2026-04-24T20:00:00Z".into(),
+        });
+        state.handle_session_event(SessionEvent::TurnAborted {
+            turn_id: t_abort.clone(),
+            reason: AbortReason::ContextOverflow,
+            detail: None,
+            usage: Usage::default(),
+            at: Some("2026-04-24T20:00:13Z".into()),
+        });
+        let card = state.cards.last().expect("aborted card");
+        let cw = card
+            .committed_wall
+            .expect("TurnAborted must anchor committed_wall");
+        let delta = cw.duration_since(card.started_wall).unwrap();
+        assert_eq!(delta.as_secs(), 13, "aborted elapsed frozen at 13s");
+
+        // interrupted turn
+        state.handle_session_event(SessionEvent::TurnStarted {
+            turn_id: t_intr.clone(),
+            run_id: RunId::new(),
+            parent_turn: None,
+            timestamp: "2026-04-24T21:00:00Z".into(),
+        });
+        state.handle_session_event(SessionEvent::TurnInterrupted {
+            turn_id: t_intr,
+            reason: AbortReason::UserCancel,
+            partial_usage: UsageDelta::default(),
+            at: Some("2026-04-24T21:00:07Z".into()),
+        });
+        let card = state.cards.last().expect("interrupted card");
+        let cw = card
+            .committed_wall
+            .expect("TurnInterrupted must anchor committed_wall");
+        let delta = cw.duration_since(card.started_wall).unwrap();
+        assert_eq!(delta.as_secs(), 7, "interrupted elapsed frozen at 7s");
     }
 
     #[test]
