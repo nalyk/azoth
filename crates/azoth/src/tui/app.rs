@@ -1379,11 +1379,14 @@ impl AppState {
                         detail: detail_str.clone(),
                     };
                 }
-                self.notes.push(Note::warn(format!(
-                    "aborted · {reason_str}{}{}",
-                    if detail_str.is_empty() { "" } else { " · " },
-                    detail_str
-                )));
+                // F9 2026-04-24: whisper is a short pointer — the card's
+                // CardState::Aborted { reason, detail } already renders
+                // both on the canvas one row below this note, so
+                // including the detail here prints the same 80-col line
+                // twice. Keep the whisper at reason-only.
+                let _ = detail_str; // intentionally unused for whisper
+                self.notes
+                    .push(Note::warn(format!("aborted · {reason_str}")));
                 self.whisper.clear();
             }
             SessionEvent::TurnInterrupted {
@@ -2457,6 +2460,47 @@ pub async fn run_app(resume: Option<String>, as_of: Option<String>) -> io::Resul
 mod tests {
     use super::*;
     use azoth_core::schemas::ContextPacketId;
+
+    #[test]
+    fn turn_aborted_whisper_note_is_reason_only_not_full_detail() {
+        // F9 2026-04-24: the TurnAborted handler was pushing
+        // reason+detail as a warn-note while simultaneously setting
+        // the card to CardState::Aborted { reason, detail } — the
+        // same 80-col error printed twice on adjacent rows. Whisper
+        // is a "look at your card" hint; the card owns the detail.
+        use azoth_core::schemas::{AbortReason, Usage};
+        let mut state = AppState::new();
+        let tid = TurnId::new();
+        state.handle_session_event(SessionEvent::TurnStarted {
+            turn_id: tid.clone(),
+            run_id: RunId::new(),
+            parent_turn: None,
+            timestamp: "2026-04-24T20:00:00Z".into(),
+        });
+        state.handle_session_event(SessionEvent::TurnAborted {
+            turn_id: tid,
+            reason: AbortReason::ContextOverflow,
+            detail: Some(
+                "estimate 36072 tokens > profile max_context_tokens 32768".into(),
+            ),
+            usage: Usage::default(),
+            at: Some("2026-04-24T20:00:05Z".into()),
+        });
+        let note = state
+            .notes
+            .last()
+            .expect("TurnAborted pushes a whisper note");
+        assert!(
+            note.text.starts_with("aborted · ContextOverflow"),
+            "whisper leads with reason; got: {:?}",
+            note.text
+        );
+        assert!(
+            !note.text.contains("36072"),
+            "whisper MUST NOT repeat the card's detail text; got: {:?}",
+            note.text
+        );
+    }
 
     #[test]
     fn slash_contract_with_goal_queues_draft_for_worker() {
