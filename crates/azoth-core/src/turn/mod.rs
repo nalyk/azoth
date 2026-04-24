@@ -1125,10 +1125,30 @@ impl<'a> TurnDriver<'a> {
                                                     // depth for when a
                                                     // future caller proposes
                                                     // larger.
+                                                    // R3 (PR #31 codex P2 +
+                                                    // gemini HIGH): pass
+                                                    // the PENDING-inclusive
+                                                    // bonus to the clamp so
+                                                    // the second amend in
+                                                    // the same turn caps
+                                                    // against the already-
+                                                    // raised ceiling. Using
+                                                    // bare `bonus` under-
+                                                    // applied: user granted
+                                                    // 40 but only 20 (the
+                                                    // pre-turn cap) landed
+                                                    // in applied_delta.
+                                                    // Symmetry with the
+                                                    // budget-check use of
+                                                    // `pending_for_class`
+                                                    // on line ~910 is the
+                                                    // invariant.
                                                     let applied_delta = crate::contract
                                                         ::apply_amend_clamped_against_base(
                                                             max_base,
-                                                            bonus,
+                                                            bonus.saturating_add(
+                                                                pending_for_class,
+                                                            ),
                                                             &proposed_delta,
                                                             effect_class,
                                                         );
