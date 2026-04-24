@@ -1546,6 +1546,42 @@ async fn build_indexer_backends(
     })
 }
 
+/// RAII guard over the shared `active_cancel` slot. Construct it with
+/// `begin()` before the per-turn `drive_turn` call; the guard parks
+/// `Some(token)` in the slot and clears to `None` on `Drop`. Drop
+/// fires on the happy path AND on panic-unwind — without this guard
+/// (R0 shape on PR #32), a panic inside `drive_turn` would leave the
+/// slot as `Some(dead_token)` forever and Ctrl+C would keep taking
+/// the cancel branch, never falling through to quit. Codex P2 on the
+/// R0 diff; fix landed in R1.
+///
+/// Poison handling matches `test_support::SandboxEnvGuard`: if a
+/// prior lock-holder panicked, the slot's `Option<CancellationToken>`
+/// is still a valid enum value (the Option can't be half-written), so
+/// we take the inner guard via `.into_inner()` and proceed.
+pub(crate) struct ActiveCancelGuard {
+    slot: Arc<Mutex<Option<CancellationToken>>>,
+}
+
+impl ActiveCancelGuard {
+    pub(crate) fn begin(
+        slot: Arc<Mutex<Option<CancellationToken>>>,
+        token: CancellationToken,
+    ) -> Self {
+        let mut g = slot.lock().unwrap_or_else(|e| e.into_inner());
+        *g = Some(token);
+        drop(g);
+        Self { slot }
+    }
+}
+
+impl Drop for ActiveCancelGuard {
+    fn drop(&mut self) {
+        let mut g = self.slot.lock().unwrap_or_else(|e| e.into_inner());
+        *g = None;
+    }
+}
+
 pub async fn run_app(resume: Option<String>, as_of: Option<String>) -> io::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -1614,9 +1650,10 @@ pub async fn run_app(resume: Option<String>, as_of: Option<String>) -> io::Resul
     let profile_status = format!("{} · {}", provider_profile.name, provider_profile.model_id);
 
     // Shared handle for cooperative turn cancellation. The worker owns
-    // the write path (Some(token) before drive_turn, None after). The
-    // TUI reads it from the Ctrl+C key handler. See AppState::active_cancel
-    // docstring for the invariant.
+    // the write path (via `ActiveCancelGuard`, defined at module level
+    // so the tests in `tests` mod can exercise the panic-safety
+    // property). The TUI reads it from the Ctrl+C key handler.
+    // See AppState::active_cancel docstring for the invariant.
     let active_cancel: Arc<Mutex<Option<CancellationToken>>> = Arc::new(Mutex::new(None));
 
     let worker_session_tx = session_tx.clone();
@@ -2182,13 +2219,20 @@ pub async fn run_app(resume: Option<String>, as_of: Option<String>) -> io::Resul
             // Per-turn cancellation token. Fresh instance each turn so a
             // cancel from a prior turn never bleeds into the next one.
             // The clone lives on `ctx.cancellation`; the outer clone is
-            // parked in `worker_active_cancel` so the TUI Ctrl+C handler
-            // can flip it. Cleared to None after drive_turn so a quiet
-            // Ctrl+C between turns falls through to the quit branch.
+            // parked in `worker_active_cancel` via the RAII guard below
+            // so the TUI Ctrl+C handler can flip it while a turn is in
+            // flight.
+            //
+            // R1 (codex P2 on PR #32 R0): the earlier revision cleared
+            // the slot only on the normal post-drive_turn path. If
+            // `drive_turn` panicked the slot stayed `Some(dead_token)`
+            // forever and Ctrl+C kept taking the cancel branch (no
+            // fall-through to quit) — user got stuck. `ActiveCancelGuard`
+            // clears the slot in `Drop`, so panic-unwind through this
+            // scope always restores idle-quit semantics.
             let turn_cancel = CancellationToken::new();
-            if let Ok(mut guard) = worker_active_cancel.lock() {
-                *guard = Some(turn_cancel.clone());
-            }
+            let _active_cancel_guard =
+                ActiveCancelGuard::begin(worker_active_cancel.clone(), turn_cancel.clone());
             let ctx = ExecutionContext::builder(
                 worker_run_id.clone(),
                 turn_id.clone(),
@@ -2248,14 +2292,11 @@ pub async fn run_app(resume: Option<String>, as_of: Option<String>) -> io::Resul
                 )
                 .await;
 
-            // Release the cancellation handle — the token is now dead
-            // (drive_turn has either committed, aborted, or emitted
-            // TurnInterrupted on its own on cancel). A subsequent Ctrl+C
-            // with no active turn must fall through to the quit branch,
-            // so we null the slot before the next select! iteration.
-            if let Ok(mut guard) = worker_active_cancel.lock() {
-                *guard = None;
-            }
+            // `_active_cancel_guard` drops at the end of this
+            // tokio::select! arm and clears the slot — via `Drop`, so
+            // panic-unwind through `drive_turn` also restores the
+            // idle-quit path. Before R1 an explicit `*guard = None`
+            // lived here on the happy path only (codex P2).
 
             match result {
                 Ok(outcome) => {
@@ -2595,6 +2636,50 @@ mod tests {
         assert!(
             state.notes.iter().any(|n| n.text.contains("cancelling")),
             "user sees a whisper note confirming the cancel"
+        );
+    }
+
+    #[test]
+    fn active_cancel_guard_clears_slot_on_panic() {
+        // Regression test for codex P2 on PR #32 R0: earlier revision
+        // cleared `active_cancel` only on the post-`drive_turn` happy
+        // path. A panic-unwind through the worker's turn scope left
+        // the slot as `Some(dead_token)` forever, so subsequent Ctrl+C
+        // kept taking the cancel branch (false "cancelling turn…"
+        // forever, no fall-through to quit). R1 swapped the manual
+        // clear for an RAII `ActiveCancelGuard` whose Drop fires on
+        // unwind. This test locks in that behaviour.
+        let slot: Arc<Mutex<Option<CancellationToken>>> = Arc::new(Mutex::new(None));
+        let token = CancellationToken::new();
+        let slot_clone = slot.clone();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = ActiveCancelGuard::begin(slot_clone, token.clone());
+            // While the guard is live, the slot must be Some(our_token).
+            let inner = slot.lock().unwrap().clone();
+            assert!(
+                matches!(inner, Some(ref t) if t.is_cancelled() == token.is_cancelled()),
+                "guard parks the token while alive"
+            );
+            panic!("simulated drive_turn panic while slot holds Some(token)");
+        }));
+        // After unwind, Drop must have fired → slot is None, Ctrl+C
+        // will correctly fall through to idle-quit.
+        assert!(
+            slot.lock().unwrap().is_none(),
+            "ActiveCancelGuard::drop clears the slot on panic-unwind"
+        );
+    }
+
+    #[test]
+    fn active_cancel_guard_clears_slot_on_normal_drop() {
+        let slot: Arc<Mutex<Option<CancellationToken>>> = Arc::new(Mutex::new(None));
+        {
+            let _guard = ActiveCancelGuard::begin(slot.clone(), CancellationToken::new());
+            assert!(slot.lock().unwrap().is_some(), "parked while alive");
+        }
+        assert!(
+            slot.lock().unwrap().is_none(),
+            "drop on scope exit clears the slot"
         );
     }
 
