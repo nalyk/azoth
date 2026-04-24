@@ -1822,36 +1822,14 @@ pub async fn run_app(resume: Option<String>, as_of: Option<String>) -> io::Resul
     let profile_max_ctx = provider_profile.max_context_tokens;
     let profile_status = format!("{} · {}", provider_profile.name, provider_profile.model_id);
 
-    // F5 2026-04-24: resume-banner data. Run a lightweight scan of the
-    // session JSONL here (parent thread) rather than piping from the
-    // worker — the banner is pushed into `state.notes` in THIS scope
-    // after the worker spawns, and `resume_scan` is a worker-local
-    // value we drop before the banner is built. A second scan is cheap
-    // relative to the worker's own boot IO and keeps cross-thread
-    // plumbing simple.
-    let (banner_contract_id, banner_checkpoint_id, banner_committed, banner_interrupted): (
-        Option<ContractId>,
-        Option<azoth_core::schemas::CheckpointId>,
-        u32,
-        u32,
-    ) = if resuming {
-        let reader = JsonlReader::open(&session_path);
-        match as_of.as_deref() {
-            Some(t) => reader.scan_as_of(t),
-            None => reader.scan(),
-        }
-        .map(|s| {
-            (
-                s.last_accepted_contract().map(|c| c.id),
-                s.last_checkpoint_id(),
-                s.committed_run_progress().1,
-                s.interrupted_turn_count(),
-            )
-        })
-        .unwrap_or((None, None, 0, 0))
-    } else {
-        (None, None, 0, 0)
-    };
+    // F5 + R5 2026-04-24: banner data is produced by the worker after
+    // recover_dangling() + post-recovery scan, then pushed through this
+    // channel to the parent render loop. Previously I ran the scan on
+    // the parent thread (synchronous blocking IO on TUI startup, plus
+    // a timing bug codex P2 #2 flagged: the parent scan captured
+    // pre-recovery counts, so dangling turns reclassified as
+    // interrupted didn't show up in the banner).
+    let (banner_tx, mut banner_rx) = mpsc::channel::<String>(1);
 
     // Shared handle for cooperative turn cancellation. The worker owns
     // the write path (via `ActiveCancelGuard`, defined at module level
@@ -1864,6 +1842,10 @@ pub async fn run_app(resume: Option<String>, as_of: Option<String>) -> io::Resul
     let worker_error_tx = error_tx.clone();
     let worker_boot_phase_tx = boot_phase_tx.clone();
     let worker_ready_tx = ready_tx.clone();
+    let worker_banner_tx = banner_tx;
+    let worker_resuming = resuming;
+    let banner_as_of = as_of.clone();
+    let banner_session_path = session_path.clone();
     let worker_run_id = run_id.clone();
     let worker_cwd = cwd.clone();
     let worker_session_path = session_path.clone();
@@ -1974,6 +1956,37 @@ pub async fn run_app(resume: Option<String>, as_of: Option<String>) -> io::Resul
                 let _ = worker_session_tx.send(ev.0);
             }
         }
+
+        // R5 codex P2 2026-04-24: banner is built from the
+        // post-recovery scan here (NOT from a second parent-side
+        // scan). Dangling turns reclassified as interrupted during
+        // recover_dangling now surface correctly. Sent via the
+        // mpsc::channel<String>(1); parent's main loop picks it up
+        // and pushes to state.notes. On non-resume paths we still
+        // send the plain "session · <path>" banner for consistency.
+        let banner_text = {
+            let (contract_id, checkpoint_id, committed, interrupted) = resume_scan
+                .as_ref()
+                .map(|s| {
+                    (
+                        s.last_accepted_contract().map(|c| c.id),
+                        s.last_checkpoint_id(),
+                        s.committed_run_progress().1,
+                        s.interrupted_turn_count(),
+                    )
+                })
+                .unwrap_or((None, None, 0, 0));
+            let core = resume_summary(
+                worker_resuming,
+                banner_as_of.as_deref(),
+                contract_id.as_ref().map(|c| c.0.as_str()),
+                checkpoint_id.as_ref().map(|c| c.0.as_str()),
+                committed,
+                interrupted,
+            );
+            format!("{core} · {}", banner_session_path.display())
+        };
+        let _ = worker_banner_tx.send(banner_text).await;
 
         // Tap attaches AFTER hydration + recovery, so future live
         // events flow to the UI without double-feeding the hydration
@@ -2538,22 +2551,10 @@ pub async fn run_app(resume: Option<String>, as_of: Option<String>) -> io::Resul
     // already cloned above (see `worker_active_cancel`). Without this
     // line both sides hold distinct Arcs and Ctrl+C silently no-ops.
     state.active_cancel = active_cancel;
-    // F5 2026-04-24: banner now carries contract_id + checkpoint_id +
-    // (committed, interrupted) turn counts (was: path-only). The resume
-    // path pulled the data off `resume_scan` before dropping it (see
-    // `resume_banner_*` bindings above). Chronon CP-5 read-only mode is
-    // still surfaced in the as-of branch of `resume_summary`.
-    let banner = resume_summary(
-        resuming,
-        as_of.as_deref(),
-        banner_contract_id.as_ref().map(|c| c.0.as_str()),
-        banner_checkpoint_id.as_ref().map(|c| c.0.as_str()),
-        banner_committed,
-        banner_interrupted,
-    );
-    state
-        .notes
-        .push(Note::info(format!("{banner} · {}", session_path.display())));
+    // F5 + R5 2026-04-24: the banner is now delivered by the worker
+    // through `banner_rx` once it has finished recover_dangling +
+    // post-recovery scan. A select! branch below pushes it into
+    // state.notes as soon as it arrives; no synchronous scan here.
     // 50ms tick = 20fps, fast enough for the 80ms spinner cadence to
     // land on a frame boundary without skipping. The handler below
     // only marks dirty when an animation is actually running, so a
@@ -2632,6 +2633,14 @@ pub async fn run_app(resume: Option<String>, as_of: Option<String>) -> io::Resul
             Some(_) = ready_rx.recv() => {
                 state.booting = false;
                 state.boot_phase = "ready".to_string();
+                state.dirty = true;
+            }
+            Some(banner) = banner_rx.recv() => {
+                // R5 2026-04-24: worker finished post-recovery scan;
+                // push the enriched banner now. Separate branch from
+                // ready_rx so a slow recovery doesn't block the ready
+                // transition and vice versa.
+                state.notes.push(Note::info(banner));
                 state.dirty = true;
             }
             _ = ticker.tick() => {
