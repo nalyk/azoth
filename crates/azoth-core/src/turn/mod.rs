@@ -1028,6 +1028,8 @@ impl<'a> TurnDriver<'a> {
                                                     current,
                                                     proposed,
                                                 }),
+                                                // Budget-extension path — no per-tool path to preflight.
+                                                path_warning: None,
                                             };
                                             match race_wall_deadline(
                                                 self.approval_bridge.send(msg),
@@ -1327,7 +1329,17 @@ impl<'a> TurnDriver<'a> {
                             };
 
                             match decision {
-                                AuthorityDecision::Auto | AuthorityDecision::Reuse(_) => {}
+                                AuthorityDecision::Auto => {}
+                                AuthorityDecision::Reuse(tok_id) => {
+                                    // F0 (2026-04-25): `Once` is contracted as
+                                    // a one-shot grant. Burn it here so the
+                                    // NEXT apply_local/apply_repo invocation
+                                    // of this tool re-prompts the user. The
+                                    // `consume_if_once` no-ops on Session and
+                                    // ScopedPaths scopes, so those grants
+                                    // survive intentionally.
+                                    self.capabilities.consume_if_once(&tok_id);
+                                }
                                 AuthorityDecision::RequireBudgetExtension { .. } => {
                                     // Unreachable in the per-tool authorization
                                     // path. `authorize()` only yields Auto /
@@ -1377,6 +1389,21 @@ impl<'a> TurnDriver<'a> {
                                     );
 
                                     let (resp_tx, resp_rx) = oneshot::channel::<ApprovalResponse>();
+                                    // F4 (2026-04-25): preflight path for
+                                    // fs_write / fs_delete. If the path
+                                    // escapes repo_root, warn in the
+                                    // sheet so the user knows the tool
+                                    // will reject even if approved.
+                                    // Prior behaviour: sheet approved,
+                                    // tool rejected, user wasted a
+                                    // grant AND saw `Some("tool error")`
+                                    // (F6). Preflight tells the truth
+                                    // BEFORE the grant.
+                                    let path_warning = compute_path_warning(
+                                        &tool_name,
+                                        input,
+                                        &self.ctx.repo_root,
+                                    );
                                     let msg = ApprovalRequestMsg {
                                         turn_id: turn_id.clone(),
                                         approval_id: approval_id.clone(),
@@ -1388,6 +1415,7 @@ impl<'a> TurnDriver<'a> {
                                         // budget-extension variant applies
                                         // only to the amend branch above.
                                         budget_extension: None,
+                                        path_warning,
                                     };
                                     // Round 6: race the bridge send against the
                                     // wall deadline. Normally bounded and
@@ -1464,7 +1492,7 @@ impl<'a> TurnDriver<'a> {
                                             self.writer.append(&SessionEvent::ApprovalGranted {
                                                 turn_id: turn_id.clone(),
                                                 approval_id: approval_id.clone(),
-                                                token: tok_id,
+                                                token: tok_id.clone(),
                                                 scope: scope.clone(),
                                                 tool_name: Some(tool_name.clone()),
                                             })?;
@@ -1474,6 +1502,16 @@ impl<'a> TurnDriver<'a> {
                                                 &tool_name,
                                                 &format!("{scope:?}"),
                                             );
+                                            // F0 (2026-04-25): `Once` is
+                                            // contracted as one invocation,
+                                            // and the upcoming dispatch IS
+                                            // that invocation. Consume the
+                                            // token now so any further
+                                            // apply_local/apply_repo call
+                                            // this turn re-prompts. Session
+                                            // and ScopedPaths grants fall
+                                            // through intentionally.
+                                            self.capabilities.consume_if_once(&tok_id);
                                         }
                                         Ok(ApprovalResponse::Deny) | Err(_) => {
                                             self.writer.append(&SessionEvent::ApprovalDenied {
@@ -2014,6 +2052,61 @@ fn persist_tool_output(
     }
 }
 
+/// F4 (2026-04-25): preflight an approval against the tool's own
+/// path guard. `fs_write` / `fs_delete` reject any path that
+/// canonicalizes outside `repo_root`; before this helper, the
+/// approval sheet asked the user to authorize writes the tool would
+/// then reject — burning the capability grant on a no-op. Returning
+/// `Some(msg)` tells the sheet to render a warning line so the
+/// user sees the truth BEFORE they tap approve.
+///
+/// Conservative rules:
+/// - Only triggers on tools we know validate paths (fs_write,
+///   fs_delete). Unknown tools: `None`.
+/// - If the path cannot be canonicalized (e.g., parent doesn't
+///   exist yet) the guard falls through on string prefix — same
+///   shape fs_write uses.
+/// - Never fails — any IO error → `None` (preflight is best-
+///   effort UX, not a security boundary; the tool's own guard is
+///   the real enforcement).
+fn compute_path_warning(
+    tool_name: &str,
+    input: &serde_json::Value,
+    repo_root: &std::path::Path,
+) -> Option<String> {
+    if !matches!(tool_name, "fs_write" | "fs_delete") {
+        return None;
+    }
+    let raw = input.get("path").and_then(|v| v.as_str())?;
+    let candidate = std::path::Path::new(raw);
+    let abs = if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else {
+        repo_root.join(candidate)
+    };
+    // Canonicalize the nearest existing ancestor — fs_write accepts
+    // paths whose parent doesn't yet exist. If canonicalize fails
+    // on the leaf, walk up until it succeeds.
+    let mut probe = abs.as_path();
+    let resolved = loop {
+        match probe.canonicalize() {
+            Ok(p) => break p,
+            Err(_) => match probe.parent() {
+                Some(parent) => probe = parent,
+                None => return None, // can't resolve at all — skip warning
+            },
+        }
+    };
+    let root = repo_root.canonicalize().ok()?;
+    if resolved.starts_with(&root) {
+        None
+    } else {
+        Some(format!(
+            "path `{raw}` is outside repo_root — tool will reject even on approval"
+        ))
+    }
+}
+
 /// Human-readable hint describing what a tool is about to do, shown in the
 /// approval modal. Tool-specific extractors take priority over the generic
 /// JSON fallback so `bash → rm -rf /` renders meaningfully instead of
@@ -2094,5 +2187,79 @@ mod approval_hint_tests {
         let v = serde_json::json!({ "weird": "thing" });
         let hint = approval_hint("custom.tool", &v);
         assert!(hint.contains("weird"));
+    }
+}
+
+#[cfg(test)]
+mod compute_path_warning_tests {
+    //! F4 (2026-04-25): preflight path validation against repo_root.
+    //! Best-effort UX helper — must never panic, must return `None`
+    //! when the check cannot be made (unknown tool, no path, I/O
+    //! failure), and must flag real escape attempts loudly.
+    use super::compute_path_warning;
+    use tempfile::tempdir;
+
+    #[test]
+    fn fs_write_inside_repo_root_returns_none() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let inp = serde_json::json!({ "path": "src/foo.rs", "contents": "x" });
+        assert!(compute_path_warning("fs_write", &inp, &root).is_none());
+    }
+
+    #[test]
+    fn fs_write_absolute_outside_repo_root_flags() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let inp = serde_json::json!({ "path": "/tmp/azoth-e2e-test/out.txt" });
+        let warn = compute_path_warning("fs_write", &inp, &root).expect("must warn");
+        assert!(warn.contains("outside repo_root"));
+        assert!(warn.contains("/tmp/azoth-e2e-test/out.txt"));
+    }
+
+    #[test]
+    fn fs_write_dotdot_escape_flags() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        // Create a sibling of repo_root that should be refused.
+        let outside = dir.path().parent().unwrap().join("sibling");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("leak.txt"), "").unwrap();
+        let rel = format!(
+            "../{}/leak.txt",
+            outside.file_name().unwrap().to_string_lossy()
+        );
+        let inp = serde_json::json!({ "path": rel });
+        let warn = compute_path_warning("fs_write", &inp, &root).expect("must warn");
+        assert!(warn.contains("outside repo_root"));
+    }
+
+    #[test]
+    fn non_path_tool_returns_none() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let inp = serde_json::json!({ "command": "ls" });
+        assert!(compute_path_warning("bash", &inp, &root).is_none());
+    }
+
+    #[test]
+    fn input_without_path_returns_none() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let inp = serde_json::json!({});
+        assert!(compute_path_warning("fs_write", &inp, &root).is_none());
+    }
+
+    #[test]
+    fn nonexistent_repo_relative_path_does_not_warn() {
+        // fs_write is allowed to create files whose parent exists but
+        // whose leaf doesn't — preflight must canonicalize via the
+        // nearest existing ancestor and not false-positive on a
+        // legitimate in-repo create.
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+        let inp = serde_json::json!({ "path": "docs/NEW_FILE.md" });
+        assert!(compute_path_warning("fs_write", &inp, &root).is_none());
     }
 }

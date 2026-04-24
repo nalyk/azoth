@@ -272,6 +272,20 @@ fn effect_preview(req: &ApprovalRequestMsg) -> Vec<Line<'static>> {
         class_note.to_string(),
         theme.italic_dim(),
     )));
+    // F4 (2026-04-25): driver-side preflight warning. When the
+    // incoming `path` canonicalizes outside `repo_root`, the tool's
+    // own guard will reject the call even on approval. Render the
+    // warning in AMBER above the summary so the user sees the truth
+    // BEFORE tapping approve. Burnt E2E on 2026-04-25 saw the user
+    // grant, tool reject, cap NOT consumed (pre-F0), and the next
+    // fs_write silently reuse the "wasted" grant for an in-repo
+    // write. With F0 + F4 together: user is warned before granting.
+    if let Some(warn) = &req.path_warning {
+        out.push(Line::from(Span::styled(
+            format!("⚠ {warn}"),
+            theme.ink(Colors::AMBER).add_modifier(Modifier::BOLD),
+        )));
+    }
     out.push(Line::from(""));
     for line in req.summary.lines() {
         out.push(Line::from(Span::styled(
@@ -300,6 +314,7 @@ mod tests {
             summary: "write 42 bytes to src/foo.rs".into(),
             responder: tx,
             budget_extension: None,
+            path_warning: None,
         }
     }
 
@@ -316,6 +331,57 @@ mod tests {
                 .draw(|f| render(f, f.area(), &req, &theme, &mut click_map, 0))
                 .expect("no panic on small terminal");
         }
+    }
+
+    #[test]
+    fn effect_preview_shows_path_warning_when_present() {
+        // F4 (2026-04-25): when the driver preflight detects a path
+        // escaping repo_root, the sheet body must lead with an AMBER
+        // warning line so the user sees it BEFORE tapping approve.
+        let (tx, _rx) = oneshot::channel();
+        let req = ApprovalRequestMsg {
+            turn_id: TurnId::new(),
+            approval_id: ApprovalId::new(),
+            tool_name: "fs_write".into(),
+            effect_class: EffectClass::ApplyLocal,
+            summary: "fs_write → /tmp/escape.txt".into(),
+            responder: tx,
+            budget_extension: None,
+            path_warning: Some(
+                "path `/tmp/escape.txt` is outside repo_root — tool will reject even on approval"
+                    .into(),
+            ),
+        };
+        let lines = super::effect_preview(&req);
+        let joined: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            joined.contains("outside repo_root"),
+            "warning text must appear in preview; got: {joined:?}"
+        );
+        assert!(
+            joined.contains("⚠") || joined.contains("warning"),
+            "warning marker must lead the line"
+        );
+    }
+
+    #[test]
+    fn effect_preview_omits_warning_when_absent() {
+        // Regression: the warning line must NOT render when
+        // `path_warning` is `None` (in-repo writes should stay clean).
+        let lines = super::effect_preview(&mk_req());
+        let joined: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            !joined.contains("outside repo_root"),
+            "no warning when path_warning=None; got: {joined:?}"
+        );
     }
 
     #[test]

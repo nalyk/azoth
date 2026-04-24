@@ -162,6 +162,7 @@ mod tests {
             summary: format!("{tool} → example summary"),
             responder: tx,
             budget_extension: None,
+            path_warning: None,
         }
     }
 

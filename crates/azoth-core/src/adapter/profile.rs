@@ -104,7 +104,17 @@ impl ProviderProfile {
             // num_ctx is a separate plumbing concern (we don't forward
             // it in build_body today) — tracked as F3(b) follow-up.
             max_context_tokens: 131_072,
-            max_output_tokens: 8_192,
+            // F9 2026-04-25: bumped from 8_192 → 16_384. Live E2E on
+            // run_26571438f80c saw three ModelTruncated aborts on
+            // nalyk-qwen36-code — one essay (genuine overflow), one
+            // /continue that burned 2 048 tokens in thinking alone with
+            // zero text output, and one 10-word question that spent
+            // 183 thinking lines before hitting the cap. qwen3.5/3.6
+            // Modelfile num_predict is typically -1 (unlimited) so the
+            // bump is azoth-side only; 16_384 is roughly 2× the median
+            // thinking-heavy turn observed and gives Q&A room to land
+            // real text after deep chain-of-thought.
+            max_output_tokens: 16_384,
             tool_use_shape: ToolUseShape::ContentBlock,
             // See `anthropic_default` for why this is empty — the adapter
             // sends `anthropic-version` itself; leaving it in extras
@@ -124,7 +134,9 @@ impl ProviderProfile {
             supports_strict_json_schema: false,
             // F3 2026-04-24: see ollama_anthropic for rationale.
             max_context_tokens: 131_072,
-            max_output_tokens: 8_192,
+            // F9 2026-04-25: see ollama_anthropic for rationale (8_192 →
+            // 16_384 to absorb qwen3.5/3.6's long thinking chains).
+            max_output_tokens: 16_384,
             tool_use_shape: ToolUseShape::FlatToolCalls,
             extra_headers: vec![],
         }

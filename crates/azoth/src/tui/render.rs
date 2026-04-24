@@ -174,7 +174,13 @@ fn render_status(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         theme.ink(Colors::ACCENT).add_modifier(Modifier::BOLD)
     };
     spans.push(Span::styled("     ctx ", theme.dim()));
-    spans.push(Span::styled(format!("{}%", state.ctx_pct), ctx_style));
+    // F7 (2026-04-25): use the shared label so sub-percent usage
+    // shows as `<1%` instead of rounding to `0%` (which reads as
+    // "context empty" and confused users on the 2026-04-25 E2E).
+    spans.push(Span::styled(
+        super::inspector::ctx_pct_label(state.ctx_pct, state.last_input_tokens),
+        ctx_style,
+    ));
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 

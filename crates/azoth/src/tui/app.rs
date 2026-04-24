@@ -129,6 +129,19 @@ pub struct AppState {
     pub ctx_pct: u8,
     pub dirty: bool,
     pub should_quit: bool,
+    /// F2 (2026-04-25): set when the app exits because of a user
+    /// action that needs a post-teardown hint (e.g. `/resume <id>`
+    /// at runtime — which cannot actually resume in-place and needs
+    /// the user to restart the binary with `azoth resume <id>`).
+    /// `run_app` prints this to stderr AFTER
+    /// `LeaveAlternateScreen`, so the message lands in the shell
+    /// scrollback instead of the now-torn-down alt screen. Before
+    /// this field existed, the informational note was pushed and
+    /// `should_quit = true` was set on the same loop iteration —
+    /// the render *might* have happened, but the alternate screen
+    /// wiped the frame on exit and users saw azoth disappear with
+    /// no explanation.
+    pub exit_message: Option<String>,
     pending_user_text: Option<String>,
     pending_contract: Option<Contract>,
     pub pending_approval: Option<ApprovalRequestMsg>,
@@ -231,6 +244,7 @@ impl AppState {
             ctx_pct: 0,
             dirty: true,
             should_quit: false,
+            exit_message: None,
             pending_user_text: None,
             pending_contract: None,
             pending_approval: None,
@@ -341,6 +355,21 @@ impl AppState {
                     for line in s.lines() {
                         self.notes.push(Note::info(line.to_string()));
                     }
+                    // F8 (2026-04-25): enrich with live counters so
+                    // the user sees not just the frozen packet
+                    // digest but the current pressure picture:
+                    // context %, last input tokens, evidence lane
+                    // count, registered tool count. Before this
+                    // fix the /context whisper surfaced only the
+                    // digest line — near-zero actionable info.
+                    let ctx_label =
+                        super::inspector::ctx_pct_label(self.ctx_pct, self.last_input_tokens);
+                    let lanes = self.inspector_data.evidence_lanes.len();
+                    let tools = self.inspector_data.tools.len();
+                    self.notes.push(Note::info(format!(
+                        "ctx {ctx_label} · {tok} input tok · {lanes} evidence · {tools} tools",
+                        tok = self.last_input_tokens,
+                    )));
                 } else {
                     self.notes
                         .push(Note::help("no packet compiled yet — send a message first"));
@@ -456,9 +485,18 @@ impl AppState {
                 // printed usage. I'm wiring the list (from the TUI-
                 // local `session_approvals` roster) so the docstring
                 // and behaviour agree.
+                //
+                // F1 (2026-04-25): empty-state message is now explicit
+                // that `once`-scope grants never populate the roster
+                // (they are consumed on use per F0). A user who only
+                // ever taps `↵ approve once` on the sheet would
+                // otherwise read "none granted" as "my approval
+                // failed" — it didn't, the grant simply did its one
+                // job and expired.
                 if self.session_approvals.is_empty() {
                     self.notes.push(Note::help(
-                        "usage: /approve <tool_name> — none granted this session yet",
+                        "usage: /approve <tool_name> — no live session/scoped grants \
+                         (once-grants don't persist)",
                     ));
                 } else {
                     let list = self.session_approvals.join(", ");
@@ -553,9 +591,21 @@ impl AppState {
             SlashCommand::Resume(Some(id)) => {
                 // Slash-only behaviour: print restart instruction +
                 // quit. The palette `Resume` variant just shows help.
-                self.notes.push(Note::info(format!(
-                    "/resume not supported at runtime — restart with: azoth resume {id}"
-                )));
+                //
+                // F2 (2026-04-25): before this fix, the user-visible
+                // note was pushed and `should_quit=true` was set on
+                // the same iteration — the render may have happened,
+                // but `LeaveAlternateScreen` wiped it before the user
+                // could read it. Live E2E on 2026-04-25
+                // (run_26571438f80c) observed azoth exit with ZERO
+                // output even at `RUST_LOG=debug`. Parking the
+                // message in `exit_message` so `run_app` prints it to
+                // stderr after teardown, where the shell prompt will
+                // preserve it in scrollback.
+                let msg =
+                    format!("/resume not supported at runtime — restart with: azoth resume {id}");
+                self.notes.push(Note::info(msg.clone()));
+                self.exit_message = Some(msg);
                 self.should_quit = true;
             }
             SlashCommand::Resume(None) => self.run_palette_action(PaletteAction::Resume),
@@ -1153,11 +1203,15 @@ impl AppState {
             SessionEvent::ContractAccepted { contract, .. } => {
                 let goal = contract.goal.clone();
                 self.inspector_data.contract_goal = Some(goal.clone());
-                let budget = contract
-                    .effect_budget
-                    .max_apply_local
-                    .saturating_add(contract.effect_budget.max_apply_repo);
-                self.inspector_data.contract_budget = Some((0, budget));
+                // F3 (2026-04-25): track apply_local and apply_repo
+                // caps separately so the inspector can render each
+                // (used/max) independently. Prior code summed them,
+                // masking "one repo edit from abort" behind a
+                // generous local-cap denominator.
+                self.inspector_data.contract_budget_local =
+                    Some((0, contract.effect_budget.max_apply_local));
+                self.inspector_data.contract_budget_repo =
+                    Some((0, contract.effect_budget.max_apply_repo));
                 self.notes
                     .push(Note::info(format!("contract accepted · {goal}")));
                 self.current_contract_id = Some(contract.id);
@@ -1386,21 +1440,35 @@ impl AppState {
                 }
             }
             SessionEvent::EffectRecord { effect, .. } => {
-                if effect.error.is_some() {
+                if let Some(msg) = effect.error.as_deref() {
+                    // F6 (2026-04-25): previous `{:?}` on Option<String>
+                    // rendered `Some("tool error")` in the UI — the
+                    // `Option` wrapper leaked into user-visible text.
+                    // Unwrap the inner string so the note reads
+                    // `effect error · fs_write · tool error` instead of
+                    // `effect error · fs_write · Some("tool error")`.
                     self.notes.push(Note::error(format!(
-                        "effect error · {} · {:?}",
-                        effect.tool_name, effect.error
+                        "effect error · {} · {}",
+                        effect.tool_name, msg
                     )));
-                } else if matches!(
-                    effect.class,
-                    azoth_core::schemas::EffectClass::ApplyLocal
-                        | azoth_core::schemas::EffectClass::ApplyRepo
-                ) {
+                } else {
                     // Successful budget-counted effect — bump the
-                    // inspector's contract budget consumption so the
-                    // user can see how close they are to the cap.
-                    // Earlier the consumed counter sat at 0 forever.
-                    if let Some((used, max)) = self.inspector_data.contract_budget.as_mut() {
+                    // matching class counter so the inspector shows
+                    // how close the user is to the per-class cap.
+                    // F3 (2026-04-25): split by class. Previously
+                    // both classes incremented the same fused
+                    // counter; a user one `apply_repo` away from
+                    // the 5-cap saw `budget 3/25` and no warning.
+                    let slot = match effect.class {
+                        azoth_core::schemas::EffectClass::ApplyLocal => {
+                            self.inspector_data.contract_budget_local.as_mut()
+                        }
+                        azoth_core::schemas::EffectClass::ApplyRepo => {
+                            self.inspector_data.contract_budget_repo.as_mut()
+                        }
+                        _ => None, // Observe/Stage/Remote*/Irreversible: not budget-counted
+                    };
+                    if let Some((used, max)) = slot {
                         *used = used.saturating_add(1).min(*max);
                     }
                 }
@@ -1468,7 +1536,20 @@ impl AppState {
                 // CapabilityStore starts fresh each resume). Skipping
                 // roster update on replay keeps the TUI mirror
                 // faithful to active capabilities.
-                if !is_replay && matches!(scope, ApprovalScope::Session) {
+                // F1 (2026-04-25): include ScopedPaths alongside
+                // Session — both are live-for-the-session grants and
+                // both belong in `/approve` roster. Only `Once` is
+                // excluded (one-shot grants are consumed on use after
+                // F0 and never survive the turn). Before this fix, a
+                // ScopedPaths grant authorized repeated writes without
+                // any /approve visibility — users could not audit what
+                // was live.
+                if !is_replay
+                    && matches!(
+                        scope,
+                        ApprovalScope::Session | ApprovalScope::ScopedPaths { .. }
+                    )
+                {
                     if let Some(tool) = tool_name.as_deref() {
                         // R4-1: pass `&str` — the helper clones only
                         // if the roster doesn't already contain it.
@@ -1489,6 +1570,10 @@ impl AppState {
                     }
                     self.inspector_data.ctx_history.push(self.ctx_pct as u64);
                     self.inspector_data.ctx_pct = self.ctx_pct;
+                    // F7 (2026-04-25): pipe raw token count so the
+                    // inspector can display `<1%` for small positive
+                    // usage instead of a misleading `0%`.
+                    self.inspector_data.last_input_tokens = self.last_input_tokens;
                 }
                 let tid = turn_id.to_string();
                 let chip = UsageChip {
@@ -2754,6 +2839,18 @@ pub async fn run_app(resume: Option<String>, as_of: Option<String>) -> io::Resul
     disable_raw_mode()?;
     terminal.backend_mut().execute(DisableMouseCapture)?;
     terminal.backend_mut().execute(LeaveAlternateScreen)?;
+
+    // F2 (2026-04-25): post-teardown hint. Printed AFTER
+    // `LeaveAlternateScreen` so the message appears in the user's
+    // shell scrollback, not on the torn-down alt screen. Currently
+    // only `/resume <id>` sets this (runtime resume is unsupported
+    // and needs a CLI restart). Stderr keeps it out of stdout
+    // piping and matches the idiom of "informational aside on
+    // graceful exit".
+    if let Some(msg) = state.exit_message.take() {
+        eprintln!("{msg}");
+    }
+
     Ok(())
 }
 
@@ -2776,7 +2873,15 @@ mod tests {
         // Empty state → helpful usage + no-grants hint
         state.run_palette_action(super::PaletteAction::Approve(None));
         let n = state.notes.last().expect("note");
-        assert!(n.text.contains("none granted"), "got: {:?}", n.text);
+        // F1 (2026-04-25): empty-state whisper text updated to mention
+        // once-grant ephemerality. Assert a stable substring that
+        // names what IS listed (session/scoped) rather than a
+        // phrase that might change again in future UX passes.
+        assert!(
+            n.text.contains("no live session/scoped grants"),
+            "got: {:?}",
+            n.text
+        );
 
         // Pre-intent via /approve <tool> must NOT touch the roster
         // until the worker confirms via ApprovalGranted.
@@ -2868,6 +2973,71 @@ mod tests {
             state.session_approvals.is_empty(),
             "Once scope must not populate session roster; got: {:?}",
             state.session_approvals
+        );
+    }
+
+    #[test]
+    fn approval_granted_scoped_paths_populates_roster() {
+        // F1 (2026-04-25): ScopedPaths grants are live-for-the-session
+        // within their path allowlist. Before this fix they were
+        // silently excluded from /approve — users had no way to audit
+        // what was live. Regression: include ScopedPaths alongside
+        // Session; only Once is truly ephemeral.
+        use azoth_core::schemas::{ApprovalScope, CapabilityTokenId};
+        let mut state = AppState::new();
+        state.handle_session_event(SessionEvent::ApprovalGranted {
+            turn_id: TurnId::from("t_sp".to_string()),
+            approval_id: ApprovalId::new(),
+            token: CapabilityTokenId::new(),
+            scope: ApprovalScope::ScopedPaths {
+                paths: vec!["src/".into()],
+            },
+            tool_name: Some("fs_write".into()),
+        });
+        assert_eq!(
+            state.session_approvals,
+            vec!["fs_write".to_string()],
+            "ScopedPaths grant must surface in /approve roster"
+        );
+    }
+
+    #[test]
+    fn slash_resume_with_id_sets_exit_message_and_quit() {
+        // F2 (2026-04-25): runtime `/resume <id>` cannot resume in-
+        // place. It must park a post-teardown hint in `exit_message`
+        // (printed to stderr after `LeaveAlternateScreen`) AND set
+        // `should_quit`. Before this fix, only the note+quit were
+        // set — the alt screen was torn down before the render
+        // landed, and users saw azoth disappear with no message.
+        let mut state = AppState::new();
+        state.handle_slash(crate::tui::input::SlashCommand::Resume(Some(
+            "run_abc123".to_string(),
+        )));
+        let exit = state
+            .exit_message
+            .as_deref()
+            .expect("exit_message must be set so run_app can print it after teardown");
+        assert!(
+            exit.contains("azoth resume run_abc123"),
+            "exit hint must name the exact restart command; got: {exit:?}"
+        );
+        assert!(state.should_quit, "runtime /resume must quit");
+    }
+
+    #[test]
+    fn approve_empty_whisper_mentions_once_is_ephemeral() {
+        // F1 (2026-04-25): "none granted this session yet" read as
+        // "my approval failed" for users who only tap `approve once`.
+        // After F0, Once grants are one-shot and consumed on use —
+        // they NEVER appear in /approve list by design. The empty-
+        // state whisper now says so explicitly.
+        let mut state = AppState::new();
+        state.run_palette_action(super::PaletteAction::Approve(None));
+        let n = state.notes.last().expect("whisper note");
+        assert!(
+            n.text.contains("once-grants don't persist"),
+            "empty /approve whisper must explain why once-grants are absent; got: {:?}",
+            n.text
         );
     }
 
@@ -3309,6 +3479,38 @@ mod tests {
     }
 
     #[test]
+    fn slash_context_emits_live_pressure_summary_with_tokens_and_lanes() {
+        // F8 (2026-04-25): the /context whisper used to show only the
+        // frozen packet digest — useless for live pressure assessment.
+        // It now also emits "ctx X% · N input tok · M evidence · K
+        // tools" so the user can decide whether to clear state or
+        // keep iterating.
+        let mut state = AppState::new();
+        state.last_context_summary = Some("digest  sha256:ab".into());
+        state.ctx_pct = 37;
+        state.last_input_tokens = 48_492;
+        state
+            .inspector_data
+            .evidence_lanes
+            .push(("lexical".into(), "TurnDriver · 4 hits".into()));
+        state
+            .inspector_data
+            .evidence_lanes
+            .push(("symbol".into(), "drive_turn".into()));
+        state.inspector_data.tools = vec!["repo_search".into(), "fs_write".into()];
+        state.handle_slash(SlashCommand::Context);
+        let live = state
+            .notes
+            .iter()
+            .find(|n| n.text.contains("input tok"))
+            .expect("live pressure summary must be pushed");
+        assert!(live.text.contains("37%"), "got: {:?}", live.text);
+        assert!(live.text.contains("48492"), "got: {:?}", live.text);
+        assert!(live.text.contains("2 evidence"), "got: {:?}", live.text);
+        assert!(live.text.contains("2 tools"), "got: {:?}", live.text);
+    }
+
+    #[test]
     fn slash_context_shows_stub_when_no_packet() {
         let mut state = AppState::new();
         state.handle_slash(SlashCommand::Context);
@@ -3656,6 +3858,7 @@ mod tests {
             summary: "write foo".into(),
             responder: tx,
             budget_extension: None,
+            path_warning: None,
         });
         let taken = state.take_pending_approval();
         assert!(taken.is_some());
@@ -3975,11 +4178,14 @@ mod tests {
 
     #[test]
     fn effect_record_increments_contract_budget_consumed() {
+        // F3 (2026-04-25): apply_local and apply_repo are tracked
+        // separately. ApplyLocal increments local; ApplyRepo
+        // increments repo; Observe/errors increment neither.
         let mut state = AppState::new();
-        // Simulate accepting a contract with budget 5 (3 apply_local + 2 apply_repo).
-        state.inspector_data.contract_budget = Some((0, 5));
+        state.inspector_data.contract_budget_local = Some((0, 3));
+        state.inspector_data.contract_budget_repo = Some((0, 2));
         let turn_id = TurnId::new();
-        // First successful ApplyLocal effect.
+        // Successful ApplyLocal → local bumps, repo untouched.
         state.handle_session_event(SessionEvent::EffectRecord {
             turn_id: turn_id.clone(),
             effect: azoth_core::schemas::EffectRecord {
@@ -3992,8 +4198,24 @@ mod tests {
                 error: None,
             },
         });
-        assert_eq!(state.inspector_data.contract_budget, Some((1, 5)));
-        // Failed effect — must NOT bump the counter.
+        assert_eq!(state.inspector_data.contract_budget_local, Some((1, 3)));
+        assert_eq!(state.inspector_data.contract_budget_repo, Some((0, 2)));
+        // Successful ApplyRepo → repo bumps, local untouched.
+        state.handle_session_event(SessionEvent::EffectRecord {
+            turn_id: turn_id.clone(),
+            effect: azoth_core::schemas::EffectRecord {
+                id: azoth_core::schemas::EffectRecordId::new(),
+                tool_use_id: azoth_core::schemas::ToolUseId::from("tu_r1".to_string()),
+                class: azoth_core::schemas::EffectClass::ApplyRepo,
+                tool_name: "git_commit".into(),
+                input_digest: None,
+                output_artifact: None,
+                error: None,
+            },
+        });
+        assert_eq!(state.inspector_data.contract_budget_local, Some((1, 3)));
+        assert_eq!(state.inspector_data.contract_budget_repo, Some((1, 2)));
+        // Failed ApplyLocal — must NOT bump either counter.
         state.handle_session_event(SessionEvent::EffectRecord {
             turn_id: turn_id.clone(),
             effect: azoth_core::schemas::EffectRecord {
@@ -4007,10 +4229,11 @@ mod tests {
             },
         });
         assert_eq!(
-            state.inspector_data.contract_budget,
-            Some((1, 5)),
+            state.inspector_data.contract_budget_local,
+            Some((1, 3)),
             "errored effects must not consume budget"
         );
+        assert_eq!(state.inspector_data.contract_budget_repo, Some((1, 2)));
         // Observe-class effect — also doesn't count.
         state.handle_session_event(SessionEvent::EffectRecord {
             turn_id,
@@ -4025,8 +4248,8 @@ mod tests {
             },
         });
         assert_eq!(
-            state.inspector_data.contract_budget,
-            Some((1, 5)),
+            state.inspector_data.contract_budget_local,
+            Some((1, 3)),
             "Observe is not budget-counted"
         );
     }
