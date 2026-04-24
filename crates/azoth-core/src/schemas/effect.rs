@@ -150,7 +150,11 @@ mod tests {
         ] {
             let json = serde_json::to_value(ec).unwrap();
             let wire = json.as_str().expect("EffectClass serialises as string");
-            assert_eq!(wire, ec.as_snake(), "serde wire must match Display/as_snake");
+            assert_eq!(
+                wire,
+                ec.as_snake(),
+                "serde wire must match Display/as_snake"
+            );
         }
     }
 

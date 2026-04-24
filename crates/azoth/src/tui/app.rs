@@ -1686,10 +1686,12 @@ impl Drop for ActiveCancelGuard {
 }
 
 /// Build the resume / session banner shown as the first whisper-note after
-/// the TUI comes up. F5 2026-04-24: was `resumed · <session_path>` (path
-/// only). `docs/draft_plan.md §Resume and session lifecycle` spec: contract
-/// + checkpoint + (committed, interrupted) counts. A pure function so we
-/// can test the formatting without booting a worker.
+/// the TUI comes up.
+///
+/// F5 2026-04-24: was `resumed · <session_path>` (path only).
+/// `docs/draft_plan.md §Resume and session lifecycle` spec calls for
+/// contract id, last checkpoint id, and (committed, interrupted) counts.
+/// A pure function so we can test the formatting without booting a worker.
 pub(crate) fn resume_summary(
     resuming: bool,
     as_of: Option<&str>,
@@ -2681,7 +2683,10 @@ mod tests {
             "checkpoint id missing: {b:?}"
         );
         assert!(b.contains("2 turns"), "committed count missing: {b:?}");
-        assert!(b.contains("1 interrupted"), "interrupted count missing: {b:?}");
+        assert!(
+            b.contains("1 interrupted"),
+            "interrupted count missing: {b:?}"
+        );
     }
 
     #[test]
@@ -2893,9 +2898,7 @@ mod tests {
         state.handle_session_event(SessionEvent::TurnAborted {
             turn_id: tid,
             reason: AbortReason::ContextOverflow,
-            detail: Some(
-                "estimate 36072 tokens > profile max_context_tokens 32768".into(),
-            ),
+            detail: Some("estimate 36072 tokens > profile max_context_tokens 32768".into()),
             usage: Usage::default(),
             at: Some("2026-04-24T20:00:05Z".into()),
         });
