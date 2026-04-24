@@ -17,7 +17,7 @@
 
 Every turn runs under a contract with explicit success criteria. Every side effect is classified into one of seven effect classes and budgeted against that contract. Bash runs inside a Landlock jail when you turn the sandbox on. Every run leaves a replayable JSONL event log, a SQLite mirror, and a content-addressed artifact store. The model proposes. The runtime decides.
 
-Rust workspace. Interactive TUI. Linux only. v2.0.2 ships fmt + clippy clean, the full workspace test suite green on Linux x86_64, and SLSA v1.0 build provenance attached.
+Rust workspace. Interactive TUI. Linux only. v2.1.0 ships fmt + clippy clean, the full workspace test suite green on Linux x86_64, and SLSA v1.0 build provenance attached.
 
 <p align="center">
   <a href="assets/start_screen.png"><img alt="azoth starting a fresh session — status line reads 'no contract yet', 0 turns, ctx 0%; the composer invites 'what are we building?' against the PAPER dark palette" src="assets/start_screen.png" width="100%"></a>
@@ -198,8 +198,8 @@ This section exists because the rest of the README is confident and you deserve 
 
 - **Retrieval is keyword-grade for prose queries.** The composite works well when the prompt contains identifiers or paths. Natural-language "explain what happens when X" prompts lose signal. A query-planning and embedding lane is v2.5 scope.
 - **Sandbox imposes ~100 ms overhead per tool call** and needs unprivileged user namespaces (check with `unshare -U true`). v2.1 flips the default on; set `AZOTH_SANDBOX=off` to opt back out. Hosts without user-ns support degrade to `off` automatically with a warning.
-- **Tree-sitter symbols: Rust only.** Python, TypeScript, Go, and Java grammars are v2.1 scope. Other languages still get FTS, ripgrep, and co-edit graph.
-- **TDAD: `cargo test` only.** pytest, jest, and `go test` adapters are v2.1 scope.
+- **Tree-sitter symbols: Rust, Python, TypeScript (`.ts` + `.tsx`), Go.** JavaScript (`.js` / `.jsx` / `.mjs` / `.cjs`) and Java grammars are post-2.1 scope. Other languages still get FTS, ripgrep, and co-edit graph.
+- **TDAD: `cargo test`, pytest, jest, and `go test`.** Jest monorepo / workspaces configs are rejected with `JestError::UnsupportedConfig`; go parallel per-package execution, `go.work` multi-module, and `-bench`-aware runners are v2.2 scope.
 - **Linux only.** Sandbox tiers and `fuse-overlayfs` are Linux-specific. macOS and Windows builds currently fail at the `sandbox` module. WSL2 works.
 - Contract amendments, the policy DSL, gVisor (Tier C), Firecracker (Tier D), domain packs, and enterprise deployment modes are all post-v2 scope per `docs/draft_plan.md`.
 
@@ -422,7 +422,8 @@ azoth/
 
 ## Version history
 
-- **v2.0.2** (current, main). Chronon Plane — invariant #8: *time is taint, not preface*. Every persisted timestamp flows through an injected `Clock` (`SystemClock` in production, `FrozenClock` in tests, `VirtualClock` for replay). Externally-observed facts carry `(observed_at, valid_at)`. Contracts may bound wall-clock spend via `scope.max_wall_secs`; open turns emit throttled `TurnHeartbeat` events. `azoth resume --as-of <ISO8601>` reconstructs a forensic projection at any wall-clock point (m0007 adds the `turns.at` index). Seven bot-review rounds closed.
+- **v2.1.0** (current, main). Language breadth + safe-by-default. Tree-sitter grammars for Python, TypeScript (`.ts` + `.tsx`), and Go — all reusing an iterative preorder walker in `code_graph/common.rs`. TDAD test-impact selectors + live runners for pytest (`-v` parser), jest (`--json`), and `go test` (`-json` NDJSON). Shared `TestRunner` trait and `word_boundary_contains` helper. 20 new red-team cases across 5 categories. Eval seed expanded to 50 hand-labelled localization tasks (Py + TS + Go, driving headless dogfood runs against psf/requests, microsoft/vscode-eslint, and urfave/cli). `AZOTH_SANDBOX` default flipped `off` → `tier_a` (with userns probe cached in `OnceLock<bool>` + thread-identity guard). Pre-2.1 JSONL + SQLite replay clean.
+- **v2.0.2**. Chronon Plane — invariant #8: *time is taint, not preface*. Every persisted timestamp flows through an injected `Clock` (`SystemClock` in production, `FrozenClock` in tests, `VirtualClock` for replay). Externally-observed facts carry `(observed_at, valid_at)`. Contracts may bound wall-clock spend via `scope.max_wall_secs`; open turns emit throttled `TurnHeartbeat` events. `azoth resume --as-of <ISO8601>` reconstructs a forensic projection at any wall-clock point (m0007 adds the `turns.at` index). Seven bot-review rounds closed.
 - **v2.0.1**. Tier-B `stage_overlay_back` symlink-escape hardening. Three rounds: refuse symlinks whose canonical target escapes the merged view; canonicalize against `ws.merged` (not `repo_root`) so same-turn-created targets validate independently of `read_dir` order; refuse every absolute symlink target outright (absolute paths captured from `$PWD` under the ephemeral overlay mount dangle forever post-unmount).
 - **v2.0.0**. Composite retrieval, tree-sitter symbols, co-edit graph, TDAD impact, eval plane, sandbox Tier-A/B enforcement on bash, live-retrieval flag, seven bot-review rounds closed.
 - **v1.5**. Adapters (Anthropic OAuth + OpenAI), content-block protocol, JSONL dual projection, Tier-A/B sandbox smoke, `ContextKernel` v0, Tools + `ToolDispatcher` + `AuthorityEngine`, TUI MVP.
