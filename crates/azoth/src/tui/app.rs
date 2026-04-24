@@ -21,7 +21,7 @@ use futures::StreamExt;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use std::io;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::sync::mpsc;
 use tui_textarea::{Input as TaInput, TextArea};
@@ -33,7 +33,7 @@ use azoth_core::context::{
     LexicalEvidenceCollector, ReciprocalRankFusion, SymbolEvidenceCollector, TokenBudget,
 };
 use azoth_core::event_store::{JsonlReader, JsonlWriter, SqliteMirror};
-use azoth_core::execution::{ExecutionContext, ToolDispatcher};
+use azoth_core::execution::{CancellationToken, ExecutionContext, ToolDispatcher};
 use azoth_core::impact::{DiffSource, ImpactConfig, ImpactSelector};
 use azoth_core::retrieval::{
     CoEditConfig, LexicalBackend, LexicalRetrieval, RetrievalConfig, RetrievalMode,
@@ -172,6 +172,20 @@ pub struct AppState {
     /// through prior snapshots is deferred — documented in the CP-6
     /// commit and the invariant #8 landing in CLAUDE.md.
     pub read_only: bool,
+
+    /// Shared handle to the currently-active turn's cancellation token.
+    /// Worker stores `Some(token)` before each `drive_turn` and clears
+    /// to `None` after it returns. Ctrl+C reads this: if `Some`, it
+    /// calls `token.cancel()` — the `TurnDriver` then exits cleanly and
+    /// emits `TurnInterrupted { reason: UserCancel, partial_usage }`.
+    /// If `None`, Ctrl+C falls through to the legacy quit behaviour
+    /// (`should_quit = true`). Ctrl+D always quits unconditionally —
+    /// the escape hatch. The mutex is `std::sync::Mutex` because the
+    /// critical section is a single `Option` load/store and is held
+    /// from both the sync TUI event loop and the async worker task;
+    /// contention is zero in practice (worker never locks while a
+    /// key is being handled).
+    pub active_cancel: Arc<Mutex<Option<CancellationToken>>>,
 }
 
 impl AppState {
@@ -226,6 +240,7 @@ impl AppState {
             tab_order_cache: None,
             tab_cursor: None,
             read_only: false,
+            active_cancel: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -710,8 +725,39 @@ impl AppState {
         }
 
         match (key.code, key.modifiers) {
-            (KeyCode::Char('c'), KeyModifiers::CONTROL)
-            | (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
+            (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                // Ctrl+C: cancel the active turn if one is in-flight,
+                // else fall through to quit. The `TurnDriver` polls
+                // `ExecutionContext::cancelled()` at two check points
+                // (pre-invoke, mid-stream) and emits
+                // `TurnInterrupted { UserCancel, partial_usage }` on
+                // its own — so we just flip the bit and let the worker
+                // drain cleanly. `partial_usage` is preserved for the
+                // eval plane; a crash-recovery synthetic would lose it.
+                // CLAUDE.md's "Ctrl+C cancel current turn" now matches
+                // implementation. Ctrl+D remains the unconditional
+                // escape hatch.
+                let cancelled = match self.active_cancel.lock() {
+                    Ok(guard) => match guard.as_ref() {
+                        Some(token) => {
+                            token.cancel();
+                            true
+                        }
+                        None => false,
+                    },
+                    // Poisoned lock means the worker panicked mid-turn —
+                    // don't trust the token state; behave as idle-quit.
+                    Err(_) => false,
+                };
+                if cancelled {
+                    self.notes.push(Note::info("cancelling turn…".to_string()));
+                    self.dirty = true;
+                } else {
+                    self.should_quit = true;
+                }
+                return;
+            }
+            (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
                 self.should_quit = true;
                 return;
             }
@@ -1567,6 +1613,12 @@ pub async fn run_app(resume: Option<String>, as_of: Option<String>) -> io::Resul
     let profile_max_ctx = provider_profile.max_context_tokens;
     let profile_status = format!("{} · {}", provider_profile.name, provider_profile.model_id);
 
+    // Shared handle for cooperative turn cancellation. The worker owns
+    // the write path (Some(token) before drive_turn, None after). The
+    // TUI reads it from the Ctrl+C key handler. See AppState::active_cancel
+    // docstring for the invariant.
+    let active_cancel: Arc<Mutex<Option<CancellationToken>>> = Arc::new(Mutex::new(None));
+
     let worker_session_tx = session_tx.clone();
     let worker_error_tx = error_tx.clone();
     let worker_boot_phase_tx = boot_phase_tx.clone();
@@ -1574,6 +1626,7 @@ pub async fn run_app(resume: Option<String>, as_of: Option<String>) -> io::Resul
     let worker_run_id = run_id.clone();
     let worker_cwd = cwd.clone();
     let worker_session_path = session_path.clone();
+    let worker_active_cancel = active_cancel.clone();
     let worker_artifacts_root = artifacts_root.clone();
     let worker_as_of = as_of.clone();
 
@@ -2126,12 +2179,23 @@ pub async fn run_app(resume: Option<String>, as_of: Option<String>) -> io::Resul
             }
 
             let turn_id = TurnId::new();
+            // Per-turn cancellation token. Fresh instance each turn so a
+            // cancel from a prior turn never bleeds into the next one.
+            // The clone lives on `ctx.cancellation`; the outer clone is
+            // parked in `worker_active_cancel` so the TUI Ctrl+C handler
+            // can flip it. Cleared to None after drive_turn so a quiet
+            // Ctrl+C between turns falls through to the quit branch.
+            let turn_cancel = CancellationToken::new();
+            if let Ok(mut guard) = worker_active_cancel.lock() {
+                *guard = Some(turn_cancel.clone());
+            }
             let ctx = ExecutionContext::builder(
                 worker_run_id.clone(),
                 turn_id.clone(),
                 artifacts.clone(),
                 worker_cwd.clone(),
             )
+            .cancellation(turn_cancel)
             .build();
 
             history.push(Message::user_text(user_text));
@@ -2184,6 +2248,15 @@ pub async fn run_app(resume: Option<String>, as_of: Option<String>) -> io::Resul
                 )
                 .await;
 
+            // Release the cancellation handle — the token is now dead
+            // (drive_turn has either committed, aborted, or emitted
+            // TurnInterrupted on its own on cancel). A subsequent Ctrl+C
+            // with no active turn must fall through to the quit branch,
+            // so we null the slot before the next select! iteration.
+            if let Ok(mut guard) = worker_active_cancel.lock() {
+                *guard = None;
+            }
+
             match result {
                 Ok(outcome) => {
                     turns_completed = turns_completed.saturating_add(1);
@@ -2213,6 +2286,12 @@ pub async fn run_app(resume: Option<String>, as_of: Option<String>) -> io::Resul
     state.max_context_tokens = profile_max_ctx;
     state.status = profile_status;
     state.read_only = read_only;
+    // Thread the shared cancellation handle through so the Ctrl+C key
+    // handler can signal the worker's in-flight turn. Replace the
+    // default empty Arc from `AppState::new()` with the one the worker
+    // already cloned above (see `worker_active_cancel`). Without this
+    // line both sides hold distinct Arcs and Ctrl+C silently no-ops.
+    state.active_cancel = active_cancel;
     // Chronon CP-5: banner surfaces the as-of cutoff so the operator
     // sees instantly that new turns will not fire. Deferred: a TUI Rail
     // slider that scrubs through prior snapshots — CP-6 commit flagged
@@ -2483,6 +2562,57 @@ mod tests {
         let mut state = AppState::new();
         state.handle_key(KeyEvent::new(KeyCode::Char('\\'), KeyModifiers::CONTROL));
         assert!(state.focus_mode);
+    }
+
+    #[test]
+    fn ctrl_c_idle_quits_tui() {
+        // No active turn → Ctrl+C sets should_quit (legacy behaviour).
+        // Guards the escape hatch for users at an idle prompt.
+        let mut state = AppState::new();
+        assert!(state.active_cancel.lock().unwrap().is_none());
+        state.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(state.should_quit, "idle Ctrl+C must quit");
+    }
+
+    #[test]
+    fn ctrl_c_with_active_turn_cancels_and_keeps_tui_alive() {
+        // Simulated worker has stashed a live CancellationToken —
+        // Ctrl+C must flip it and NOT set should_quit. The TurnDriver
+        // polls the token at its check points and emits
+        // TurnInterrupted { UserCancel, partial_usage } on its own.
+        let mut state = AppState::new();
+        let token = CancellationToken::new();
+        *state.active_cancel.lock().unwrap() = Some(token.clone());
+        state.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(
+            token.is_cancelled(),
+            "Ctrl+C with active turn must cancel the worker's token"
+        );
+        assert!(
+            !state.should_quit,
+            "Ctrl+C with active turn must keep the TUI alive"
+        );
+        assert!(
+            state.notes.iter().any(|n| n.text.contains("cancelling")),
+            "user sees a whisper note confirming the cancel"
+        );
+    }
+
+    #[test]
+    fn ctrl_d_always_quits_even_mid_turn() {
+        // Ctrl+D is the unconditional escape hatch — it must not go
+        // through the cancel branch, because a user hitting Ctrl+D
+        // wants to exit whether or not a turn is in flight. The
+        // TurnDriver gets interrupted by process teardown instead.
+        let mut state = AppState::new();
+        let token = CancellationToken::new();
+        *state.active_cancel.lock().unwrap() = Some(token.clone());
+        state.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        assert!(state.should_quit, "Ctrl+D must always quit");
+        assert!(
+            !token.is_cancelled(),
+            "Ctrl+D does not route through the cancel branch"
+        );
     }
 
     #[test]
