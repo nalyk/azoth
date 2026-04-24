@@ -988,6 +988,29 @@ impl Scan {
         })
     }
 
+    /// Most recent `Checkpoint` id in the scan. `None` if the scan has
+    /// never committed a turn. Used by the TUI resume banner so the
+    /// operator sees which checkpoint anchor they landed on.
+    pub fn last_checkpoint_id(&self) -> Option<crate::schemas::CheckpointId> {
+        self.events.iter().rev().find_map(|ev| match ev {
+            SessionEvent::Checkpoint { checkpoint_id, .. } => Some(checkpoint_id.clone()),
+            _ => None,
+        })
+    }
+
+    /// Count of turns whose terminal marker was `TurnInterrupted`.
+    /// Used alongside `committed_run_progress().1` to show the
+    /// spec'd (`N turns · M interrupted`) resume banner.
+    pub fn interrupted_turn_count(&self) -> u32 {
+        u32::try_from(
+            self.outcomes
+                .values()
+                .filter(|k| matches!(k, TurnOutcomeKind::Interrupted))
+                .count(),
+        )
+        .unwrap_or(u32::MAX)
+    }
+
     /// Recompute `(EffectCounter, turns_completed)` from committed turns
     /// only — same accounting the live driver produced.
     pub fn committed_run_progress(&self) -> (EffectCounter, u32) {
@@ -1587,5 +1610,107 @@ mod tests {
             exists, 1,
             "recovery through writer.append must hit the SqliteMirror"
         );
+    }
+
+    #[test]
+    fn scan_last_checkpoint_id_returns_most_recent() {
+        // F5 2026-04-24: banner needs to surface the last checkpoint
+        // id so the operator sees which anchor they landed on.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let mut w = JsonlWriter::open(&path).unwrap();
+        let run_id = RunId::from("run_f5".to_string());
+        let t1 = TurnId::from("t_1".to_string());
+        let t2 = TurnId::from("t_2".to_string());
+        w.append(&SessionEvent::RunStarted {
+            run_id: run_id.clone(),
+            contract_id: ContractId::from("ctr".to_string()),
+            timestamp: ts(),
+        })
+        .unwrap();
+        // Seed two checkpoints; the scan must return the most recent.
+        for (tid, cid) in [(&t1, "chk_first"), (&t2, "chk_second")] {
+            w.append(&SessionEvent::TurnStarted {
+                turn_id: tid.clone(),
+                run_id: run_id.clone(),
+                parent_turn: None,
+                timestamp: ts(),
+            })
+            .unwrap();
+            w.append(&SessionEvent::Checkpoint {
+                turn_id: tid.clone(),
+                checkpoint_id: crate::schemas::CheckpointId::from(cid.to_string()),
+            })
+            .unwrap();
+            w.append(&SessionEvent::TurnCommitted {
+                turn_id: tid.clone(),
+                outcome: CommitOutcome::Success,
+                usage: Usage::default(),
+                user_input: None,
+                final_assistant: None,
+                at: Some(ts()),
+            })
+            .unwrap();
+        }
+        drop(w);
+        let reader = JsonlReader::open(&path);
+        let scan = reader.scan().unwrap();
+        let id = scan.last_checkpoint_id().expect("some checkpoint");
+        assert_eq!(id.0, "chk_second");
+    }
+
+    #[test]
+    fn scan_interrupted_turn_count_matches_dangling_and_user_cancels() {
+        // F5 2026-04-24: count the interrupted turns shown in the
+        // banner (e.g. "2 turns · 1 interrupted").
+        use crate::schemas::{AbortReason, UsageDelta};
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let mut w = JsonlWriter::open(&path).unwrap();
+        let run_id = RunId::from("run_f5b".to_string());
+        let t_ok = TurnId::from("t_ok".to_string());
+        let t_int = TurnId::from("t_int".to_string());
+        w.append(&SessionEvent::RunStarted {
+            run_id: run_id.clone(),
+            contract_id: ContractId::from("ctr".to_string()),
+            timestamp: ts(),
+        })
+        .unwrap();
+        // committed
+        w.append(&SessionEvent::TurnStarted {
+            turn_id: t_ok.clone(),
+            run_id: run_id.clone(),
+            parent_turn: None,
+            timestamp: ts(),
+        })
+        .unwrap();
+        w.append(&SessionEvent::TurnCommitted {
+            turn_id: t_ok,
+            outcome: CommitOutcome::Success,
+            usage: Usage::default(),
+            user_input: None,
+            final_assistant: None,
+            at: Some(ts()),
+        })
+        .unwrap();
+        // interrupted
+        w.append(&SessionEvent::TurnStarted {
+            turn_id: t_int.clone(),
+            run_id,
+            parent_turn: None,
+            timestamp: ts(),
+        })
+        .unwrap();
+        w.append(&SessionEvent::TurnInterrupted {
+            turn_id: t_int,
+            reason: AbortReason::UserCancel,
+            partial_usage: UsageDelta::default(),
+            at: Some(ts()),
+        })
+        .unwrap();
+        drop(w);
+        let scan = JsonlReader::open(&path).scan().unwrap();
+        assert_eq!(scan.interrupted_turn_count(), 1);
+        assert_eq!(scan.committed_run_progress().1, 1, "1 committed");
     }
 }

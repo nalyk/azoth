@@ -1635,6 +1635,42 @@ impl Drop for ActiveCancelGuard {
     }
 }
 
+/// Build the resume / session banner shown as the first whisper-note after
+/// the TUI comes up. F5 2026-04-24: was `resumed · <session_path>` (path
+/// only). `docs/draft_plan.md §Resume and session lifecycle` spec: contract
+/// + checkpoint + (committed, interrupted) counts. A pure function so we
+/// can test the formatting without booting a worker.
+pub(crate) fn resume_summary(
+    resuming: bool,
+    as_of: Option<&str>,
+    contract_id: Option<&str>,
+    checkpoint_id: Option<&str>,
+    committed_turns: u32,
+    interrupted_turns: u32,
+) -> String {
+    if !resuming {
+        return "session".to_string();
+    }
+    let mut s = if let Some(t) = as_of {
+        format!("resumed · read-only · as-of {t}")
+    } else {
+        "resumed".to_string()
+    };
+    if let Some(c) = contract_id {
+        s.push_str(" · ");
+        s.push_str(c);
+    }
+    if let Some(k) = checkpoint_id {
+        s.push_str(" · ");
+        s.push_str(k);
+    }
+    s.push_str(&format!(" · {committed_turns} turns"));
+    if interrupted_turns > 0 {
+        s.push_str(&format!(" · {interrupted_turns} interrupted"));
+    }
+    s
+}
+
 pub async fn run_app(resume: Option<String>, as_of: Option<String>) -> io::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -1701,6 +1737,37 @@ pub async fn run_app(resume: Option<String>, as_of: Option<String>) -> io::Resul
     let provider_profile = super::config::resolve_profile();
     let profile_max_ctx = provider_profile.max_context_tokens;
     let profile_status = format!("{} · {}", provider_profile.name, provider_profile.model_id);
+
+    // F5 2026-04-24: resume-banner data. Run a lightweight scan of the
+    // session JSONL here (parent thread) rather than piping from the
+    // worker — the banner is pushed into `state.notes` in THIS scope
+    // after the worker spawns, and `resume_scan` is a worker-local
+    // value we drop before the banner is built. A second scan is cheap
+    // relative to the worker's own boot IO and keeps cross-thread
+    // plumbing simple.
+    let (banner_contract_id, banner_checkpoint_id, banner_committed, banner_interrupted): (
+        Option<ContractId>,
+        Option<azoth_core::schemas::CheckpointId>,
+        u32,
+        u32,
+    ) = if resuming {
+        let reader = JsonlReader::open(&session_path);
+        match as_of.as_deref() {
+            Some(t) => reader.scan_as_of(t),
+            None => reader.scan(),
+        }
+        .map(|s| {
+            (
+                s.last_accepted_contract().map(|c| c.id),
+                s.last_checkpoint_id(),
+                s.committed_run_progress().1,
+                s.interrupted_turn_count(),
+            )
+        })
+        .unwrap_or((None, None, 0, 0))
+    } else {
+        (None, None, 0, 0)
+    };
 
     // Shared handle for cooperative turn cancellation. The worker owns
     // the write path (via `ActiveCancelGuard`, defined at module level
@@ -2386,16 +2453,19 @@ pub async fn run_app(resume: Option<String>, as_of: Option<String>) -> io::Resul
     // already cloned above (see `worker_active_cancel`). Without this
     // line both sides hold distinct Arcs and Ctrl+C silently no-ops.
     state.active_cancel = active_cancel;
-    // Chronon CP-5: banner surfaces the as-of cutoff so the operator
-    // sees instantly that new turns will not fire. Deferred: a TUI Rail
-    // slider that scrubs through prior snapshots — CP-6 commit flagged
-    // it as needing its own UX round; read-only mode here is the
-    // load-bearing minimum.
-    let banner = match (resuming, as_of.as_deref()) {
-        (true, Some(t)) => format!("resumed · read-only · as-of {t}"),
-        (true, None) => "resumed".to_string(),
-        (false, _) => "session".to_string(),
-    };
+    // F5 2026-04-24: banner now carries contract_id + checkpoint_id +
+    // (committed, interrupted) turn counts (was: path-only). The resume
+    // path pulled the data off `resume_scan` before dropping it (see
+    // `resume_banner_*` bindings above). Chronon CP-5 read-only mode is
+    // still surfaced in the as-of branch of `resume_summary`.
+    let banner = resume_summary(
+        resuming,
+        as_of.as_deref(),
+        banner_contract_id.as_ref().map(|c| c.0.as_str()),
+        banner_checkpoint_id.as_ref().map(|c| c.0.as_str()),
+        banner_committed,
+        banner_interrupted,
+    );
     state
         .notes
         .push(Note::info(format!("{banner} · {}", session_path.display())));
@@ -2510,6 +2580,65 @@ pub async fn run_app(resume: Option<String>, as_of: Option<String>) -> io::Resul
 mod tests {
     use super::*;
     use azoth_core::schemas::ContextPacketId;
+
+    #[test]
+    fn resume_summary_banner_carries_contract_checkpoint_and_turn_counts() {
+        // F5 2026-04-24: the banner was `resumed · <session_path>` —
+        // no contract, no checkpoint, no turn counts. draft_plan.md
+        // §Resume and session lifecycle spec: the enriched form.
+        let b = super::resume_summary(
+            true,
+            None,
+            Some("ctr_8b2770f7f9"),
+            Some("chk_c0154ed85c78"),
+            2,
+            1,
+        );
+        assert!(b.starts_with("resumed"), "got: {b:?}");
+        assert!(b.contains("ctr_8b2770f7f9"), "contract id missing: {b:?}");
+        assert!(
+            b.contains("chk_c0154ed85c78"),
+            "checkpoint id missing: {b:?}"
+        );
+        assert!(b.contains("2 turns"), "committed count missing: {b:?}");
+        assert!(b.contains("1 interrupted"), "interrupted count missing: {b:?}");
+    }
+
+    #[test]
+    fn resume_summary_omits_interrupted_suffix_when_zero() {
+        // A clean run shouldn't show "· 0 interrupted" noise.
+        let b = super::resume_summary(true, None, Some("ctr_x"), Some("chk_y"), 5, 0);
+        assert!(
+            !b.contains("interrupted"),
+            "clean resume must omit the interrupted clause; got: {b:?}"
+        );
+    }
+
+    #[test]
+    fn resume_summary_non_resume_returns_session_literal() {
+        // Regression guard: the no-resume startup path (fresh session)
+        // still renders the plain "session" marker that the existing
+        // `session banner` test in this module relies on.
+        let b = super::resume_summary(false, None, None, None, 0, 0);
+        assert_eq!(b, "session");
+    }
+
+    #[test]
+    fn resume_summary_read_only_surface_preserves_as_of_prefix() {
+        // Chronon CP-5: when resuming with --as-of, the banner must
+        // tell the operator the session is read-only so they don't
+        // wonder why Enter doesn't send.
+        let b = super::resume_summary(
+            true,
+            Some("2026-04-24T20:00:00Z"),
+            Some("ctr_q"),
+            Some("chk_q"),
+            3,
+            0,
+        );
+        assert!(b.contains("read-only"), "got: {b:?}");
+        assert!(b.contains("as-of 2026-04-24T20:00:00Z"), "got: {b:?}");
+    }
 
     #[test]
     fn resume_hydrates_wall_clocks_from_turn_event_timestamps() {
