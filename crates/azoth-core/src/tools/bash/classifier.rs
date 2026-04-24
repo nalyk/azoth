@@ -105,21 +105,24 @@ const READ_ONLY_COMMANDS: &[&str] = &[
 /// objects DB.
 // gemini R0 HIGH (2026-04-24) removed `branch` and `tag`: both
 // mutate refs by default (`git branch -D foo`, `git tag -d foo`).
-// Listing them as read-only let the model delete branches at
-// Observe cost. The remaining entries don't mutate state on their
-// own — but `log`, `show`, and `diff` accept `--output=<file>` /
-// `--output <file>` which writes to disk; the per-invocation
-// `has_write_flag` scan below catches that family.
-const GIT_READ_ONLY_SUBCOMMANDS: &[&str] = &[
-    "log",
-    "show",
-    "diff",
-    "status",
-    "blame",
-    "rev-parse",
-    "ls-files",
-    "ls-tree",
-];
+// codex R3 P1 (PR #30, 2026-04-24) removed `diff` and `status`:
+// both can write `.git/index` via `refresh_index()` when the stat
+// cache is stale (happens after any fs_write to a tracked path).
+// The write is semantically benign — it's git's internal stat
+// cache, not a repo-logical mutation — but it's still a local
+// write, and the consistency argument with find/env/xxd/date
+// wins: one real write → budget counts. `--no-optional-locks` is
+// the flag that suppresses the refresh; requiring it via classifier
+// rewrite would violate "stay stupid" (we'd be spelling shell
+// commands for the model), so the cheaper path is exclusion.
+//
+// The remaining entries don't touch the working tree or refresh
+// the index. `log`, `show`, `blame` read commit history and
+// objects; `rev-parse`, `ls-files`, `ls-tree` read refs / index
+// metadata only. `--output` family flag writes for log/show are
+// caught by `has_write_flag` per R1.
+const GIT_READ_ONLY_SUBCOMMANDS: &[&str] =
+    &["log", "show", "blame", "rev-parse", "ls-files", "ls-tree"];
 
 // `cargo` has NO read-only subcommand allowlist in R3. codex R2
 // P1 (PR #30, 2026-04-24) flagged `cargo check --target-dir <DIR>`
@@ -414,13 +417,26 @@ mod tests {
         }
         assert_observe("git log --oneline -5");
         assert_observe("git show HEAD");
-        assert_observe("git diff main..HEAD");
-        assert_observe("git status");
         assert_observe("git rev-parse --short HEAD");
+        assert_observe("git blame src/main.rs");
         // Unquoted glob — quoted forms (`'src/*.rs'`) go to
         // ApplyLocal after gemini R1 HIGH, see
         // `quoted_args_force_apply_local_after_r1_gemini_high`.
         assert_observe("git ls-files src");
+    }
+
+    #[test]
+    fn git_diff_and_status_classify_as_apply_local_after_r3_codex_p1() {
+        // codex R3 P1 (PR #30, 2026-04-24): `git diff` / `git status`
+        // can write `.git/index` via refresh_index() when the stat
+        // cache is stale (happens after any fs_write to tracked
+        // files). Removed from GIT_READ_ONLY_SUBCOMMANDS.
+        assert_apply_local("git diff");
+        assert_apply_local("git diff main..HEAD");
+        assert_apply_local("git diff --staged");
+        assert_apply_local("git status");
+        assert_apply_local("git status -s");
+        assert_apply_local("git status --porcelain");
     }
 
     #[test]
@@ -456,11 +472,13 @@ mod tests {
 
     #[test]
     fn non_write_output_prefix_flags_stay_observe() {
-        // `--output-format` (cargo tree, jq), `--output-indicator-new`
-        // (git diff) etc. change formatting, not destination. The
-        // tight matcher must not over-reject these.
-        assert_observe("git diff --output-indicator-new=X");
+        // `--output-format`, `--output-indicator-new`, and friends
+        // change formatting, not destination. The tight matcher
+        // must not over-reject these. Use `git log` only because
+        // `git diff` was removed from GIT_READ_ONLY_SUBCOMMANDS in
+        // R3 (codex P1 on index refresh_index writes).
         assert_observe("git log --output-indicator-new=X");
+        assert_observe("git log --output-indicator-new X");
     }
 
     #[test]

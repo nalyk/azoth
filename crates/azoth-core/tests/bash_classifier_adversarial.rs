@@ -219,11 +219,14 @@ fn bare_allowlist_positives_survive_the_gauntlet() {
     assert_observe("cat Cargo.toml");
     assert_observe("wc -l src/main.rs");
     assert_observe("git log --oneline -5");
-    assert_observe("git status");
-    assert_observe("git diff main..HEAD");
+    assert_observe("git show HEAD");
+    assert_observe("git blame src/main.rs");
     assert_observe("git config --get user.email");
-    // `cargo <anything>` is ApplyLocal after R3 (codex R2 P1 on
-    // --target-dir); see `cargo_reads_are_apply_local_after_r3_codex_p1`.
+    // `git diff` and `git status` → ApplyLocal after R3 codex P1
+    // (`.git/index` stat-cache refresh via `refresh_index()`); see
+    // `git_diff_and_status_are_apply_local_after_r3_codex_p1`.
+    // `cargo <anything>` → ApplyLocal after R3 codex P1 on
+    // --target-dir; see `cargo_reads_are_apply_local_after_r3_codex_p1`.
     assert_observe("rustc --version");
 }
 
@@ -287,9 +290,28 @@ fn non_write_output_flags_stay_observe() {
     // NOT write flags — they change output formatting, not
     // destination. The tightened matcher (`== "--output" ||
     // starts_with "--output="`) preserves them as Observe so
-    // common structured-read patterns don't get taxed.
+    // common structured-read patterns don't get taxed. Use
+    // `git log` only — `git diff` was removed from the allowlist
+    // in R3 for independent reasons (codex P1 on index refresh).
     assert_observe("git log --output-indicator-new=X");
-    assert_observe("git diff --output-indicator-new X");
+    assert_observe("git log --output-indicator-new X");
+}
+
+#[test]
+fn git_diff_and_status_are_apply_local_after_r3_codex_p1() {
+    // codex R3 P1 (PR #30, 2026-04-24): `git diff` and `git status`
+    // can write `.git/index` via `refresh_index()` when the stat
+    // cache is stale (happens after any fs_write to a tracked
+    // file). Removed from GIT_READ_ONLY_SUBCOMMANDS — all
+    // invocations classify ApplyLocal regardless of args.
+    assert_apply_local("git diff");
+    assert_apply_local("git diff main..HEAD");
+    assert_apply_local("git diff --staged");
+    assert_apply_local("git diff --cached HEAD");
+    assert_apply_local("git status");
+    assert_apply_local("git status -s");
+    assert_apply_local("git status --porcelain");
+    assert_apply_local("git status --branch");
 }
 
 #[test]
