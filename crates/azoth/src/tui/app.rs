@@ -374,16 +374,37 @@ impl AppState {
                 self.should_quit = true;
             }
             PaletteAction::Continue => {
-                self.pending_user_text = Some(
-                    "Please continue from where you left off — pick up the \
-                     partial output and finish."
-                        .to_string(),
-                );
-                // Note added in round 14 to match the slash-handler
-                // behaviour — earlier the palette path silently queued
-                // the prompt with no user feedback, while /continue
-                // showed "continue requested". Now both paths agree.
-                self.notes.push(Note::info("continue requested"));
+                // F2 2026-04-24: /continue's documented purpose is to
+                // resume from a `model_truncated` abort. I wired it
+                // without inspecting WHY the last turn aborted, so an
+                // operator running `/continue` after a context_overflow
+                // got a fresh turn that immediately re-overflowed
+                // (witnessed on run_f9c7978e66de: two back-to-back
+                // context_overflow aborts from one /continue). The
+                // context is the problem; a repeat turn is not the
+                // remediation.
+                let last_was_context_overflow = self.cards.last().is_some_and(|c| {
+                    matches!(
+                        &c.state,
+                        CardState::Aborted { reason, .. } if reason == "ContextOverflow"
+                    )
+                });
+                if last_was_context_overflow {
+                    self.notes.push(Note::warn(
+                        "context full — /quit and start a fresh session, or shrink the scope",
+                    ));
+                } else {
+                    self.pending_user_text = Some(
+                        "Please continue from where you left off — pick up the \
+                         partial output and finish."
+                            .to_string(),
+                    );
+                    // Note added in round 14 to match the slash-handler
+                    // behaviour — earlier the palette path silently queued
+                    // the prompt with no user feedback, while /continue
+                    // showed "continue requested". Now both paths agree.
+                    self.notes.push(Note::info("continue requested"));
+                }
             }
             PaletteAction::DraftContract(Some(goal)) => {
                 let mut draft = azoth_core::contract::draft(goal.clone());
@@ -2460,6 +2481,85 @@ pub async fn run_app(resume: Option<String>, as_of: Option<String>) -> io::Resul
 mod tests {
     use super::*;
     use azoth_core::schemas::ContextPacketId;
+
+    #[test]
+    fn slash_continue_after_context_overflow_refuses_and_does_not_queue_turn() {
+        // F2 2026-04-24: I wired /continue to always queue a
+        // continuation prompt, never checking why the last turn
+        // aborted. A context_overflow abort means the CONTEXT is
+        // the problem — running /continue immediately re-overflows.
+        // Witnessed in E2E run_f9c7978e66de: two back-to-back
+        // context_overflow aborts from one /continue.
+        use azoth_core::schemas::{AbortReason, Usage};
+        let mut state = AppState::new();
+        let tid = TurnId::new();
+        state.handle_session_event(SessionEvent::TurnStarted {
+            turn_id: tid.clone(),
+            run_id: RunId::new(),
+            parent_turn: None,
+            timestamp: "2026-04-24T20:00:00Z".into(),
+        });
+        state.handle_session_event(SessionEvent::TurnAborted {
+            turn_id: tid,
+            reason: AbortReason::ContextOverflow,
+            detail: Some("estimate 40000 > 32768".into()),
+            usage: Usage::default(),
+            at: Some("2026-04-24T20:00:05Z".into()),
+        });
+        state.run_palette_action(super::PaletteAction::Continue);
+        assert!(
+            state.pending_user_text.is_none(),
+            "/continue after context_overflow must NOT queue a new turn"
+        );
+        let note = state.notes.last().expect("refusal note");
+        assert!(
+            note.text.contains("context full"),
+            "user must see why /continue was refused; got: {:?}",
+            note.text
+        );
+    }
+
+    #[test]
+    fn slash_continue_after_model_truncated_still_queues_turn() {
+        // Regression guard: /continue's original purpose is exactly
+        // to resume from a model_truncated abort. Don't break it.
+        use azoth_core::schemas::{AbortReason, Usage};
+        let mut state = AppState::new();
+        let tid = TurnId::new();
+        state.handle_session_event(SessionEvent::TurnStarted {
+            turn_id: tid.clone(),
+            run_id: RunId::new(),
+            parent_turn: None,
+            timestamp: "2026-04-24T20:00:00Z".into(),
+        });
+        state.handle_session_event(SessionEvent::TurnAborted {
+            turn_id: tid,
+            reason: AbortReason::ModelTruncated,
+            detail: None,
+            usage: Usage::default(),
+            at: Some("2026-04-24T20:00:05Z".into()),
+        });
+        state.run_palette_action(super::PaletteAction::Continue);
+        assert!(
+            state.pending_user_text.is_some(),
+            "/continue after model_truncated MUST queue the continuation turn"
+        );
+    }
+
+    #[test]
+    fn slash_continue_with_no_cards_still_queues_turn() {
+        // Regression guard: empty history (no prior turn yet) ⇒
+        // /continue is a no-op historically but should still queue
+        // (the worker will produce something sensible even if the
+        // model has nothing to resume from). Don't tighten beyond
+        // the documented context_overflow case.
+        let mut state = AppState::new();
+        state.run_palette_action(super::PaletteAction::Continue);
+        assert!(
+            state.pending_user_text.is_some(),
+            "empty history /continue stays functional"
+        );
+    }
 
     #[test]
     fn turn_aborted_whisper_note_is_reason_only_not_full_detail() {
