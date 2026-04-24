@@ -1208,12 +1208,40 @@ impl AppState {
                 // (used/max) independently. Prior code summed them,
                 // masking "one repo edit from abort" behind a
                 // generous local-cap denominator.
+                //
+                // R1 (gemini HIGH on PR #34, 2026-04-25): preserve
+                // accumulated `used` across re-emits of
+                // `ContractAccepted`. The worker's `EffectCounter`
+                // keeps tallies on amend (only bonuses reset); hard-
+                // coding `0` here desynced the inspector — a user
+                // 8/20 into apply_local would suddenly see 0/30
+                // after an amend even though their actual
+                // consumption was unchanged. First accept of a
+                // session sees `None` and falls through to 0.
+                let used_local = self
+                    .inspector_data
+                    .contract_budget_local
+                    .map(|(u, _)| u)
+                    .unwrap_or(0);
                 self.inspector_data.contract_budget_local =
-                    Some((0, contract.effect_budget.max_apply_local));
+                    Some((used_local, contract.effect_budget.max_apply_local));
+                let used_repo = self
+                    .inspector_data
+                    .contract_budget_repo
+                    .map(|(u, _)| u)
+                    .unwrap_or(0);
                 self.inspector_data.contract_budget_repo =
-                    Some((0, contract.effect_budget.max_apply_repo));
-                self.notes
-                    .push(Note::info(format!("contract accepted · {goal}")));
+                    Some((used_repo, contract.effect_budget.max_apply_repo));
+                // R1 (gemini MED on PR #34, 2026-04-25): gate
+                // lifecycle notes on `!is_replay`. Replaying a
+                // session with N contract accepts would otherwise
+                // re-push N stale notes into the whisper queue on
+                // every resume; transcript cards already tell that
+                // story during hydration.
+                if !is_replay {
+                    self.notes
+                        .push(Note::info(format!("contract accepted · {goal}")));
+                }
                 self.current_contract_id = Some(contract.id);
             }
             SessionEvent::TurnStarted {
@@ -1447,10 +1475,22 @@ impl AppState {
                     // Unwrap the inner string so the note reads
                     // `effect error · fs_write · tool error` instead of
                     // `effect error · fs_write · Some("tool error")`.
-                    self.notes.push(Note::error(format!(
-                        "effect error · {} · {}",
-                        effect.tool_name, msg
-                    )));
+                    //
+                    // R1 (gemini MED on PR #34, 2026-04-25): gate the
+                    // error note on `!is_replay`. On resume, every
+                    // historical errored effect would otherwise re-
+                    // push into the narrator queue — both memory
+                    // growth (proportional to session age) and
+                    // user-confusing stale errors. The errored cell
+                    // already shows the failure inline in the
+                    // transcript; the whisper-row narrator is for
+                    // live signals only.
+                    if !is_replay {
+                        self.notes.push(Note::error(format!(
+                            "effect error · {} · {}",
+                            effect.tool_name, msg
+                        )));
+                    }
                 } else {
                     // Successful budget-counted effect — bump the
                     // matching class counter so the inspector shows
@@ -1468,8 +1508,16 @@ impl AppState {
                         }
                         _ => None, // Observe/Stage/Remote*/Irreversible: not budget-counted
                     };
-                    if let Some((used, max)) = slot {
-                        *used = used.saturating_add(1).min(*max);
+                    if let Some((used, _max)) = slot {
+                        // R1 (gemini MED on PR #34, 2026-04-25):
+                        // dropped the `.min(*max)` clamp. When the
+                        // worker amends a budget upward and the TUI
+                        // hasn't yet handled `ContractAmended`, the
+                        // raw `used` count overshooting the stale
+                        // `max` (e.g. `6/5`) is a clearer signal of
+                        // "amend in flight / state inconsistent"
+                        // than artificially pinning at the cap.
+                        *used = used.saturating_add(1);
                     }
                 }
             }
@@ -1528,7 +1576,17 @@ impl AppState {
                     ApprovalScope::Session => "session",
                     ApprovalScope::ScopedPaths { .. } => "scoped-paths",
                 };
-                self.notes.push(Note::info(format!("approval · {label}")));
+                // R1 (proactive sibling-fix on PR #34, 2026-04-25):
+                // gate the lifecycle note on `!is_replay`. Same
+                // shape as the ContractAccepted/EffectRecord
+                // gates gemini flagged in this round — replaying
+                // a session with N approvals would otherwise re-
+                // push N stale "approval · once" notes into the
+                // narrator on every resume. The roster update
+                // below is already gated for the same reason.
+                if !is_replay {
+                    self.notes.push(Note::info(format!("approval · {label}")));
+                }
                 // R4 codex P2: authoritative mint signal → roster.
                 // R2-4 codex P2: but only for LIVE grants. Historical
                 // ApprovalGranted events replayed during hydration
@@ -1561,6 +1619,14 @@ impl AppState {
                 turn_id, usage, at, ..
             } => {
                 self.last_input_tokens = usage.input_tokens;
+                // R1 (gemini MED on PR #34, 2026-04-25): keep the
+                // raw `last_input_tokens` mirror to the inspector
+                // OUTSIDE the `max_context_tokens > 0` gate. A
+                // generic profile with no declared cap can still
+                // report token usage; previously the inspector
+                // would render stale token counts whenever the
+                // ctx-percent denominator was missing.
+                self.inspector_data.last_input_tokens = self.last_input_tokens;
                 if self.max_context_tokens > 0 {
                     self.ctx_pct = ((usage.input_tokens as u64 * 100)
                         / self.max_context_tokens as u64)
@@ -1570,10 +1636,6 @@ impl AppState {
                     }
                     self.inspector_data.ctx_history.push(self.ctx_pct as u64);
                     self.inspector_data.ctx_pct = self.ctx_pct;
-                    // F7 (2026-04-25): pipe raw token count so the
-                    // inspector can display `<1%` for small positive
-                    // usage instead of a misleading `0%`.
-                    self.inspector_data.last_input_tokens = self.last_input_tokens;
                 }
                 let tid = turn_id.to_string();
                 let chip = UsageChip {
@@ -4252,6 +4314,135 @@ mod tests {
             Some((1, 3)),
             "Observe is not budget-counted"
         );
+    }
+
+    #[test]
+    fn budget_counter_overshoots_stale_max_when_amend_in_flight() {
+        // R1 (gemini MED on PR #34, 2026-04-25): the `.min(*max)`
+        // clamp was masking a real signal — when the worker's
+        // EffectCounter goes past a stale TUI cap (because
+        // ContractAmended hasn't arrived yet), the inspector now
+        // shows the truth (e.g. 6/5) instead of a misleading
+        // pinned 5/5. Asserts the clamp is gone.
+        let mut state = AppState::new();
+        state.inspector_data.contract_budget_local = Some((4, 5));
+        let turn_id = TurnId::new();
+        for i in 0..3 {
+            state.handle_session_event(SessionEvent::EffectRecord {
+                turn_id: turn_id.clone(),
+                effect: azoth_core::schemas::EffectRecord {
+                    id: azoth_core::schemas::EffectRecordId::new(),
+                    tool_use_id: azoth_core::schemas::ToolUseId::from(format!("tu_{i}")),
+                    class: azoth_core::schemas::EffectClass::ApplyLocal,
+                    tool_name: "fs_write".into(),
+                    input_digest: None,
+                    output_artifact: None,
+                    error: None,
+                },
+            });
+        }
+        // Three successful ApplyLocal effects on a 4/5 starting state
+        // → 7/5 (NOT clamped to 5/5). The stale-max overshoot is
+        // exactly the "amend in flight" signal we want to surface.
+        assert_eq!(state.inspector_data.contract_budget_local, Some((7, 5)));
+    }
+
+    #[test]
+    fn contract_accepted_preserves_used_across_reaccept() {
+        // R1 (gemini HIGH on PR #34, 2026-04-25): re-emitting
+        // ContractAccepted (e.g. on amend) must NOT zero the
+        // accumulated `used` counters. Worker's EffectCounter
+        // keeps tallies on amend; TUI must mirror. Before the
+        // fix, a user 3/20 deep would suddenly see 0/30 after
+        // amend.
+        let mut state = AppState::new();
+        // Pre-seed: 3 apply_local + 1 apply_repo already consumed.
+        state.inspector_data.contract_budget_local = Some((3, 20));
+        state.inspector_data.contract_budget_repo = Some((1, 5));
+        // New contract accepted — caps raised.
+        let mut contract = azoth_core::contract::draft("amended goal");
+        contract.effect_budget.max_apply_local = 30;
+        contract.effect_budget.max_apply_repo = 10;
+        state.handle_session_event(SessionEvent::ContractAccepted {
+            contract,
+            timestamp: "2026-04-25T00:00:00Z".into(),
+        });
+        assert_eq!(
+            state.inspector_data.contract_budget_local,
+            Some((3, 30)),
+            "used must carry forward across re-accept (3); max becomes 30"
+        );
+        assert_eq!(
+            state.inspector_data.contract_budget_repo,
+            Some((1, 10)),
+            "used must carry forward across re-accept (1); max becomes 10"
+        );
+    }
+
+    #[test]
+    fn replay_does_not_flood_notes_with_lifecycle_events() {
+        // R1 (gemini MED + sibling-audit on PR #34, 2026-04-25):
+        // ContractAccepted, ApprovalGranted, and EffectRecord-error
+        // notes must all be gated on `!is_replay`. Replaying a
+        // session with N of each event would otherwise re-push 3N
+        // stale notes into the narrator queue on every resume.
+        use azoth_core::schemas::{ApprovalScope, CapabilityTokenId, EffectRecordId};
+        let mut state = AppState::new();
+        let pre_count = state.notes.len();
+        // Replay path — each of the three lifecycle event types.
+        state.handle_replayed_session_event(SessionEvent::ContractAccepted {
+            contract: azoth_core::contract::draft("old goal"),
+            timestamp: "2026-04-25T00:00:00Z".into(),
+        });
+        state.handle_replayed_session_event(SessionEvent::ApprovalGranted {
+            turn_id: TurnId::new(),
+            approval_id: ApprovalId::new(),
+            token: CapabilityTokenId::new(),
+            scope: ApprovalScope::Session,
+            tool_name: Some("bash".into()),
+        });
+        state.handle_replayed_session_event(SessionEvent::EffectRecord {
+            turn_id: TurnId::new(),
+            effect: azoth_core::schemas::EffectRecord {
+                id: EffectRecordId::new(),
+                tool_use_id: azoth_core::schemas::ToolUseId::from("tu_old".to_string()),
+                class: azoth_core::schemas::EffectClass::ApplyLocal,
+                tool_name: "fs_write".into(),
+                input_digest: None,
+                output_artifact: None,
+                error: Some("legacy error".into()),
+            },
+        });
+        assert_eq!(
+            state.notes.len(),
+            pre_count,
+            "replay path must not push ANY lifecycle notes; got: {:?}",
+            state.notes
+        );
+    }
+
+    #[test]
+    fn last_input_tokens_updates_even_without_max_context() {
+        // R1 (gemini MED on PR #34, 2026-04-25): the inspector's
+        // `last_input_tokens` mirror must not be gated by a
+        // non-zero `max_context_tokens`. Generic profiles report
+        // zero limits; their token usage is still meaningful.
+        let mut state = AppState::new();
+        state.max_context_tokens = 0; // generic profile
+        let usage = azoth_core::schemas::Usage {
+            input_tokens: 1234,
+            output_tokens: 56,
+            ..Default::default()
+        };
+        state.handle_session_event(SessionEvent::TurnCommitted {
+            turn_id: TurnId::new(),
+            outcome: azoth_core::schemas::CommitOutcome::Success,
+            usage,
+            user_input: None,
+            final_assistant: None,
+            at: None,
+        });
+        assert_eq!(state.inspector_data.last_input_tokens, 1234);
     }
 
     #[test]
