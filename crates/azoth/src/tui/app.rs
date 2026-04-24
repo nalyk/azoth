@@ -1110,14 +1110,18 @@ impl AppState {
     /// fallback); a single method with `contains` keeps them in sync and
     /// names the invariant ("roster dedupes on insertion").
     ///
-    /// R3-3 gemini MED on PR #33 2026-04-25: I shipped this `pub`; since
-    /// R4 centralised the call path through `handle_session_event_with_mode`
-    /// the only external caller would be a test — and even in tests we
-    /// drive through the public `handle_session_event` path, so
-    /// private scope is correct.
-    fn record_session_approval(&mut self, tool: String) {
-        if !self.session_approvals.contains(&tool) {
-            self.session_approvals.push(tool);
+    /// R3-3 gemini MED: private `fn` scope — no external callers.
+    ///
+    /// R4-1 gemini MED on PR #33 2026-04-25: take `&str` and convert
+    /// to owned only on the push path. Previously the caller's
+    /// `String` was moved in and — if the entry was already present —
+    /// dropped unused. The duplicate path is the common case once a
+    /// session accumulates several grants. `&str` lets the caller
+    /// hand the owned string to the Vec only when we actually need
+    /// storage.
+    fn record_session_approval(&mut self, tool: &str) {
+        if !self.session_approvals.iter().any(|s| s == tool) {
+            self.session_approvals.push(tool.to_string());
         }
     }
 
@@ -1465,7 +1469,9 @@ impl AppState {
                 // roster update on replay keeps the TUI mirror
                 // faithful to active capabilities.
                 if !is_replay && matches!(scope, ApprovalScope::Session) {
-                    if let Some(tool) = tool_name {
+                    if let Some(tool) = tool_name.as_deref() {
+                        // R4-1: pass `&str` — the helper clones only
+                        // if the roster doesn't already contain it.
                         self.record_session_approval(tool);
                     }
                 }
