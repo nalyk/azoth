@@ -63,8 +63,15 @@ impl Whisper {
         pending_approval: Option<&azoth_core::authority::ApprovalRequestMsg>,
     ) -> Line<'static> {
         if let Some(req) = pending_approval {
-            let tool = req.tool_name.clone();
-            let cls = req.effect_class.to_string();
+            // R1 gemini MED on PR #33 (PAPER R24/R26): avoid heap
+            // churn at 60fps. `effect_class.to_string()` + `format!`
+            // allocated two Strings per frame while the sheet was up.
+            // Splitting into borrowed spans drops both allocations —
+            // `as_snake()` returns `&'static str`, the tool name only
+            // needs a single Cow::Owned clone (field-owned String
+            // that outlives the borrow; same pattern used elsewhere
+            // per CLAUDE.md R24 sweep rule).
+            let cls: &'static str = req.effect_class.as_snake();
             return Line::from(vec![
                 Span::raw("      "),
                 Span::styled("⏸", theme.ink(Palette::AMBER)),
@@ -72,7 +79,10 @@ impl Whisper {
                 Span::styled("azoth", theme.bold()),
                 Span::raw(" "),
                 Span::styled("awaiting approval", theme.bold()),
-                Span::styled(format!(" · {tool} → {cls}"), theme.italic_dim()),
+                Span::styled(" · ", theme.italic_dim()),
+                Span::styled(req.tool_name.clone(), theme.italic_dim()),
+                Span::styled(" → ", theme.italic_dim()),
+                Span::styled(cls, theme.italic_dim()),
             ]);
         }
         if let (Some(text), Some(started)) = (self.narration.as_ref(), self.narration_started) {
