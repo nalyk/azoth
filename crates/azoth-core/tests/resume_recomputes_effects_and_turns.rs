@@ -154,7 +154,8 @@ fn committed_run_progress_counts_only_committed_turn_effects() {
         EffectCounter {
             apply_local: 2,
             apply_repo: 1,
-            network_reads: 0
+            network_reads: 0,
+            ..Default::default()
         },
         "aborted turn's apply_repo must be excluded; Observe must not bump"
     );

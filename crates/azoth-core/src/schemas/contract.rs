@@ -46,3 +46,25 @@ pub struct EffectBudget {
     #[serde(default)]
     pub max_network_reads: u32,
 }
+
+/// β: additive delta to an `EffectBudget`, carried on a `SessionEvent::
+/// ContractAmended` when the user grants a mid-run budget extension.
+///
+/// Per-class additivity preserves the invariant-4 property that
+/// `EffectCounter` tallies stay meaningful after an amend — the counter
+/// bumps each tool call against a ceiling that only ever grows.
+///
+/// Multiplier cap (research §10.4, plan §β): a single grant's delta is
+/// clamped by `contract::apply_amend_clamped` to `min(delta, current)`
+/// per class — i.e. the ceiling at most doubles per amend. Without this
+/// brake, a socially-engineered user could raise the ceiling unboundedly
+/// across repeated prompts in one turn.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct EffectBudgetDelta {
+    #[serde(default)]
+    pub apply_local: u32,
+    #[serde(default)]
+    pub apply_repo: u32,
+    #[serde(default)]
+    pub network_reads: u32,
+}

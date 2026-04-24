@@ -320,6 +320,20 @@ fn write_event_line<W: std::io::Write>(
             progress.tokens_out,
             if at.is_empty() { "-" } else { at }
         ),
+        SessionEvent::ContractAmended {
+            contract_id,
+            delta,
+            at,
+            ..
+        } => writeln!(
+            out,
+            "{prefix}{turn} contract_amended contract={} +apply_local={} +apply_repo={} +network_reads={} at={}",
+            contract_id.as_str(),
+            delta.apply_local,
+            delta.apply_repo,
+            delta.network_reads,
+            if at.is_empty() { "-" } else { at }
+        ),
     }
 }
 

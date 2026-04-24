@@ -114,12 +114,18 @@ async fn over_budget_apply_local_aborts_turn_with_runtime_error() {
     });
 
     let mut caps = CapabilityStore::new();
-    // Seed the counter AT the cap, as if a prior turn had already consumed
-    // the sole apply_local budget — the next call must short-circuit.
+    // Seed the counter AT the cap AND at the per-run amend brake, so
+    // the β budget-overflow branch exercises the preserved deny path
+    // (NotAvailable → RuntimeError abort) rather than offering an
+    // amend the responder would then grant. This keeps the original
+    // test's invariant ("budget exhaustion aborts the turn") intact
+    // against the β mechanism change. See plan §β ship gate.
     let mut effects = EffectCounter {
         apply_local: 1,
         apply_repo: 0,
         network_reads: 0,
+        amends_this_run: azoth_core::authority::MAX_AMENDS_PER_RUN,
+        ..Default::default()
     };
 
     {

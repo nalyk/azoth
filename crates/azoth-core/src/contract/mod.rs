@@ -1,10 +1,17 @@
-//! Contract lifecycle: draft → lint → accept. Amend deferred.
+//! Contract lifecycle: draft → lint → accept → amend (β).
 //!
 //! `accept_and_persist` writes a `ContractAccepted` event to the JSONL log so a
 //! resuming session can rehydrate the full contract (not just its id).
+//!
+//! β adds:
+//! - `apply_amend_clamped` / `apply_amend_clamped_against_base` — enforce the
+//!   ≤2× multiplier cap.
+//! - `apply_amends` — replay fold from the JSONL `ContractAmended` stream.
 
 use crate::event_store::JsonlWriter;
-use crate::schemas::{Contract, ContractId, EffectBudget, Scope, SessionEvent};
+use crate::schemas::{
+    Contract, ContractId, EffectBudget, EffectBudgetDelta, EffectClass, Scope, SessionEvent,
+};
 use std::collections::HashSet;
 use std::io;
 use thiserror::Error;
@@ -115,6 +122,107 @@ pub fn accept_and_persist(
         timestamp: timestamp.into(),
     })?;
     Ok(accepted)
+}
+
+/// β: apply a budget delta to `contract.effect_budget` in place, clamping
+/// each class to ≤2× the pre-amend ceiling. Returns the actually-applied
+/// delta (the clamped values) so the caller can persist exactly what was
+/// committed to the contract, not the proposed amount that might be larger.
+///
+/// The clamp is per-class and independent: a single `EffectBudgetDelta`
+/// carrying `{ apply_local: 60, apply_repo: 3, network_reads: 0 }` against
+/// `{ max_apply_local: 20, max_apply_repo: 5, max_network_reads: 0 }`
+/// applies as `{ apply_local: 20, apply_repo: 3, network_reads: 0 }` —
+/// i.e. apply_local hits the 2× ceiling while apply_repo passes through
+/// under the cap.
+///
+/// Using `saturating_add` on the final write makes an adversarial delta
+/// equal to `u32::MAX` still produce a defined ceiling (u32::MAX) rather
+/// than overflow.
+pub fn apply_amend_clamped(
+    contract: &mut Contract,
+    proposed: &EffectBudgetDelta,
+) -> EffectBudgetDelta {
+    let clamped = EffectBudgetDelta {
+        apply_local: proposed
+            .apply_local
+            .min(contract.effect_budget.max_apply_local),
+        apply_repo: proposed
+            .apply_repo
+            .min(contract.effect_budget.max_apply_repo),
+        network_reads: proposed
+            .network_reads
+            .min(contract.effect_budget.max_network_reads),
+    };
+    contract.effect_budget.max_apply_local = contract
+        .effect_budget
+        .max_apply_local
+        .saturating_add(clamped.apply_local);
+    contract.effect_budget.max_apply_repo = contract
+        .effect_budget
+        .max_apply_repo
+        .saturating_add(clamped.apply_repo);
+    contract.effect_budget.max_network_reads = contract
+        .effect_budget
+        .max_network_reads
+        .saturating_add(clamped.network_reads);
+    clamped
+}
+
+/// β: driver-side variant of the clamp for use when the `Contract` is held
+/// behind a shared reference and cannot be mutated in place. Clamps
+/// against `max_base + bonus` (the effective ceiling that overflowed),
+/// returns the applied delta; the caller is responsible for folding the
+/// returned delta into its own ceiling-bonus counters.
+///
+/// `class` narrows the clamp to one class — callers that offered a
+/// single-class extension get a single-class delta back, preventing
+/// accidental multi-class amend from a narrowly-scoped approval.
+pub fn apply_amend_clamped_against_base(
+    max_base: u32,
+    bonus: u32,
+    proposed: &EffectBudgetDelta,
+    class: EffectClass,
+) -> EffectBudgetDelta {
+    // Effective ceiling at the moment of overflow. A delta ≤ this value
+    // keeps the new ceiling ≤2× the effective ceiling.
+    let cap = max_base.saturating_add(bonus);
+    match class {
+        EffectClass::ApplyLocal => EffectBudgetDelta {
+            apply_local: proposed.apply_local.min(cap),
+            apply_repo: 0,
+            network_reads: 0,
+        },
+        EffectClass::ApplyRepo => EffectBudgetDelta {
+            apply_local: 0,
+            apply_repo: proposed.apply_repo.min(cap),
+            network_reads: 0,
+        },
+        // Other classes do not flow through the amend path in β.
+        _ => EffectBudgetDelta::default(),
+    }
+}
+
+/// β: replay helper. Fold every `EffectBudgetDelta` onto `contract`,
+/// saturating each class at u32::MAX. Does NOT enforce the 2× cap —
+/// that happens at grant time via `apply_amend_clamped`; JSONL only
+/// carries already-clamped deltas. Use on resume to rebuild the
+/// effective ceiling.
+pub fn apply_amends(contract: &mut Contract, amends: &[EffectBudgetDelta]) {
+    for d in amends {
+        contract.effect_budget.max_apply_local = contract
+            .effect_budget
+            .max_apply_local
+            .saturating_add(d.apply_local);
+        contract.effect_budget.max_apply_repo = contract
+            .effect_budget
+            .max_apply_repo
+            .saturating_add(d.apply_repo);
+        contract.effect_budget.max_network_reads = contract
+            .effect_budget
+            .max_network_reads
+            .saturating_add(d.network_reads);
+    }
 }
 
 #[cfg(test)]

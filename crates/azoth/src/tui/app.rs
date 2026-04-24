@@ -2003,6 +2003,21 @@ pub async fn run_app(resume: Option<String>, as_of: Option<String>) -> io::Resul
                         &mut writer, contract, ts,
                     ) {
                         Ok(accepted) => {
+                            // β R5 (PR #31 codex P1 turn/mod.rs:912):
+                            // mid-session `/contract <goal>` is a real
+                            // replacement path. Previously-granted amend
+                            // ceiling-bonuses were scoped to the OLD
+                            // contract and must NOT leak into the new
+                            // one — the live-driver needs to match the
+                            // replay-side reset that fold_progress
+                            // already does on every ContractAccepted.
+                            // `reset_for_new_contract` zeroes only the
+                            // *_ceiling_bonus triplet; amends_this_run
+                            // stays (per-run brake survives contract
+                            // cycling) and effect tallies stay
+                            // (pre-β scope, consistent with
+                            // fold_progress behaviour).
+                            effects_consumed.reset_for_new_contract();
                             // Refresh the worker-side handle inline. The tap
                             // already fired ContractAccepted to the UI, but
                             // the driver reads from this local stash.
@@ -2090,6 +2105,16 @@ pub async fn run_app(resume: Option<String>, as_of: Option<String>) -> io::Resul
 
                 match azoth_core::contract::accept_and_persist(&mut writer, draft, ts) {
                     Ok(accepted) => {
+                        // β R5 (sibling to the explicit `/contract`
+                        // path above): auto-draft also replaces the
+                        // active contract and must reset
+                        // contract-scoped amend bonuses. In practice
+                        // auto-draft only fires when `active_contract`
+                        // was `None`, so the ceiling-bonus triplet is
+                        // already zero — but calling reset here is
+                        // defensively symmetric with the explicit
+                        // path and costs nothing at zero bonus.
+                        effects_consumed.reset_for_new_contract();
                         active_contract = Some(accepted);
                     }
                     Err(e) => {
@@ -2634,6 +2659,7 @@ mod tests {
             effect_class: azoth_core::schemas::EffectClass::ApplyLocal,
             summary: "write foo".into(),
             responder: tx,
+            budget_extension: None,
         });
         let taken = state.take_pending_approval();
         assert!(taken.is_some());

@@ -59,11 +59,117 @@ impl EffectClass {
 /// would be exceeded. On resume the worker recomputes this from the
 /// replayable JSONL projection (see
 /// [`JsonlReader::committed_run_progress`]); fresh sessions start at zero.
+///
+/// β: the three `*_ceiling_bonus` fields accumulate every granted
+/// `ContractAmended` delta, so the driver's budget check reads the
+/// effective ceiling as `contract.effect_budget.max_X + apply_X_ceiling_bonus`
+/// without mutating the base `Contract` object through its shared reference.
+/// JSONL replay rebuilds the bonuses the same way it rebuilds the
+/// consumption tallies (see `committed_run_progress`) so resume observes
+/// the same effective ceiling the live turn did.
+///
+/// `amends_this_turn` is reset to 0 each time `TurnDriver::drive_turn`
+/// enters; `amends_this_run` is never reset (brake: ≤6 per run).
+/// Kept `Copy` by staying all-u32 — so every existing test constructing
+/// an `EffectCounter` by field literal keeps compiling via
+/// `..Default::default()`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct EffectCounter {
     pub apply_local: u32,
     pub apply_repo: u32,
     pub network_reads: u32,
+    /// β: accumulated `apply_local` delta from granted amends, folded
+    /// additively into the effective ceiling.
+    pub apply_local_ceiling_bonus: u32,
+    /// β: accumulated `apply_repo` delta from granted amends.
+    pub apply_repo_ceiling_bonus: u32,
+    /// β: accumulated `network_reads` delta from granted amends.
+    pub network_reads_ceiling_bonus: u32,
+    /// β: amend grants observed in the currently-open turn. Reset to 0
+    /// at drive_turn entry. Drives the ≤2-per-turn brake in
+    /// `AuthorityEngine::authorize_budget_extension`.
+    pub amends_this_turn: u32,
+    /// β: amend grants observed over the whole run. Never reset.
+    /// Drives the ≤6-per-run brake.
+    pub amends_this_run: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reset_for_new_contract_zeroes_bonus_only() {
+        let mut c = EffectCounter {
+            apply_local: 17,
+            apply_repo: 4,
+            network_reads: 2,
+            apply_local_ceiling_bonus: 50,
+            apply_repo_ceiling_bonus: 3,
+            network_reads_ceiling_bonus: 1,
+            amends_this_turn: 2,
+            amends_this_run: 5,
+        };
+        c.reset_for_new_contract();
+        // Zeroed: the contract-scoped ceiling bonuses.
+        assert_eq!(c.apply_local_ceiling_bonus, 0);
+        assert_eq!(c.apply_repo_ceiling_bonus, 0);
+        assert_eq!(c.network_reads_ceiling_bonus, 0);
+        // Preserved: run-scoped brake counter — R5 fix. Resetting
+        // amends_this_run here would let a user bypass
+        // MAX_AMENDS_PER_RUN by cycling contracts in a single run.
+        assert_eq!(
+            c.amends_this_run, 5,
+            "run-scope brake MUST survive contract replacement"
+        );
+        // Preserved: effect tallies (pre-β scope) + per-turn counter
+        // (drive_turn handles amends_this_turn via its own reset on
+        // entry).
+        assert_eq!(c.apply_local, 17);
+        assert_eq!(c.apply_repo, 4);
+        assert_eq!(c.network_reads, 2);
+        assert_eq!(c.amends_this_turn, 2);
+    }
+}
+
+impl EffectCounter {
+    /// R4+R5 (PR #31 codex P1 ×2 + gemini MED): clear the
+    /// CONTRACT-SCOPED amend state. Zeros the three
+    /// `*_ceiling_bonus` fields only. Effect-count tallies
+    /// (`apply_local`, `apply_repo`, `network_reads`) and both amend
+    /// counters (`amends_this_turn` resets on `drive_turn` entry,
+    /// `amends_this_run` is RUN-scoped) are preserved.
+    ///
+    /// R5 correction: my R4 draft also zeroed `amends_this_run`.
+    /// That contradicted my own R2 fix in `JsonlReader::fold_progress`
+    /// that explicitly preserves `amends_this_run` across
+    /// `ContractAccepted` so a user can't bypass `MAX_AMENDS_PER_RUN`
+    /// by cycling contracts inside a single run. Both the gemini MED
+    /// thread on schemas/effect.rs:158 and the codex P1 on
+    /// schemas/effect.rs:157 caught the self-contradiction.
+    ///
+    /// Call site contract: a worker that accepts a fresh contract
+    /// mid-session MUST call this on its owned `EffectCounter`
+    /// before the next `drive_turn` — otherwise amend bonuses
+    /// granted under the prior contract silently inflate the new
+    /// contract's effective ceiling and over-permit effects (e.g.,
+    /// old contract amended by +20, new contract max=5 evaluates
+    /// as 25). The replay-side equivalent is
+    /// `JsonlReader::fold_progress`, which resets the same
+    /// ceiling-bonus fields (and preserves `amends_this_run`) on
+    /// every `ContractAccepted` it walks; this method keeps the
+    /// live-driver path symmetric.
+    ///
+    /// Wired at `crates/azoth/src/tui/app.rs`'s `contract_rx` arm
+    /// (β R5). The `/contract <goal>` path is a real mid-session
+    /// replacement; my R4 memo incorrectly claimed otherwise.
+    pub fn reset_for_new_contract(&mut self) {
+        self.apply_local_ceiling_bonus = 0;
+        self.apply_repo_ceiling_bonus = 0;
+        self.network_reads_ceiling_bonus = 0;
+        // amends_this_run intentionally preserved — see doc above
+        // and the sibling comment in JsonlReader::fold_progress.
+    }
 }
 
 /// One recorded effect against the world. Emitted on every tool dispatch.

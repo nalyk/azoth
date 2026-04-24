@@ -5,7 +5,7 @@
 use crate::adapter::ProviderAdapter;
 use crate::authority::{
     mint_from_approval, ApprovalPolicyV1, ApprovalRequestMsg, ApprovalResponse, AuthorityDecision,
-    AuthorityEngine, CapabilityStore, Origin, Tainted,
+    AuthorityEngine, BudgetExtensionRequest, CapabilityStore, Origin, Tainted,
 };
 use crate::context::{ContextKernel, EvidenceCollector, KernelError, StepInput};
 use crate::event_store::JsonlWriter;
@@ -281,6 +281,27 @@ impl<'a> TurnDriver<'a> {
         system: String,
         mut messages: Vec<Message>,
     ) -> Result<TurnOutcome, TurnError> {
+        // β: amends_this_turn is per-turn state (the ≤2/turn brake).
+        // Reset at drive_turn entry so a prior turn's grants don't
+        // leak into this one's budget. amends_this_run is run-scoped
+        // and is NEVER reset here.
+        self.effects_consumed.amends_this_turn = 0;
+
+        // R2 (codex PR #31 P1): amend state updates are DEFERRED until
+        // the turn commits. The grant path accumulates into these
+        // stack-locals; the commit path flushes them into
+        // `effects_consumed`; every abort path discards them by the
+        // natural scope drop. Without this, an amend grant in a turn
+        // that later aborts (e.g. user denies the subsequent per-tool
+        // approval) would persist the ceiling bonus + run-brake bump
+        // into the next turn's live memory, diverging from the
+        // replayable projection (which drops the aborted turn whole
+        // and so never folds its ContractAmended event).
+        let mut pending_amend_apply_local: u32 = 0;
+        let mut pending_amend_apply_repo: u32 = 0;
+        let mut pending_amend_network_reads: u32 = 0;
+        let mut pending_amend_count: u32 = 0;
+
         // Capture the triggering user input before tool-loop pushes any
         // tool_result User messages. Persisted on TurnCommitted so a
         // restarted worker can rebuild the full history from JSONL alone.
@@ -836,43 +857,466 @@ impl<'a> TurnDriver<'a> {
 
                             let path_hint = input.get("path").and_then(|v| v.as_str());
 
-                            // Effect-budget short-circuit: if a contract is
-                            // active and the projected class would push the
-                            // per-run counter past its cap, abort the turn
-                            // with RuntimeError. Classes not tracked by
-                            // `EffectBudget` (Observe, Stage, remote/*) are
-                            // left alone. A cap of 0 means "none allowed".
+                            // Effect-budget check: if a contract is active
+                            // and the projected class would push the per-run
+                            // counter past its EFFECTIVE ceiling (base
+                            // contract value + prior amends' ceiling bonus),
+                            // offer a budget-extension approval per β.
+                            //
+                            // Classes not tracked by `EffectBudget` (Observe,
+                            // Stage, remote/*) are left alone. A cap of 0
+                            // means "none allowed".
+                            //
+                            // Flow per plan §β:
+                            //   1. Compute effective ceiling.
+                            //   2. If not exhausted → continue.
+                            //   3. Else: ask the engine whether an amend is
+                            //      offerable (brakes: ≤2/turn, ≤6/run).
+                            //      - NotAvailable → existing abort path.
+                            //      - RequireBudgetExtension → approval flow,
+                            //        grant raises ceiling + emits
+                            //        ContractAmended, deny → ApprovalDenied
+                            //        abort.
                             if let Some(c) = self.contract {
-                                let (used, max, label) = match effect_class {
+                                let (used, max_base, bonus, label) = match effect_class {
                                     EffectClass::ApplyLocal => (
                                         self.effects_consumed.apply_local,
                                         c.effect_budget.max_apply_local,
+                                        self.effects_consumed.apply_local_ceiling_bonus,
                                         "apply_local",
                                     ),
                                     EffectClass::ApplyRepo => (
                                         self.effects_consumed.apply_repo,
                                         c.effect_budget.max_apply_repo,
+                                        self.effects_consumed.apply_repo_ceiling_bonus,
                                         "apply_repo",
                                     ),
-                                    _ => (0, u32::MAX, ""),
+                                    _ => (0, u32::MAX, 0, ""),
                                 };
-                                if !label.is_empty() && used >= max {
+                                // R2 (codex PR #31 P1): fold uncommitted
+                                // amend deltas from this turn into the
+                                // effective ceiling so additional tool
+                                // calls inside the same turn see the
+                                // raised bar without requiring
+                                // `effects_consumed` to already carry
+                                // them. `pending_*` only leaves the
+                                // stack via the commit-time flush
+                                // below; aborts drop it naturally.
+                                let pending_for_class = match effect_class {
+                                    EffectClass::ApplyLocal => pending_amend_apply_local,
+                                    EffectClass::ApplyRepo => pending_amend_apply_repo,
+                                    _ => 0,
+                                };
+                                let effective_max = max_base
+                                    .saturating_add(bonus)
+                                    .saturating_add(pending_for_class);
+                                if !label.is_empty() && used >= effective_max {
+                                    // Keep the telemetry signal so Gate G1
+                                    // / G2 instrumentation continues firing
+                                    // even when an amend is offered.
                                     telemetry::emit_effect_budget_exhausted(
                                         &self.run_id.0,
                                         &turn_id.0,
                                         label,
                                         used,
-                                        max,
+                                        effective_max,
                                     );
-                                    self.record_abort(
-                                        &turn_id,
-                                        AbortReason::RuntimeError,
-                                        Some(format!(
-                                            "effect budget exhausted: {label} {used}/{max}"
-                                        )),
-                                        total_usage.clone(),
-                                    )?;
-                                    return Ok(TurnOutcome::aborted(total_usage));
+
+                                    // R2 (codex PR #31 P1): pass a
+                                    // pending-merged counter so the brake
+                                    // check sees the true "amends so far"
+                                    // count that includes THIS turn's
+                                    // uncommitted grants. Without this,
+                                    // multiple amends inside one turn
+                                    // would each see amends_this_run
+                                    // frozen at the pre-turn value and
+                                    // bypass the per-run cap.
+                                    let mut brake_counter = *self.effects_consumed;
+                                    brake_counter.amends_this_run = brake_counter
+                                        .amends_this_run
+                                        .saturating_add(pending_amend_count);
+                                    brake_counter.amends_this_turn = brake_counter
+                                        .amends_this_turn
+                                        .saturating_add(pending_amend_count);
+
+                                    // R2 (gemini PR #31 MED): inline the
+                                    // engine construction — used once,
+                                    // then dropped before the per-tool
+                                    // authorize below constructs its own
+                                    // at line ~1192. Both paths must
+                                    // coexist because the per-tool
+                                    // authorize needs a fresh borrow
+                                    // after any capability mutation in
+                                    // this branch.
+                                    let amend_decision =
+                                        AuthorityEngine::new(&*self.capabilities, ApprovalPolicyV1)
+                                            .authorize_budget_extension(
+                                                label,
+                                                effective_max,
+                                                &brake_counter,
+                                            );
+
+                                    match amend_decision {
+                                        AuthorityDecision::NotAvailable { hint } => {
+                                            // Brakes tripped OR engine
+                                            // declined — fall back to the
+                                            // pre-β abort path, but surface
+                                            // the hint so the user sees why
+                                            // no amend was offered.
+                                            self.record_abort(
+                                                &turn_id,
+                                                AbortReason::RuntimeError,
+                                                Some(format!(
+                                                    "effect budget exhausted: {label} \
+                                                     {used}/{effective_max}; {hint}"
+                                                )),
+                                                total_usage.clone(),
+                                            )?;
+                                            return Ok(TurnOutcome::aborted(total_usage));
+                                        }
+                                        AuthorityDecision::RequireBudgetExtension {
+                                            approval_id,
+                                            label: amend_label,
+                                            current,
+                                            proposed,
+                                        } => {
+                                            // Offer the extension. The
+                                            // ApprovalRequest event keeps
+                                            // invariant #5 intact (every
+                                            // run leaves structured
+                                            // evidence); budget_extension
+                                            // field in the msg lets the TUI
+                                            // render a distinct modal.
+                                            let summary = format!(
+                                                "extend {amend_label}: {current} → {proposed}"
+                                            );
+                                            self.writer.append(&SessionEvent::ApprovalRequest {
+                                                turn_id: turn_id.clone(),
+                                                approval_id: approval_id.clone(),
+                                                effect_class,
+                                                tool_name: name.to_string(),
+                                                summary: summary.clone(),
+                                            })?;
+                                            // Telemetry tool_name is the
+                                            // literal `budget_extension` so
+                                            // operators aggregating
+                                            // `approval_requested` by tool
+                                            // see amend grants as a
+                                            // first-class row distinct from
+                                            // real tool approvals. The JSONL
+                                            // ApprovalRequest event carries
+                                            // the real tool name for
+                                            // forensic replay.
+                                            telemetry::emit_approval_requested(
+                                                &self.run_id.0,
+                                                &turn_id.0,
+                                                "budget_extension",
+                                                effect_class,
+                                            );
+
+                                            let (resp_tx, resp_rx) =
+                                                oneshot::channel::<ApprovalResponse>();
+                                            let msg = ApprovalRequestMsg {
+                                                turn_id: turn_id.clone(),
+                                                approval_id: approval_id.clone(),
+                                                tool_name: name.to_string(),
+                                                effect_class,
+                                                summary,
+                                                responder: resp_tx,
+                                                budget_extension: Some(BudgetExtensionRequest {
+                                                    label: amend_label,
+                                                    current,
+                                                    proposed,
+                                                }),
+                                            };
+                                            match race_wall_deadline(
+                                                self.approval_bridge.send(msg),
+                                                deadline,
+                                            )
+                                            .await
+                                            {
+                                                Ok(Ok(())) => {}
+                                                Ok(Err(_)) => {
+                                                    self.writer.append(
+                                                        &SessionEvent::ApprovalDenied {
+                                                            turn_id: turn_id.clone(),
+                                                            approval_id: approval_id.clone(),
+                                                        },
+                                                    )?;
+                                                    self.record_abort(
+                                                        &turn_id,
+                                                        AbortReason::ApprovalDenied,
+                                                        Some("approval bridge closed".into()),
+                                                        total_usage.clone(),
+                                                    )?;
+                                                    return Ok(TurnOutcome::aborted(total_usage));
+                                                }
+                                                Err(()) => {
+                                                    let usage = self.record_wall_timeout_abort(
+                                                        &turn_id,
+                                                        deadline_anchor,
+                                                        turn_started_tokio,
+                                                        budget_secs,
+                                                        &total_usage,
+                                                        0,
+                                                        0,
+                                                    )?;
+                                                    return Ok(TurnOutcome::aborted(usage));
+                                                }
+                                            }
+
+                                            let amend_response =
+                                                match race_wall_deadline(resp_rx, deadline).await {
+                                                    Ok(r) => r,
+                                                    Err(()) => {
+                                                        let usage = self
+                                                            .record_wall_timeout_abort(
+                                                                &turn_id,
+                                                                deadline_anchor,
+                                                                turn_started_tokio,
+                                                                budget_secs,
+                                                                &total_usage,
+                                                                0,
+                                                                0,
+                                                            )?;
+                                                        return Ok(TurnOutcome::aborted(usage));
+                                                    }
+                                                };
+
+                                            match amend_response {
+                                                Ok(ApprovalResponse::Grant { .. }) => {
+                                                    // Build the delta and
+                                                    // apply via the clamped
+                                                    // helper so the 2×
+                                                    // multiplier cap is
+                                                    // enforced even if a
+                                                    // future caller proposes
+                                                    // more. `current` is the
+                                                    // pre-amend effective
+                                                    // ceiling — at most
+                                                    // current more can be
+                                                    // added this grant.
+                                                    let proposed_delta = match effect_class {
+                                                        EffectClass::ApplyLocal => {
+                                                            crate::schemas::EffectBudgetDelta {
+                                                                apply_local: current,
+                                                                apply_repo: 0,
+                                                                network_reads: 0,
+                                                            }
+                                                        }
+                                                        EffectClass::ApplyRepo => {
+                                                            crate::schemas::EffectBudgetDelta {
+                                                                apply_local: 0,
+                                                                apply_repo: current,
+                                                                network_reads: 0,
+                                                            }
+                                                        }
+                                                        _ => {
+                                                            crate::schemas::EffectBudgetDelta
+                                                                ::default()
+                                                        }
+                                                    };
+                                                    // The engine's proposal
+                                                    // (exactly current) is
+                                                    // already within the
+                                                    // cap, but routing
+                                                    // through the clamped
+                                                    // helper is defensive
+                                                    // depth for when a
+                                                    // future caller proposes
+                                                    // larger.
+                                                    // R3 (PR #31 codex P2 +
+                                                    // gemini HIGH): pass
+                                                    // the PENDING-inclusive
+                                                    // bonus to the clamp so
+                                                    // the second amend in
+                                                    // the same turn caps
+                                                    // against the already-
+                                                    // raised ceiling. Using
+                                                    // bare `bonus` under-
+                                                    // applied: user granted
+                                                    // 40 but only 20 (the
+                                                    // pre-turn cap) landed
+                                                    // in applied_delta.
+                                                    // Symmetry with the
+                                                    // budget-check use of
+                                                    // `pending_for_class`
+                                                    // on line ~910 is the
+                                                    // invariant.
+                                                    let applied_delta = crate::contract
+                                                        ::apply_amend_clamped_against_base(
+                                                            max_base,
+                                                            bonus.saturating_add(
+                                                                pending_for_class,
+                                                            ),
+                                                            &proposed_delta,
+                                                            effect_class,
+                                                        );
+                                                    // R2 (gemini PR #31
+                                                    // MED on
+                                                    // turn/mod.rs:1098):
+                                                    // dropped the
+                                                    // `ApprovalGranted`
+                                                    // event — an amend
+                                                    // does NOT mint a
+                                                    // capability, so the
+                                                    // token id the old
+                                                    // code emitted was a
+                                                    // false forensic
+                                                    // signal. The
+                                                    // `ContractAmended`
+                                                    // event below is the
+                                                    // structured
+                                                    // evidence required by
+                                                    // invariant #5 and
+                                                    // the one a future
+                                                    // forensic tool
+                                                    // should key off.
+                                                    self.writer.append(
+                                                        &SessionEvent::ContractAmended {
+                                                            contract_id: c.id.clone(),
+                                                            turn_id: turn_id.clone(),
+                                                            delta: applied_delta.clone(),
+                                                            at: self.ctx.now_iso(),
+                                                        },
+                                                    )?;
+                                                    telemetry::emit_approval_granted(
+                                                        &self.run_id.0,
+                                                        &turn_id.0,
+                                                        "budget_extension",
+                                                        "once",
+                                                    );
+                                                    // R2 (codex PR #31 P1):
+                                                    // accumulate into
+                                                    // pending locals, NOT
+                                                    // effects_consumed.
+                                                    // Flush at commit only
+                                                    // — aborts drop
+                                                    // naturally by stack
+                                                    // scope. Budget check
+                                                    // already reads
+                                                    // `pending_for_class`
+                                                    // so the raised
+                                                    // ceiling is visible
+                                                    // to the next tool
+                                                    // call in THIS turn.
+                                                    pending_amend_apply_local =
+                                                        pending_amend_apply_local.saturating_add(
+                                                            applied_delta.apply_local,
+                                                        );
+                                                    pending_amend_apply_repo =
+                                                        pending_amend_apply_repo.saturating_add(
+                                                            applied_delta.apply_repo,
+                                                        );
+                                                    pending_amend_network_reads =
+                                                        pending_amend_network_reads.saturating_add(
+                                                            applied_delta.network_reads,
+                                                        );
+                                                    pending_amend_count =
+                                                        pending_amend_count.saturating_add(1);
+                                                    // R4 (PR #31 codex P2):
+                                                    // re-check after
+                                                    // applying the delta.
+                                                    // If the amend wasn't
+                                                    // enough (e.g., the
+                                                    // counter was already
+                                                    // well above cap from
+                                                    // a resume into a
+                                                    // stricter contract,
+                                                    // or from a harness
+                                                    // pre-seed), falling
+                                                    // through would let
+                                                    // the tool execute
+                                                    // while still over
+                                                    // budget. Abort with
+                                                    // a distinct message
+                                                    // so the operator can
+                                                    // tell "grant didn't
+                                                    // help" from "grant
+                                                    // brake-declined".
+                                                    //
+                                                    // ContractAmended
+                                                    // above was written
+                                                    // before this abort —
+                                                    // that's intentional:
+                                                    // the grant DID
+                                                    // happen (audit
+                                                    // trail), even if
+                                                    // it didn't clear
+                                                    // the budget.
+                                                    // Replayable drops
+                                                    // the aborted turn
+                                                    // whole anyway, so
+                                                    // the persisted
+                                                    // grant evaporates
+                                                    // on resume.
+                                                    let new_pending_for_class = match effect_class {
+                                                        EffectClass::ApplyLocal => {
+                                                            pending_amend_apply_local
+                                                        }
+                                                        EffectClass::ApplyRepo => {
+                                                            pending_amend_apply_repo
+                                                        }
+                                                        _ => 0,
+                                                    };
+                                                    let new_effective_max = max_base
+                                                        .saturating_add(bonus)
+                                                        .saturating_add(new_pending_for_class);
+                                                    if used >= new_effective_max {
+                                                        self.record_abort(
+                                                            &turn_id,
+                                                            AbortReason::RuntimeError,
+                                                            Some(format!(
+                                                                "effect budget still exhausted after amend: {label} {used}/{new_effective_max}"
+                                                            )),
+                                                            total_usage.clone(),
+                                                        )?;
+                                                        return Ok(TurnOutcome::aborted(
+                                                            total_usage,
+                                                        ));
+                                                    }
+                                                    // Fall through to normal
+                                                    // per-tool authorization
+                                                    // below. The amend only
+                                                    // raised the ceiling; it
+                                                    // does NOT pre-authorize
+                                                    // the specific tool.
+                                                }
+                                                Ok(ApprovalResponse::Deny) | Err(_) => {
+                                                    self.writer.append(
+                                                        &SessionEvent::ApprovalDenied {
+                                                            turn_id: turn_id.clone(),
+                                                            approval_id: approval_id.clone(),
+                                                        },
+                                                    )?;
+                                                    telemetry::emit_approval_denied(
+                                                        &self.run_id.0,
+                                                        &turn_id.0,
+                                                        "budget_extension",
+                                                    );
+                                                    self.record_abort(
+                                                        &turn_id,
+                                                        AbortReason::ApprovalDenied,
+                                                        Some("user denied budget extension".into()),
+                                                        total_usage.clone(),
+                                                    )?;
+                                                    return Ok(TurnOutcome::aborted(total_usage));
+                                                }
+                                            }
+                                        }
+                                        // The engine should never return
+                                        // Auto / Reuse / RequireApproval
+                                        // from authorize_budget_extension.
+                                        // Keep the match exhaustive.
+                                        AuthorityDecision::Auto
+                                        | AuthorityDecision::Reuse(_)
+                                        | AuthorityDecision::RequireApproval { .. } => {
+                                            unreachable!(
+                                                "authorize_budget_extension returns only \
+                                                 RequireBudgetExtension or NotAvailable"
+                                            );
+                                        }
+                                    }
                                 }
                             }
 
@@ -884,6 +1328,21 @@ impl<'a> TurnDriver<'a> {
 
                             match decision {
                                 AuthorityDecision::Auto | AuthorityDecision::Reuse(_) => {}
+                                AuthorityDecision::RequireBudgetExtension { .. } => {
+                                    // Unreachable in the per-tool authorization
+                                    // path. `authorize()` only yields Auto /
+                                    // Reuse / RequireApproval / NotAvailable;
+                                    // budget-extension decisions come from
+                                    // `authorize_budget_extension()`, which the
+                                    // driver calls separately at the budget-
+                                    // overflow branch above. Dedicated arm
+                                    // keeps the match exhaustive across future
+                                    // AuthorityDecision variants.
+                                    unreachable!(
+                                        "authorize() never returns RequireBudgetExtension; \
+                                         budget extensions go through authorize_budget_extension()"
+                                    );
+                                }
                                 AuthorityDecision::NotAvailable { hint } => {
                                     self.record_abort(
                                         &turn_id,
@@ -925,6 +1384,10 @@ impl<'a> TurnDriver<'a> {
                                         effect_class: ec,
                                         summary,
                                         responder: resp_tx,
+                                        // Per-tool approval path: β's
+                                        // budget-extension variant applies
+                                        // only to the amend branch above.
+                                        budget_extension: None,
                                     };
                                     // Round 6: race the bridge send against the
                                     // wall deadline. Normally bounded and
@@ -1393,6 +1856,17 @@ impl<'a> TurnDriver<'a> {
                             checkpoint_id: CheckpointId::new(),
                         })?;
                     }
+                    // R2 (codex PR #31 P1): commit-time flush of
+                    // pending amend state, sequenced AFTER the
+                    // TurnCommitted write so a writer.append failure
+                    // leaves `effects_consumed` at the pre-flush value
+                    // — matching what fold_progress would rebuild
+                    // (dangling turn → treated as interrupted on
+                    // recovery → dropped from replayable). Sequencing
+                    // the flush BEFORE the append would introduce a
+                    // narrow window where a disk/IO failure persisted
+                    // the counter bump in live memory but left no
+                    // JSONL record for replay.
                     self.writer.append(&SessionEvent::TurnCommitted {
                         turn_id: turn_id.clone(),
                         outcome: CommitOutcome::Success,
@@ -1401,6 +1875,28 @@ impl<'a> TurnDriver<'a> {
                         final_assistant: Some(response.content.clone()),
                         at: Some(self.ctx.now_iso()),
                     })?;
+                    if pending_amend_count > 0 {
+                        self.effects_consumed.apply_local_ceiling_bonus = self
+                            .effects_consumed
+                            .apply_local_ceiling_bonus
+                            .saturating_add(pending_amend_apply_local);
+                        self.effects_consumed.apply_repo_ceiling_bonus = self
+                            .effects_consumed
+                            .apply_repo_ceiling_bonus
+                            .saturating_add(pending_amend_apply_repo);
+                        self.effects_consumed.network_reads_ceiling_bonus = self
+                            .effects_consumed
+                            .network_reads_ceiling_bonus
+                            .saturating_add(pending_amend_network_reads);
+                        self.effects_consumed.amends_this_turn = self
+                            .effects_consumed
+                            .amends_this_turn
+                            .saturating_add(pending_amend_count);
+                        self.effects_consumed.amends_this_run = self
+                            .effects_consumed
+                            .amends_this_run
+                            .saturating_add(pending_amend_count);
+                    }
                     telemetry::emit_turn_committed(
                         &self.run_id.0,
                         &turn_id.0,
