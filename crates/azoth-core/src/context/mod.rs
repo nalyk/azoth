@@ -10,6 +10,7 @@
 
 mod budget;
 mod composite;
+pub mod discipline;
 mod evidence;
 mod graph_evidence;
 mod kernel;
@@ -19,6 +20,7 @@ mod tokenizer;
 
 pub use budget::{Slot, TokenBudget};
 pub use composite::CompositeEvidenceCollector;
+pub use discipline::TOOL_USE_DISCIPLINE;
 pub use evidence::{EvidenceCollector, LexicalEvidenceCollector};
 pub use graph_evidence::{extract_seed_paths, GraphEvidenceCollector};
 pub use kernel::{ContextKernel, KernelError, StepInput};

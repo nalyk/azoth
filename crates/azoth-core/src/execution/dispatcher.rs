@@ -45,6 +45,20 @@ pub trait Tool: Send + Sync {
         &[Origin::ModelOutput]
     }
 
+    /// Per-invocation effect class refinement for budget accounting.
+    /// Default `None` means "use the static `effect_class()`". Tools may
+    /// inspect the raw input and downgrade a worst-case static class to
+    /// something cheaper for a specific shape — e.g. `BashTool` downgrades
+    /// read-only argv (`grep foo src/`) from `ApplyLocal` to `Observe`.
+    ///
+    /// This return value drives BUDGET and AUTHORITY decisions. The
+    /// sandbox tier still selects from the static `effect_class()` so a
+    /// mis-classified "observe" invocation cannot escape the worst-case
+    /// jail.
+    fn effect_class_for(&self, _raw: &Value) -> Option<EffectClass> {
+        None
+    }
+
     async fn execute(
         &self,
         input: Self::Input,
@@ -58,6 +72,9 @@ pub trait ErasedTool: Send + Sync {
     fn name(&self) -> &'static str;
     fn schema(&self) -> Value;
     fn effect_class(&self) -> EffectClass;
+    /// Per-invocation refinement. No default — every `ErasedTool` must
+    /// route. The blanket impl below forwards to `Tool::effect_class_for`.
+    fn effect_class_for(&self, raw: &Value) -> Option<EffectClass>;
     fn dispatch<'a>(
         &'a self,
         raw: Tainted<Value>,
@@ -74,6 +91,9 @@ impl<T: Tool + 'static> ErasedTool for T {
     }
     fn effect_class(&self) -> EffectClass {
         Tool::effect_class(self)
+    }
+    fn effect_class_for(&self, raw: &Value) -> Option<EffectClass> {
+        <T as Tool>::effect_class_for(self, raw)
     }
     fn dispatch<'a>(
         &'a self,
