@@ -68,13 +68,25 @@ fn v2_1_seed_loads_ships_50_tasks_and_meets_localization_at_5_floor() {
         );
     }
 
-    // Per-language coverage (ids are the contract): 20 v2 rows use `loc*`,
-    // then 10 `py_*`, 10 `ts_*`, 10 `go_*`.
-    let count_with_prefix = |p: &str| tasks.iter().filter(|t| t.id.starts_with(p)).count();
-    assert_eq!(count_with_prefix("loc"), 20, "20 original v2 tasks");
-    assert_eq!(count_with_prefix("py_"), 10, "10 Python tasks");
-    assert_eq!(count_with_prefix("ts_"), 10, "10 TypeScript tasks");
-    assert_eq!(count_with_prefix("go_"), 10, "10 Go tasks");
+    // Per-language coverage (ids are the contract): 20 v2 rows use `locNN`,
+    // then 10 each `py_NNN` / `ts_NNN` / `go_NNN`. Prefix + length + numeric
+    // suffix guards against drift (e.g. a future `location_*` or `py_alpha`
+    // id inflating a bucket silently). Gemini PR #28 R4 flagged the loose
+    // `starts_with` check — regex dep would be overkill for 4 call sites.
+    let count_pattern = |prefix: &str, digits: usize| {
+        tasks
+            .iter()
+            .filter(|t| {
+                t.id.starts_with(prefix)
+                    && t.id.len() == prefix.len() + digits
+                    && t.id[prefix.len()..].chars().all(|c| c.is_ascii_digit())
+            })
+            .count()
+    };
+    assert_eq!(count_pattern("loc", 2), 20, "20 original v2 tasks (locNN)");
+    assert_eq!(count_pattern("py_", 3), 10, "10 Python tasks (py_NNN)");
+    assert_eq!(count_pattern("ts_", 3), 10, "10 TypeScript tasks (ts_NNN)");
+    assert_eq!(count_pattern("go_", 3), 10, "10 Go tasks (go_NNN)");
 
     let scores = score_tasks(&tasks, 5);
     let mean = mean_precision(&scores).expect(
