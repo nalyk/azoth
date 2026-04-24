@@ -655,9 +655,16 @@ impl JsonlReader {
         // R1 (gemini HIGH + codex P2): track the currently-active
         // contract id so amends that target an older, superseded
         // contract do NOT inflate the ceiling bonus for the new one.
-        // A mid-session `ContractAccepted` also resets the bonus +
-        // amends_this_run counter because the new contract starts
-        // with its own budget, unaffected by prior amends.
+        // A mid-session `ContractAccepted` resets the ceiling-bonus
+        // triplet because those bonuses applied to the prior contract
+        // and the new contract starts its ceiling fresh.
+        //
+        // R2 (codex PR #31 P2): `amends_this_run` is the per-run
+        // brake counter. Resetting it on ContractAccepted would let
+        // a user bypass `MAX_AMENDS_PER_RUN` by cycling contracts.
+        // The brake is run-scope, stricter than contract-scope — so
+        // the run-amend count accumulates across contract boundaries
+        // even when the bonus magnitudes do not.
         //
         // `apply_local` / `apply_repo` tallies are intentionally NOT
         // reset here — that is pre-existing behaviour (pre-β) and
@@ -671,7 +678,8 @@ impl JsonlReader {
                     effects.apply_local_ceiling_bonus = 0;
                     effects.apply_repo_ceiling_bonus = 0;
                     effects.network_reads_ceiling_bonus = 0;
-                    effects.amends_this_run = 0;
+                    // amends_this_run intentionally preserved — see
+                    // R2 comment above.
                 }
                 // β: fold ContractAmended deltas into the ceiling-bonus
                 // fields and bump the run-scoped amend counter. Only

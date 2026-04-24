@@ -230,9 +230,14 @@ fn fold_progress_ignores_stale_amends_across_contract_replacement() {
         "only the new-contract amend delta (7) must count; \
          the stale amend (50) against the superseded contract_id must be dropped"
     );
+    // R2 (codex PR #31 P2): amends_this_run is the per-run brake
+    // counter and MUST accumulate across contract boundaries — two
+    // amends fired in this run, regardless of the fact that one
+    // targeted a superseded contract. If this were 1, a user could
+    // bypass MAX_AMENDS_PER_RUN by cycling contracts.
     assert_eq!(
-        effects.amends_this_run, 1,
-        "only one amend targets the current contract"
+        effects.amends_this_run, 2,
+        "run-scope brake counter must preserve across contract replacement"
     );
 
     let effective = r.last_effective_contract().unwrap().expect("contract");

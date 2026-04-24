@@ -12,10 +12,10 @@ use crate::event_store::JsonlWriter;
 use crate::execution::{ExecutionContext, ToolDispatcher, ToolError};
 use crate::impact::DiffSource;
 use crate::schemas::{
-    AbortReason, ApprovalScope, CheckpointId, CommitOutcome, ContentBlock, ContentBlockStub,
-    Contract, Diff, EffectClass, EffectCounter, EffectRecord, EffectRecordId, Message,
-    ModelTurnRequest, RequestMetadata, Role, RunId, SessionEvent, StopReason, StreamEvent,
-    ToolDefinition, TurnId, Usage, ValidatorStatus,
+    AbortReason, CheckpointId, CommitOutcome, ContentBlock, ContentBlockStub, Contract, Diff,
+    EffectClass, EffectCounter, EffectRecord, EffectRecordId, Message, ModelTurnRequest,
+    RequestMetadata, Role, RunId, SessionEvent, StopReason, StreamEvent, ToolDefinition, TurnId,
+    Usage, ValidatorStatus,
 };
 use crate::telemetry;
 use crate::validators::{ImpactValidator, Validator};
@@ -286,6 +286,21 @@ impl<'a> TurnDriver<'a> {
         // leak into this one's budget. amends_this_run is run-scoped
         // and is NEVER reset here.
         self.effects_consumed.amends_this_turn = 0;
+
+        // R2 (codex PR #31 P1): amend state updates are DEFERRED until
+        // the turn commits. The grant path accumulates into these
+        // stack-locals; the commit path flushes them into
+        // `effects_consumed`; every abort path discards them by the
+        // natural scope drop. Without this, an amend grant in a turn
+        // that later aborts (e.g. user denies the subsequent per-tool
+        // approval) would persist the ceiling bonus + run-brake bump
+        // into the next turn's live memory, diverging from the
+        // replayable projection (which drops the aborted turn whole
+        // and so never folds its ContractAmended event).
+        let mut pending_amend_apply_local: u32 = 0;
+        let mut pending_amend_apply_repo: u32 = 0;
+        let mut pending_amend_network_reads: u32 = 0;
+        let mut pending_amend_count: u32 = 0;
 
         // Capture the triggering user input before tool-loop pushes any
         // tool_result User messages. Persisted on TurnCommitted so a
@@ -878,7 +893,23 @@ impl<'a> TurnDriver<'a> {
                                     ),
                                     _ => (0, u32::MAX, 0, ""),
                                 };
-                                let effective_max = max_base.saturating_add(bonus);
+                                // R2 (codex PR #31 P1): fold uncommitted
+                                // amend deltas from this turn into the
+                                // effective ceiling so additional tool
+                                // calls inside the same turn see the
+                                // raised bar without requiring
+                                // `effects_consumed` to already carry
+                                // them. `pending_*` only leaves the
+                                // stack via the commit-time flush
+                                // below; aborts drop it naturally.
+                                let pending_for_class = match effect_class {
+                                    EffectClass::ApplyLocal => pending_amend_apply_local,
+                                    EffectClass::ApplyRepo => pending_amend_apply_repo,
+                                    _ => 0,
+                                };
+                                let effective_max = max_base
+                                    .saturating_add(bonus)
+                                    .saturating_add(pending_for_class);
                                 if !label.is_empty() && used >= effective_max {
                                     // Keep the telemetry signal so Gate G1
                                     // / G2 instrumentation continues firing
@@ -891,17 +922,39 @@ impl<'a> TurnDriver<'a> {
                                         effective_max,
                                     );
 
-                                    let amend_decision = {
-                                        let engine = AuthorityEngine::new(
-                                            &*self.capabilities,
-                                            ApprovalPolicyV1,
-                                        );
-                                        engine.authorize_budget_extension(
-                                            label,
-                                            effective_max,
-                                            self.effects_consumed,
-                                        )
-                                    };
+                                    // R2 (codex PR #31 P1): pass a
+                                    // pending-merged counter so the brake
+                                    // check sees the true "amends so far"
+                                    // count that includes THIS turn's
+                                    // uncommitted grants. Without this,
+                                    // multiple amends inside one turn
+                                    // would each see amends_this_run
+                                    // frozen at the pre-turn value and
+                                    // bypass the per-run cap.
+                                    let mut brake_counter = *self.effects_consumed;
+                                    brake_counter.amends_this_run = brake_counter
+                                        .amends_this_run
+                                        .saturating_add(pending_amend_count);
+                                    brake_counter.amends_this_turn = brake_counter
+                                        .amends_this_turn
+                                        .saturating_add(pending_amend_count);
+
+                                    // R2 (gemini PR #31 MED): inline the
+                                    // engine construction — used once,
+                                    // then dropped before the per-tool
+                                    // authorize below constructs its own
+                                    // at line ~1192. Both paths must
+                                    // coexist because the per-tool
+                                    // authorize needs a fresh borrow
+                                    // after any capability mutation in
+                                    // this branch.
+                                    let amend_decision =
+                                        AuthorityEngine::new(&*self.capabilities, ApprovalPolicyV1)
+                                            .authorize_budget_extension(
+                                                label,
+                                                effective_max,
+                                                &brake_counter,
+                                            );
 
                                     match amend_decision {
                                         AuthorityDecision::NotAvailable { hint } => {
@@ -1079,23 +1132,26 @@ impl<'a> TurnDriver<'a> {
                                                             &proposed_delta,
                                                             effect_class,
                                                         );
-                                                    // Record the grant
-                                                    // (invariant #5) and
-                                                    // the amend event —
-                                                    // strictly between
-                                                    // TurnStarted and the
-                                                    // turn's terminal
-                                                    // marker, preserving
-                                                    // invariant #7.
-                                                    self.writer.append(
-                                                        &SessionEvent::ApprovalGranted {
-                                                            turn_id: turn_id.clone(),
-                                                            approval_id: approval_id.clone(),
-                                                            token: crate::schemas
-                                                                ::CapabilityTokenId::new(),
-                                                            scope: ApprovalScope::Once,
-                                                        },
-                                                    )?;
+                                                    // R2 (gemini PR #31
+                                                    // MED on
+                                                    // turn/mod.rs:1098):
+                                                    // dropped the
+                                                    // `ApprovalGranted`
+                                                    // event — an amend
+                                                    // does NOT mint a
+                                                    // capability, so the
+                                                    // token id the old
+                                                    // code emitted was a
+                                                    // false forensic
+                                                    // signal. The
+                                                    // `ContractAmended`
+                                                    // event below is the
+                                                    // structured
+                                                    // evidence required by
+                                                    // invariant #5 and
+                                                    // the one a future
+                                                    // forensic tool
+                                                    // should key off.
                                                     self.writer.append(
                                                         &SessionEvent::ContractAmended {
                                                             contract_id: c.id.clone(),
@@ -1110,38 +1166,34 @@ impl<'a> TurnDriver<'a> {
                                                         "budget_extension",
                                                         "once",
                                                     );
-                                                    // Advance counters and
-                                                    // ceiling bonuses. All
-                                                    // three classes are
-                                                    // folded additively so
-                                                    // a multi-class amend
-                                                    // lands in a single
-                                                    // counter update.
-                                                    self.effects_consumed
-                                                        .apply_local_ceiling_bonus = self
-                                                        .effects_consumed
-                                                        .apply_local_ceiling_bonus
-                                                        .saturating_add(applied_delta.apply_local);
-                                                    self.effects_consumed
-                                                        .apply_repo_ceiling_bonus = self
-                                                        .effects_consumed
-                                                        .apply_repo_ceiling_bonus
-                                                        .saturating_add(applied_delta.apply_repo);
-                                                    self.effects_consumed
-                                                        .network_reads_ceiling_bonus = self
-                                                        .effects_consumed
-                                                        .network_reads_ceiling_bonus
-                                                        .saturating_add(
+                                                    // R2 (codex PR #31 P1):
+                                                    // accumulate into
+                                                    // pending locals, NOT
+                                                    // effects_consumed.
+                                                    // Flush at commit only
+                                                    // — aborts drop
+                                                    // naturally by stack
+                                                    // scope. Budget check
+                                                    // already reads
+                                                    // `pending_for_class`
+                                                    // so the raised
+                                                    // ceiling is visible
+                                                    // to the next tool
+                                                    // call in THIS turn.
+                                                    pending_amend_apply_local =
+                                                        pending_amend_apply_local.saturating_add(
+                                                            applied_delta.apply_local,
+                                                        );
+                                                    pending_amend_apply_repo =
+                                                        pending_amend_apply_repo.saturating_add(
+                                                            applied_delta.apply_repo,
+                                                        );
+                                                    pending_amend_network_reads =
+                                                        pending_amend_network_reads.saturating_add(
                                                             applied_delta.network_reads,
                                                         );
-                                                    self.effects_consumed.amends_this_turn = self
-                                                        .effects_consumed
-                                                        .amends_this_turn
-                                                        .saturating_add(1);
-                                                    self.effects_consumed.amends_this_run = self
-                                                        .effects_consumed
-                                                        .amends_this_run
-                                                        .saturating_add(1);
+                                                    pending_amend_count =
+                                                        pending_amend_count.saturating_add(1);
                                                     // Fall through to normal
                                                     // per-tool authorization
                                                     // below. The amend only
@@ -1723,6 +1775,17 @@ impl<'a> TurnDriver<'a> {
                             checkpoint_id: CheckpointId::new(),
                         })?;
                     }
+                    // R2 (codex PR #31 P1): commit-time flush of
+                    // pending amend state, sequenced AFTER the
+                    // TurnCommitted write so a writer.append failure
+                    // leaves `effects_consumed` at the pre-flush value
+                    // — matching what fold_progress would rebuild
+                    // (dangling turn → treated as interrupted on
+                    // recovery → dropped from replayable). Sequencing
+                    // the flush BEFORE the append would introduce a
+                    // narrow window where a disk/IO failure persisted
+                    // the counter bump in live memory but left no
+                    // JSONL record for replay.
                     self.writer.append(&SessionEvent::TurnCommitted {
                         turn_id: turn_id.clone(),
                         outcome: CommitOutcome::Success,
@@ -1731,6 +1794,28 @@ impl<'a> TurnDriver<'a> {
                         final_assistant: Some(response.content.clone()),
                         at: Some(self.ctx.now_iso()),
                     })?;
+                    if pending_amend_count > 0 {
+                        self.effects_consumed.apply_local_ceiling_bonus = self
+                            .effects_consumed
+                            .apply_local_ceiling_bonus
+                            .saturating_add(pending_amend_apply_local);
+                        self.effects_consumed.apply_repo_ceiling_bonus = self
+                            .effects_consumed
+                            .apply_repo_ceiling_bonus
+                            .saturating_add(pending_amend_apply_repo);
+                        self.effects_consumed.network_reads_ceiling_bonus = self
+                            .effects_consumed
+                            .network_reads_ceiling_bonus
+                            .saturating_add(pending_amend_network_reads);
+                        self.effects_consumed.amends_this_turn = self
+                            .effects_consumed
+                            .amends_this_turn
+                            .saturating_add(pending_amend_count);
+                        self.effects_consumed.amends_this_run = self
+                            .effects_consumed
+                            .amends_this_run
+                            .saturating_add(pending_amend_count);
+                    }
                     telemetry::emit_turn_committed(
                         &self.run_id.0,
                         &turn_id.0,

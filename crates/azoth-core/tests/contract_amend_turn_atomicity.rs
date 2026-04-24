@@ -249,3 +249,118 @@ async fn amend_grant_preserves_single_terminal_marker_and_ordering() {
         .iter()
         .any(|e| matches!(e, SessionEvent::ToolResult { .. })));
 }
+
+#[tokio::test]
+async fn aborted_turn_after_amend_does_not_persist_amend_state() {
+    // R2 (codex PR #31 P1): if a turn grants an amend and then
+    // aborts — e.g. the user denies the subsequent per-tool
+    // approval — the ceiling bonus + amends_this_run bumps must
+    // NOT persist into the next turn. The replayable projection
+    // drops the aborted turn whole (and with it the
+    // ContractAmended event); the live driver's in-memory counter
+    // must follow.
+    let dir = tempdir().unwrap();
+    let repo_root = tokio::fs::canonicalize(dir.path()).await.unwrap();
+    let session_path = repo_root.join(".azoth/sessions/run_amend_abort.jsonl");
+    let artifacts_root = repo_root.join(".azoth/artifacts");
+
+    let mut writer = JsonlWriter::open(&session_path).unwrap();
+    let (_tap_tx, _tap_rx) = mpsc::unbounded_channel::<SessionEvent>();
+
+    let artifacts = ArtifactStore::open(&artifacts_root).unwrap();
+    let mut dispatcher = ToolDispatcher::new();
+    dispatcher.register(FsWriteTool);
+
+    let adapter = MockAdapter::new(
+        ProviderProfile::anthropic_default("claude-sonnet-4-6"),
+        one_fs_write_then_end(),
+    );
+
+    let contract_val = budget_1_contract("amend then deny");
+    let run_id = RunId::from("run_amend_abort".to_string());
+    let turn_id = TurnId::from("t_amend_abort".to_string());
+    let ctx = ExecutionContext::builder(
+        run_id.clone(),
+        turn_id.clone(),
+        artifacts,
+        repo_root.clone(),
+    )
+    .build();
+
+    // Responder: grant the FIRST approval (the budget extension),
+    // deny every subsequent one (the per-tool fs_write). This models
+    // a user who raised the ceiling then got cold feet on the actual
+    // write.
+    let (approval_tx, mut approval_rx) = mpsc::channel::<ApprovalRequestMsg>(8);
+    let responder = tokio::spawn(async move {
+        let mut first = true;
+        while let Some(req) = approval_rx.recv().await {
+            if first {
+                first = false;
+                let _ = req.responder.send(ApprovalResponse::Grant {
+                    scope: ApprovalScope::Once,
+                });
+            } else {
+                let _ = req.responder.send(ApprovalResponse::Deny);
+            }
+        }
+    });
+
+    let mut caps = CapabilityStore::new();
+    let mut effects = EffectCounter {
+        apply_local: 1,
+        ..Default::default()
+    };
+
+    {
+        let mut driver = TurnDriver {
+            run_id: run_id.clone(),
+            adapter: &adapter,
+            dispatcher: &dispatcher,
+            writer: &mut writer,
+            ctx: &ctx,
+            capabilities: &mut caps,
+            approval_bridge: approval_tx,
+            contract: Some(&contract_val),
+            turns_completed: 0,
+            run_started_tokio: None,
+            kernel: None,
+            validators: &[],
+            effects_consumed: &mut effects,
+            evidence_collector: None,
+            impact_validators: &[],
+            diff_source: None,
+        };
+        driver
+            .drive_turn(
+                turn_id.clone(),
+                "system".into(),
+                vec![Message::user_text("grant then deny")],
+            )
+            .await
+            .expect("abort path returns Ok");
+    }
+    drop(writer);
+    responder.abort();
+
+    // Counter snapshot after the aborted turn: pre-seeded 1 stays,
+    // NO bonus from the amend, NO amends_this_run bump. If any of
+    // these assertions failed, the pending→commit flush leaked into
+    // a non-commit path.
+    assert_eq!(
+        effects.apply_local, 1,
+        "pre-seed preserved; no post-amend effect recorded (tool denied)"
+    );
+    assert_eq!(
+        effects.apply_local_ceiling_bonus, 0,
+        "ceiling bonus MUST NOT persist from an aborted turn"
+    );
+    assert_eq!(
+        effects.amends_this_run, 0,
+        "per-run brake counter MUST NOT carry uncommitted grants"
+    );
+    assert_eq!(
+        effects.amends_this_turn, 0,
+        "per-turn brake counter reset on drive_turn entry; abort leaves it at 0"
+    );
+}
