@@ -988,12 +988,29 @@ impl Scan {
         })
     }
 
-    /// Most recent `Checkpoint` id in the scan. `None` if the scan has
-    /// never committed a turn. Used by the TUI resume banner so the
-    /// operator sees which checkpoint anchor they landed on.
+    /// Most recent `Checkpoint` id belonging to a COMMITTED turn, or
+    /// `None` if the scan has never committed a turn. Used by the TUI
+    /// resume banner so the operator sees which checkpoint anchor they
+    /// landed on.
+    ///
+    /// R2-3 codex P2 on PR #33 2026-04-24: the driver writes
+    /// `Checkpoint` *before* `TurnCommitted`; if the process crashes
+    /// between those two writes, recovery reclassifies that turn as
+    /// interrupted, but its Checkpoint event remains on disk. Without
+    /// the outcome filter we'd advertise the interrupted-turn
+    /// checkpoint as the resume anchor — misleading the operator
+    /// about how much progress survived. Filtering on
+    /// `outcomes[turn_id] == Committed` restricts the lookup to
+    /// anchors whose turn actually reached terminal success.
     pub fn last_checkpoint_id(&self) -> Option<crate::schemas::CheckpointId> {
         self.events.iter().rev().find_map(|ev| match ev {
-            SessionEvent::Checkpoint { checkpoint_id, .. } => Some(checkpoint_id.clone()),
+            SessionEvent::Checkpoint {
+                turn_id,
+                checkpoint_id,
+            } => match self.outcomes.get(turn_id) {
+                Some(TurnOutcomeKind::Committed) => Some(checkpoint_id.clone()),
+                _ => None,
+            },
             _ => None,
         })
     }
@@ -1657,6 +1674,86 @@ mod tests {
         let scan = reader.scan().unwrap();
         let id = scan.last_checkpoint_id().expect("some checkpoint");
         assert_eq!(id.0, "chk_second");
+    }
+
+    #[test]
+    fn scan_last_checkpoint_id_skips_checkpoints_on_interrupted_turns() {
+        // R2-3 codex P2 on PR #33 2026-04-24: the driver writes
+        // Checkpoint BEFORE TurnCommitted. If the process crashes
+        // between those writes, recovery marks the turn interrupted
+        // but the Checkpoint event survives. Without filtering on
+        // the outcome map, the resume banner would advertise an
+        // interrupted-turn checkpoint as the anchor.
+        use crate::schemas::{AbortReason, UsageDelta};
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let mut w = JsonlWriter::open(&path).unwrap();
+        let run_id = RunId::from("run_r2_3".to_string());
+        let t_ok = TurnId::from("t_committed".to_string());
+        let t_dead = TurnId::from("t_crashed".to_string());
+        w.append(&SessionEvent::RunStarted {
+            run_id: run_id.clone(),
+            contract_id: ContractId::from("ctr".to_string()),
+            timestamp: ts(),
+        })
+        .unwrap();
+
+        // Committed turn with its checkpoint (the good anchor).
+        w.append(&SessionEvent::TurnStarted {
+            turn_id: t_ok.clone(),
+            run_id: run_id.clone(),
+            parent_turn: None,
+            timestamp: ts(),
+        })
+        .unwrap();
+        w.append(&SessionEvent::Checkpoint {
+            turn_id: t_ok.clone(),
+            checkpoint_id: crate::schemas::CheckpointId::from("chk_committed".to_string()),
+        })
+        .unwrap();
+        w.append(&SessionEvent::TurnCommitted {
+            turn_id: t_ok,
+            outcome: CommitOutcome::Success,
+            usage: Usage::default(),
+            user_input: None,
+            final_assistant: None,
+            at: Some(ts()),
+        })
+        .unwrap();
+
+        // Crashy turn: Checkpoint then Interrupted (no TurnCommitted).
+        // This is the exact race codex flagged — the checkpoint row
+        // exists on disk but its turn never reached commit.
+        w.append(&SessionEvent::TurnStarted {
+            turn_id: t_dead.clone(),
+            run_id,
+            parent_turn: None,
+            timestamp: ts(),
+        })
+        .unwrap();
+        w.append(&SessionEvent::Checkpoint {
+            turn_id: t_dead.clone(),
+            checkpoint_id: crate::schemas::CheckpointId::from("chk_never_landed".to_string()),
+        })
+        .unwrap();
+        w.append(&SessionEvent::TurnInterrupted {
+            turn_id: t_dead,
+            reason: AbortReason::Crash,
+            partial_usage: UsageDelta::default(),
+            at: Some(ts()),
+        })
+        .unwrap();
+        drop(w);
+
+        let scan = JsonlReader::open(&path).scan().unwrap();
+        let id = scan
+            .last_checkpoint_id()
+            .expect("should find the committed anchor");
+        assert_eq!(
+            id.0, "chk_committed",
+            "must skip checkpoint on the interrupted turn; got {:?}",
+            id
+        );
     }
 
     #[test]
