@@ -3,8 +3,8 @@
 
 use super::{
     ApprovalId, ArtifactId, CallGroupId, CapabilityTokenId, CheckpointId, ContentBlock,
-    ContextPacketId, Contract, ContractId, EffectClass, EffectRecord, RunId, SandboxTier,
-    ToolUseId, TurnId, Usage, UsageDelta,
+    ContextPacketId, Contract, ContractId, EffectBudgetDelta, EffectClass, EffectRecord, RunId,
+    SandboxTier, ToolUseId, TurnId, Usage, UsageDelta,
 };
 use serde::{Deserialize, Serialize};
 
@@ -319,6 +319,27 @@ pub enum SessionEvent {
         at: String,
         progress: HeartbeatProgress,
     },
+    /// β: the user granted a mid-run budget extension against the active
+    /// contract. `delta` is the actually-applied amount per class after
+    /// clamping to the ≤2× multiplier cap (see
+    /// `contract::apply_amend_clamped`). Written strictly BETWEEN a
+    /// `TurnStarted` and the turn's terminal marker — never as a
+    /// terminal itself (invariant #7 intact).
+    ///
+    /// Old binaries without this variant will fail to parse the line;
+    /// `JsonlReader::scan` currently halts on unknown `type` tags, same
+    /// as it does for any forward-compat SessionEvent addition. A
+    /// dedicated forward-compat tolerance test (`jsonl_tolerates_
+    /// unknown_event_variant`) locks the documented behaviour so future
+    /// downgrades are a known failure mode, not a surprise.
+    ContractAmended {
+        contract_id: ContractId,
+        turn_id: TurnId,
+        delta: EffectBudgetDelta,
+        /// Chronon CP-1: wall-clock (RFC3339 UTC) of the amend grant.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        at: String,
+    },
 }
 
 /// Progress tally carried on each heartbeat. All fields are cumulative
@@ -360,7 +381,8 @@ impl SessionEvent {
             | SymbolResolved { turn_id, .. }
             | ImpactComputed { turn_id, .. }
             | EvalSampled { turn_id, .. }
-            | TurnHeartbeat { turn_id, .. } => Some(turn_id),
+            | TurnHeartbeat { turn_id, .. }
+            | ContractAmended { turn_id, .. } => Some(turn_id),
         }
     }
 
@@ -586,6 +608,50 @@ mod tests {
             }
             other => panic!("expected EvalSampled, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn contract_amended_round_trips_and_covers_turn_id_match() {
+        use crate::schemas::{ContractId, EffectBudgetDelta};
+        let ev = SessionEvent::ContractAmended {
+            contract_id: ContractId::from("ctr_amend".to_string()),
+            turn_id: TurnId::from("t_amend".to_string()),
+            delta: EffectBudgetDelta {
+                apply_local: 20,
+                apply_repo: 0,
+                network_reads: 0,
+            },
+            at: "2026-04-24T18:00:00Z".to_string(),
+        };
+        let s = serde_json::to_string(&ev).unwrap();
+        assert!(s.contains(r#""type":"contract_amended""#), "{s}");
+        assert!(s.contains(r#""apply_local":20"#), "{s}");
+        let back: SessionEvent = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, ev);
+        // Invariant #7 coverage: the new variant MUST be matched by
+        // turn_id() so projection code stays exhaustive.
+        assert_eq!(back.turn_id().map(|t| t.as_str()), Some("t_amend"));
+
+        // Forward-compat: a pre-CP-1 writer omitting `at` still deserialises.
+        let wire = r#"{
+            "type":"contract_amended",
+            "contract_id":"ctr_x",
+            "turn_id":"t_x",
+            "delta":{"apply_local":5,"apply_repo":0,"network_reads":0}
+        }"#;
+        let back2: SessionEvent = serde_json::from_str(wire).unwrap();
+        match back2 {
+            SessionEvent::ContractAmended { at, delta, .. } => {
+                assert!(at.is_empty());
+                assert_eq!(delta.apply_local, 5);
+            }
+            other => panic!("expected ContractAmended, got {other:?}"),
+        }
+
+        // ContractAmended is NOT a terminal marker — invariant #7
+        // (TurnStarted → exactly one of Committed/Aborted/Interrupted)
+        // must still hold.
+        assert!(!ev.is_terminal());
     }
 
     #[test]

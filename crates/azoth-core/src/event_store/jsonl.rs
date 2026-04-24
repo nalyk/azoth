@@ -552,6 +552,40 @@ impl JsonlReader {
         }))
     }
 
+    /// β: the accepted contract with every replayable `ContractAmended`
+    /// delta folded in. Returns `Ok(None)` if no contract was ever
+    /// accepted. This is the view a resuming driver should bind to its
+    /// `contract` field so budget checks start from the same effective
+    /// ceiling the prior session saw at its last committed turn.
+    ///
+    /// Only amends inside committed turns count (same rule as
+    /// `committed_run_progress`) — an amend whose turn later aborted is
+    /// forensic-only and must not influence the live ceiling.
+    ///
+    /// Amends are matched against the accepted contract by `contract_id`
+    /// so a mid-session `ContractAccepted` supersedes prior amends: a
+    /// fresh contract starts with its own budget, unaffected by amends
+    /// issued against the previous contract id.
+    pub fn last_effective_contract(
+        &self,
+    ) -> Result<Option<crate::schemas::Contract>, ProjectionError> {
+        let Some(mut contract) = self.last_accepted_contract()? else {
+            return Ok(None);
+        };
+        let replay = self.replayable()?;
+        let amends: Vec<crate::schemas::EffectBudgetDelta> = replay
+            .into_iter()
+            .filter_map(|ReplayableEvent(ev)| match ev {
+                SessionEvent::ContractAmended {
+                    contract_id, delta, ..
+                } if contract_id == contract.id => Some(delta),
+                _ => None,
+            })
+            .collect();
+        crate::contract::apply_amends(&mut contract, &amends);
+        Ok(Some(contract))
+    }
+
     /// Recompute `(EffectCounter, turns_completed)` from the replayable
     /// projection so a resuming worker can seed the contract gates exactly
     /// as if it had been the one driving the prior turns. Effects inside
@@ -590,6 +624,28 @@ impl JsonlReader {
         let mut turns_completed: u32 = 0;
         for ev in events {
             match ev {
+                // β: fold ContractAmended deltas into the ceiling-bonus
+                // fields and bump the run-scoped amend counter. Live
+                // driver bumps these same fields at grant time; replay
+                // must converge to the same effective ceiling or resume
+                // will misjudge whether the next tool call fits.
+                SessionEvent::ContractAmended { delta, .. } => {
+                    effects.apply_local_ceiling_bonus = effects
+                        .apply_local_ceiling_bonus
+                        .saturating_add(delta.apply_local);
+                    effects.apply_repo_ceiling_bonus = effects
+                        .apply_repo_ceiling_bonus
+                        .saturating_add(delta.apply_repo);
+                    effects.network_reads_ceiling_bonus = effects
+                        .network_reads_ceiling_bonus
+                        .saturating_add(delta.network_reads);
+                    effects.amends_this_run = effects.amends_this_run.saturating_add(1);
+                    // amends_this_turn intentionally NOT restored — it
+                    // is per-turn state that drive_turn resets on entry;
+                    // resuming is always the start of a fresh turn so
+                    // carrying a stale per-turn tally would double-count
+                    // brake pressure.
+                }
                 SessionEvent::EffectRecord { effect, .. } => match effect.class {
                     EffectClass::ApplyLocal => {
                         effects.apply_local = effects.apply_local.saturating_add(1);

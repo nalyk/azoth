@@ -2634,6 +2634,7 @@ mod tests {
             effect_class: azoth_core::schemas::EffectClass::ApplyLocal,
             summary: "write foo".into(),
             responder: tx,
+            budget_extension: None,
         });
         let taken = state.take_pending_approval();
         assert!(taken.is_some());

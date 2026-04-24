@@ -2,9 +2,22 @@
 //! "Authority Engine — hardcoded v1 policy".
 
 use super::{CapabilityStore, CapabilityToken};
-use crate::schemas::{ApprovalId, ApprovalScope, CapabilityTokenId, EffectClass};
+use crate::schemas::{ApprovalId, ApprovalScope, CapabilityTokenId, EffectClass, EffectCounter};
 
-/// Decision yielded by `AuthorityEngine::authorize`.
+/// β: ≤2 amend grants per open turn. Prevents a runaway "keep extending
+/// until the model stops" pattern within a single turn.
+pub const MAX_AMENDS_PER_TURN: u32 = 2;
+/// β: ≤6 amend grants per run. Prevents the same runaway pattern from
+/// being reset by turn boundaries.
+pub const MAX_AMENDS_PER_RUN: u32 = 6;
+/// β: proposed multiplier applied by the engine when offering a budget
+/// extension. The actually-applied delta is clamped to ≤current by
+/// `contract::apply_amend_clamped`, so the effective ceiling never more
+/// than doubles per grant regardless of what the engine proposes.
+pub const AMEND_PROPOSED_MULTIPLIER: u32 = 2;
+
+/// Decision yielded by `AuthorityEngine::authorize` and
+/// `AuthorityEngine::authorize_budget_extension`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthorityDecision {
     /// Execution may proceed without bothering the user.
@@ -19,7 +32,24 @@ pub enum AuthorityDecision {
         tool_name: String,
         effect_class: EffectClass,
     },
+    /// β: the contract's per-class effect budget has been exhausted and
+    /// the brakes allow offering the user a one-shot extension.
+    /// Distinct from `RequireApproval`: the grant here raises the
+    /// ceiling and emits `SessionEvent::ContractAmended`; per-tool
+    /// authorization still runs afterward.
+    RequireBudgetExtension {
+        approval_id: ApprovalId,
+        label: &'static str,
+        current: u32,
+        /// Engine's proposed new ceiling, always `current *
+        /// AMEND_PROPOSED_MULTIPLIER` in β. The UI shows this to the
+        /// user; `contract::apply_amend_clamped` enforces the cap on
+        /// commit.
+        proposed: u32,
+    },
     /// Effect class is not available in v1 — Tier C/D hook territory.
+    /// Also used by `authorize_budget_extension` to surface brake-
+    /// exceeded states (≤2/turn, ≤6/run) with a specific `hint`.
     NotAvailable { hint: &'static str },
 }
 
@@ -78,6 +108,43 @@ impl<'a> AuthorityEngine<'a> {
             | EffectClass::ApplyIrreversible => AuthorityDecision::NotAvailable {
                 hint: "scheduled for v2.5",
             },
+        }
+    }
+
+    /// β: check whether a budget-extension approval may be offered to
+    /// the user. Returns `RequireBudgetExtension` when the brakes are
+    /// clear; `NotAvailable { hint }` when either rate limit is hit.
+    /// The driver wires this in at the budget-overflow branch instead
+    /// of the bare abort.
+    ///
+    /// `counter` is read-only; incrementing `amends_this_turn` /
+    /// `amends_this_run` happens only AFTER the user grants — at which
+    /// point the driver also emits `ContractAmended` and bumps the
+    /// ceiling bonus.
+    pub fn authorize_budget_extension(
+        &self,
+        label: &'static str,
+        current: u32,
+        counter: &EffectCounter,
+    ) -> AuthorityDecision {
+        // Per-run brake checked first — hitting 6/run is the harder
+        // signal to cross and takes precedence over the softer
+        // per-turn limit for the error message.
+        if counter.amends_this_run >= MAX_AMENDS_PER_RUN {
+            return AuthorityDecision::NotAvailable {
+                hint: "amend rate limit exceeded: max 6 per run",
+            };
+        }
+        if counter.amends_this_turn >= MAX_AMENDS_PER_TURN {
+            return AuthorityDecision::NotAvailable {
+                hint: "amend rate limit exceeded: max 2 per turn",
+            };
+        }
+        AuthorityDecision::RequireBudgetExtension {
+            approval_id: ApprovalId::new(),
+            label,
+            current,
+            proposed: current.saturating_mul(AMEND_PROPOSED_MULTIPLIER),
         }
     }
 }

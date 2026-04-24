@@ -133,6 +133,7 @@ async fn bare_bash_read_only_does_not_bump_budget() {
         apply_local: 1,
         apply_repo: 0,
         network_reads: 0,
+        ..Default::default()
     };
 
     {

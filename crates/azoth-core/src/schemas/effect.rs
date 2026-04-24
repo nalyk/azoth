@@ -59,11 +59,39 @@ impl EffectClass {
 /// would be exceeded. On resume the worker recomputes this from the
 /// replayable JSONL projection (see
 /// [`JsonlReader::committed_run_progress`]); fresh sessions start at zero.
+///
+/// β: the three `*_ceiling_bonus` fields accumulate every granted
+/// `ContractAmended` delta, so the driver's budget check reads the
+/// effective ceiling as `contract.effect_budget.max_X + apply_X_ceiling_bonus`
+/// without mutating the base `Contract` object through its shared reference.
+/// JSONL replay rebuilds the bonuses the same way it rebuilds the
+/// consumption tallies (see `committed_run_progress`) so resume observes
+/// the same effective ceiling the live turn did.
+///
+/// `amends_this_turn` is reset to 0 each time `TurnDriver::drive_turn`
+/// enters; `amends_this_run` is never reset (brake: ≤6 per run).
+/// Kept `Copy` by staying all-u32 — so every existing test constructing
+/// an `EffectCounter` by field literal keeps compiling via
+/// `..Default::default()`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct EffectCounter {
     pub apply_local: u32,
     pub apply_repo: u32,
     pub network_reads: u32,
+    /// β: accumulated `apply_local` delta from granted amends, folded
+    /// additively into the effective ceiling.
+    pub apply_local_ceiling_bonus: u32,
+    /// β: accumulated `apply_repo` delta from granted amends.
+    pub apply_repo_ceiling_bonus: u32,
+    /// β: accumulated `network_reads` delta from granted amends.
+    pub network_reads_ceiling_bonus: u32,
+    /// β: amend grants observed in the currently-open turn. Reset to 0
+    /// at drive_turn entry. Drives the ≤2-per-turn brake in
+    /// `AuthorityEngine::authorize_budget_extension`.
+    pub amends_this_turn: u32,
+    /// β: amend grants observed over the whole run. Never reset.
+    /// Drives the ≤6-per-run brake.
+    pub amends_this_run: u32,
 }
 
 /// One recorded effect against the world. Emitted on every tool dispatch.

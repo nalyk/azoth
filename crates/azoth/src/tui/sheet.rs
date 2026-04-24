@@ -64,15 +64,33 @@ pub fn render(
 
     f.render_widget(Clear, rect);
 
-    let effect_label = format!("{:?}", req.effect_class).to_lowercase();
-    let title = Line::from(vec![
-        Span::styled(" approve · ", theme.bold()),
-        Span::styled(effect_label.clone(), theme.ink(Colors::AMBER)),
-        Span::styled(
-            format!(" · {} ", truncate_for_title(&req.summary, 48)),
-            theme.dim(),
-        ),
-    ]);
+    // β: budget-extension approvals get a distinct title so the user
+    // can tell at a glance this is a ceiling raise, not a per-tool
+    // authorization. The summary the driver already formatted
+    // (`extend apply_local: 20 → 40`) supplies the numbers.
+    let title = if let Some(ext) = &req.budget_extension {
+        // `ext.label` is `&'static str` — Span::styled takes
+        // `Into<Cow<'a, str>>` so we can pass it directly without a
+        // per-render alloc (CLAUDE.md: Static-str → Span::styled rule).
+        Line::from(vec![
+            Span::styled(" extend budget · ", theme.bold()),
+            Span::styled(ext.label, theme.ink(Colors::AMBER)),
+            Span::styled(
+                format!(" · {} → {} ", ext.current, ext.proposed),
+                theme.ink(Colors::AMBER).add_modifier(Modifier::BOLD),
+            ),
+        ])
+    } else {
+        let effect_label = format!("{:?}", req.effect_class).to_lowercase();
+        Line::from(vec![
+            Span::styled(" approve · ", theme.bold()),
+            Span::styled(effect_label.clone(), theme.ink(Colors::AMBER)),
+            Span::styled(
+                format!(" · {} ", truncate_for_title(&req.summary, 48)),
+                theme.dim(),
+            ),
+        ])
+    };
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -197,6 +215,38 @@ use super::util::truncate as truncate_for_title;
 fn effect_preview(req: &ApprovalRequestMsg) -> Vec<Line<'static>> {
     let mut out = Vec::new();
     let theme = Theme { unicode: true };
+
+    // β: budget-extension approvals replace the per-tool body with a
+    // compact "ceiling raise" explainer. The driver has already written
+    // `extend apply_local: 20 → 40` as the summary; we add context
+    // about what an amend actually does (raises the ceiling; does NOT
+    // pre-authorize the specific tool).
+    if let Some(ext) = &req.budget_extension {
+        let headline = format!(
+            "raise {} ceiling: {} → {}",
+            ext.label, ext.current, ext.proposed
+        );
+        out.push(Line::from(Span::styled(
+            headline,
+            theme.ink(Colors::AMBER).add_modifier(Modifier::BOLD),
+        )));
+        out.push(Line::from(""));
+        out.push(Line::from(Span::styled(
+            "granting raises the effective ceiling only;".to_string(),
+            theme.italic_dim(),
+        )));
+        out.push(Line::from(Span::styled(
+            "the specific tool still asks for its own approval.".to_string(),
+            theme.italic_dim(),
+        )));
+        out.push(Line::from(""));
+        out.push(Line::from(Span::styled(
+            format!("next tool: {}", req.tool_name),
+            theme.ink(Colors::INK_1),
+        )));
+        return out;
+    }
+
     // The summary string is already formatted by the authority engine;
     // we render it verbatim as the sheet body, line-by-line. When the
     // tool is `fs_write` we add a "diff preview unavailable in v1"
@@ -241,6 +291,7 @@ mod tests {
             effect_class: EffectClass::ApplyLocal,
             summary: "write 42 bytes to src/foo.rs".into(),
             responder: tx,
+            budget_extension: None,
         }
     }
 

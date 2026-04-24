@@ -1,0 +1,251 @@
+//! β: invariant #7 (turn-scoped atomicity) survives the amend path.
+//!
+//! Scenario: budget seeded AT the ceiling for `apply_local = 1`. The
+//! responder grants BOTH the budget extension AND the per-tool
+//! approval. The fs_write then succeeds, the turn commits, and the
+//! JSONL log contains exactly one terminal marker for this turn
+//! (TurnCommitted), a `ContractAmended` event sitting strictly between
+//! TurnStarted and TurnCommitted, and the expected EffectRecord +
+//! ToolResult after the amend.
+
+use azoth_core::adapter::{MockAdapter, MockScript, ProviderProfile};
+use azoth_core::artifacts::ArtifactStore;
+use azoth_core::authority::{ApprovalRequestMsg, ApprovalResponse, CapabilityStore};
+use azoth_core::contract;
+use azoth_core::event_store::JsonlWriter;
+use azoth_core::execution::{ExecutionContext, ToolDispatcher};
+use azoth_core::schemas::{
+    ApprovalScope, CommitOutcome, ContentBlock, Contract, EffectClass, EffectCounter, Message,
+    ModelTurnResponse, RunId, SessionEvent, StopReason, ToolUseId, TurnId, Usage,
+};
+use azoth_core::tools::FsWriteTool;
+use azoth_core::turn::TurnDriver;
+use tempfile::tempdir;
+use tokio::sync::mpsc;
+
+fn one_fs_write_then_end() -> MockScript {
+    MockScript {
+        turns: vec![
+            ModelTurnResponse {
+                content: vec![ContentBlock::ToolUse {
+                    id: ToolUseId::new(),
+                    name: "fs_write".into(),
+                    input: serde_json::json!({
+                        "path": ".azoth/tmp/amend_ok.txt",
+                        "contents": "written after amend",
+                    }),
+                    call_group: None,
+                }],
+                stop_reason: StopReason::ToolUse,
+                usage: Usage {
+                    input_tokens: 5,
+                    output_tokens: 2,
+                    ..Default::default()
+                },
+            },
+            ModelTurnResponse {
+                content: vec![ContentBlock::Text {
+                    text: "wrote it".into(),
+                }],
+                stop_reason: StopReason::EndTurn,
+                usage: Usage {
+                    input_tokens: 3,
+                    output_tokens: 1,
+                    ..Default::default()
+                },
+            },
+        ],
+    }
+}
+
+fn budget_1_contract(goal: &str) -> Contract {
+    let mut c = contract::draft(goal);
+    c.success_criteria.push("amend lets it through".into());
+    c.effect_budget.max_apply_local = 1;
+    c
+}
+
+#[tokio::test]
+async fn amend_grant_preserves_single_terminal_marker_and_ordering() {
+    let dir = tempdir().unwrap();
+    let repo_root = tokio::fs::canonicalize(dir.path()).await.unwrap();
+    let session_path = repo_root.join(".azoth/sessions/run_amend.jsonl");
+    let artifacts_root = repo_root.join(".azoth/artifacts");
+
+    let mut writer = JsonlWriter::open(&session_path).unwrap();
+    let (tap_tx, mut tap_rx) = mpsc::unbounded_channel::<SessionEvent>();
+    writer.set_tap(tap_tx);
+
+    let artifacts = ArtifactStore::open(&artifacts_root).unwrap();
+    let mut dispatcher = ToolDispatcher::new();
+    dispatcher.register(FsWriteTool);
+
+    let adapter = MockAdapter::new(
+        ProviderProfile::anthropic_default("claude-sonnet-4-6"),
+        one_fs_write_then_end(),
+    );
+
+    let contract_val = budget_1_contract("atomicity under amend");
+    let contract_id = contract_val.id.clone();
+    let run_id = RunId::from("run_amend".to_string());
+    let turn_id = TurnId::from("t_amend_1".to_string());
+    let ctx = ExecutionContext::builder(
+        run_id.clone(),
+        turn_id.clone(),
+        artifacts,
+        repo_root.clone(),
+    )
+    .build();
+
+    // Grant-everything responder: both budget_extension and the
+    // subsequent per-tool approval come through this bridge.
+    let (approval_tx, mut approval_rx) = mpsc::channel::<ApprovalRequestMsg>(8);
+    let responder = tokio::spawn(async move {
+        while let Some(req) = approval_rx.recv().await {
+            let _ = req.responder.send(ApprovalResponse::Grant {
+                scope: ApprovalScope::Session,
+            });
+        }
+    });
+
+    let mut caps = CapabilityStore::new();
+    // Seed the counter AT the cap so the first fs_write hits the
+    // budget-overflow branch.
+    let mut effects = EffectCounter {
+        apply_local: 1,
+        ..Default::default()
+    };
+
+    {
+        let mut driver = TurnDriver {
+            run_id: run_id.clone(),
+            adapter: &adapter,
+            dispatcher: &dispatcher,
+            writer: &mut writer,
+            ctx: &ctx,
+            capabilities: &mut caps,
+            approval_bridge: approval_tx,
+            contract: Some(&contract_val),
+            turns_completed: 0,
+            run_started_tokio: None,
+            kernel: None,
+            validators: &[],
+            effects_consumed: &mut effects,
+            evidence_collector: None,
+            impact_validators: &[],
+            diff_source: None,
+        };
+        driver
+            .drive_turn(
+                turn_id.clone(),
+                "system".into(),
+                vec![Message::user_text("write past the cap")],
+            )
+            .await
+            .expect("amend+write returns Ok");
+    }
+    drop(writer);
+    responder.abort();
+
+    let mut events = Vec::new();
+    while let Ok(ev) = tap_rx.try_recv() {
+        events.push(ev);
+    }
+
+    // Invariant #7: exactly one terminal marker for this turn.
+    let terminals: Vec<_> = events
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                SessionEvent::TurnCommitted { .. }
+                    | SessionEvent::TurnAborted { .. }
+                    | SessionEvent::TurnInterrupted { .. }
+            )
+        })
+        .collect();
+    assert_eq!(
+        terminals.len(),
+        1,
+        "amend must not split the turn or double-terminate; got: {terminals:#?}"
+    );
+    assert!(
+        matches!(
+            terminals[0],
+            SessionEvent::TurnCommitted {
+                outcome: CommitOutcome::Success,
+                ..
+            }
+        ),
+        "expected TurnCommitted(Success) after amend+grant+write, got {:?}",
+        terminals[0]
+    );
+
+    // ContractAmended lands strictly between TurnStarted and the
+    // terminal marker. Positional check: find indices and compare.
+    let turn_started_idx = events
+        .iter()
+        .position(|e| matches!(e, SessionEvent::TurnStarted { .. }))
+        .expect("TurnStarted present");
+    let amend_idx = events
+        .iter()
+        .position(|e| matches!(e, SessionEvent::ContractAmended { .. }))
+        .expect("ContractAmended present");
+    let terminal_idx = events
+        .iter()
+        .position(|e| {
+            matches!(
+                e,
+                SessionEvent::TurnCommitted { .. }
+                    | SessionEvent::TurnAborted { .. }
+                    | SessionEvent::TurnInterrupted { .. }
+            )
+        })
+        .expect("terminal present");
+    assert!(
+        turn_started_idx < amend_idx && amend_idx < terminal_idx,
+        "ContractAmended must land between TurnStarted and terminal: \
+         got turn_started={turn_started_idx} amend={amend_idx} terminal={terminal_idx}"
+    );
+
+    // Amend event carries the right contract id and a nonzero delta.
+    let (c_id, delta) = events
+        .iter()
+        .find_map(|e| match e {
+            SessionEvent::ContractAmended {
+                contract_id, delta, ..
+            } => Some((contract_id.clone(), delta.clone())),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(c_id, contract_id);
+    assert_eq!(
+        delta.apply_local, 1,
+        "β proposes delta=current; current was 1 so delta=1"
+    );
+
+    // Counter state AFTER the turn: 2 effects consumed (pre-seeded 1 +
+    // the one that succeeded after amend), 1 amend this run, 0 per
+    // turn (drive_turn resets on entry, then the grant bumped it to 1;
+    // check total reached ≥1 via amends_this_run).
+    assert_eq!(
+        effects.apply_local, 2,
+        "pre-seeded 1 + 1 post-amend write = 2"
+    );
+    assert_eq!(effects.apply_local_ceiling_bonus, 1);
+    assert_eq!(effects.amends_this_run, 1);
+    assert_eq!(
+        effects.amends_this_turn, 1,
+        "one grant observed in this turn"
+    );
+
+    // A successful tool dispatch followed the amend (EffectRecord +
+    // ToolResult). Order check not strict — the amend flow only cares
+    // that the per-tool happy path ran after the ceiling raise.
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, SessionEvent::EffectRecord { effect, .. } if effect.class == EffectClass::ApplyLocal)));
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, SessionEvent::ToolResult { .. })));
+}
