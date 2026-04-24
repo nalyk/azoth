@@ -39,7 +39,9 @@ pub fn built_in_profiles() -> Vec<ProfileEntry> {
             model_id: "nalyk-qwen35-opus-9b".into(),
             api_key_env: None,
             tokenizer_family: TokenizerFamily::SentencepieceLlama,
-            max_context_tokens: 32_768,
+            // F3 2026-04-24: see adapter/profile.rs::ollama_anthropic —
+            // 32_768 was saturating after 3 retrieval turns.
+            max_context_tokens: 131_072,
             max_output_tokens: 8_192,
         },
         ProfileEntry {
@@ -49,7 +51,8 @@ pub fn built_in_profiles() -> Vec<ProfileEntry> {
             model_id: "nalyk-qwen35-opus-9b".into(),
             api_key_env: None,
             tokenizer_family: TokenizerFamily::SentencepieceLlama,
-            max_context_tokens: 32_768,
+            // F3 2026-04-24: same rationale.
+            max_context_tokens: 131_072,
             max_output_tokens: 8_192,
         },
         ProfileEntry {
