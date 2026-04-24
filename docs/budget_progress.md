@@ -1,7 +1,7 @@
 # Budget Plan — Progress Tracker
 
-**Current sequence:** β (in-flight on branch `feat/budget-beta-amend`)
-**Last updated:** 2026-04-24 after β.R0 build
+**Current sequence:** γ (blocked on user `/new` per sprint-gate-handoff)
+**Last updated:** 2026-04-24 after β merge
 **Plan reference:** [`docs/budget_plan.md`](./budget_plan.md)
 
 ---
@@ -92,10 +92,10 @@ Forbidden metachars in `has_forbidden_metachar`: `; | & > < \` $ ( ) \ \n \t \r 
 
 ## Sprint β — Contract amend via approval
 
-**Status:** in-flight (R0 built; awaiting user push consent)
-**Branch:** `feat/budget-beta-amend`
-**PR:** _(link when pushed)_
-**Merged at:** _(commit SHA + date)_
+**Status:** MERGED
+**Branch:** `feat/budget-beta-amend` (deleted on merge)
+**PR:** [#31](https://github.com/nalyk/azoth/pull/31)
+**Merged at:** `2d5971c` on 2026-04-24T16:17:50Z (squash of R0–R5, 6 rounds, ~18 bot findings addressed)
 
 ### Subtasks
 
@@ -136,6 +136,8 @@ Forbidden metachars in `has_forbidden_metachar`: `; | & > < \` $ ( ) \ \n \t \r 
 - [ ] PR merged
 
 ### Session log
+
+- **2026-04-24 β merge** — PR #31 squashed to main as `2d5971c` at 16:17:50Z. Branch `feat/budget-beta-amend` deleted on merge. 6 rounds R0–R5 total, ~18 bot findings addressed (applied / moot / declined-with-docs). Post-merge dogfood forensic survey of 55 session JSONLs: 0 ContractAmended events ever (β mechanism untested in real wild); session 13:06 confirmed β's target class (pre-β binary hit 20/20 on shell-pipe reads); session 17:51 hit context_overflow 45k/32k on ollama-qwen-anthropic 32k profile (orthogonal to β). γ blocked on user `/new` per sprint-gate-handoff rule.
 
 - **2026-04-24 β.R5** — addressed 3 R4 findings (1 class bug, 2 surfaces caught by gemini MED + codex P1 ×2). My R4 `reset_for_new_contract` zeroed `amends_this_run` — contradicting my own R2 fix that explicitly preserves it across `ContractAccepted` in `fold_progress` to prevent per-run brake bypass via contract cycling. Both bots caught the self-contradiction independently. Removed the zeroing; method now only clears the three `*_ceiling_bonus` fields. Updated unit test to assert `amends_this_run` survives the reset. Second codex P1 (turn/mod.rs:912) pointed out that `/contract <goal>` IS a real mid-session replacement path in the TUI — my R4 claim "β doesn't support mid-session replacement" was FALSE. Hooked `effects_consumed.reset_for_new_contract()` in app.rs at both `accept_and_persist` sites (the explicit `/contract` path at line 2002 and the auto-draft fallback at line 2106). Fixed the doc comment on the method to reflect the actual wire-up and correct the wrong scope claim. 835/0 (unit test count unchanged; behaviour change only).
 
