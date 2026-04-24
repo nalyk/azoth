@@ -60,20 +60,19 @@ const READ_ONLY_COMMANDS: &[&str] = &[
     // POSIX read-only core. Entries here must be read-only under
     // EVERY argv combination the classifier will accept.
     //
-    // gemini R0 HIGH (2026-04-24) removed `find` and `env`:
-    // `find -exec`, `find -delete`, `find -fprintf`, and
-    // `env VAR=val cmd` all let the model run arbitrary commands
-    // or write files.
-    //
-    // codex R1 P1 (2026-04-24) removed `xxd`: the `-r` reverse
-    // mode converts a hex dump to binary and writes the output
-    // file (`xxd -r dump.hex target.bin`). Any allowlist entry
-    // with a write mode, even one behind a single flag, is unsafe
-    // to keep unconditionally.
+    // Removals across R1–R3 (gemini + codex found the class bug,
+    // I fixed each occurrence):
+    //   - R1: `find` (`-exec` / `-delete` / `-fprintf`), `env`
+    //     (`env VAR=val cmd` runs arbitrary command).
+    //   - R2: `xxd` (`-r` reverse mode writes binary).
+    //   - R3: `date` (`-s STRING` sets system time under root /
+    //     CAP_SYS_TIME; bypass is environment-dependent but still
+    //     a budget escape on elevated sandbox tiers).
     //
     // The false-UPGRADE on legitimate read-only use (bare
-    // `find . -name x`, `xxd file`) is acceptable per the safety
-    // model comment at the top of this file.
+    // `date`, `xxd file`, `find . -name x`) is acceptable per the
+    // safety model at the top of this file — cost/UX bug, not a
+    // safety bug.
     "grep",
     "rg",
     "ls",
@@ -89,7 +88,6 @@ const READ_ONLY_COMMANDS: &[&str] = &[
     "sha256sum",
     "md5sum",
     "od",
-    "date",
     "pwd",
     "test",
     "true",
@@ -123,11 +121,20 @@ const GIT_READ_ONLY_SUBCOMMANDS: &[&str] = &[
     "ls-tree",
 ];
 
-/// `cargo` subcommands that read without building a writable
-/// artifact in the repo tree. (`cargo check` writes target/ — but
-/// target/ is gitignored scratch and doesn't mutate the repo from
-/// the model's perspective; the user's build cache is fair game.)
-const CARGO_READ_ONLY_SUBCOMMANDS: &[&str] = &["check", "metadata", "tree", "version"];
+// `cargo` has NO read-only subcommand allowlist in R3. codex R2
+// P1 (PR #30, 2026-04-24) flagged `cargo check --target-dir <DIR>`
+// as a write escape — `--target-dir` lets the model point the
+// compiler's artifact output at ANY writable path, and neither the
+// static effect_class nor the Observe budget catch it. Plain
+// `cargo metadata` / `cargo tree` can also rewrite `Cargo.lock` in
+// an unlocked workspace. Same class of bug as `find -exec`,
+// `env VAR=val cmd`, `xxd -r`, and `date -s` — one flag flips the
+// tool from read to write. Per this file's safety model, I remove
+// the entry rather than maintain a per-flag denylist: bare `cargo
+// check` now counts as ApplyLocal (false-UPGRADE, cost/UX bug not
+// a safety bug). If a later sprint decides the UX tax is too high,
+// restore a targeted allowlist that scans for `--target-dir`,
+// `--offline`, and the locked-invariant family.
 
 /// Bytes that force an immediate `ApplyLocal` fallback — the presence
 /// of any one of these in the raw command string means the classifier
@@ -275,15 +282,6 @@ pub fn classify_bash_command(cmd: &str) -> EffectClass {
             }
             EffectClass::ApplyLocal
         }
-        "cargo" => {
-            let Some((sub, _)) = rest.split_first() else {
-                return EffectClass::Observe;
-            };
-            if CARGO_READ_ONLY_SUBCOMMANDS.contains(sub) {
-                return EffectClass::Observe;
-            }
-            EffectClass::ApplyLocal
-        }
         "rustc" => {
             // `rustc --version` is read-only. `rustc <srcfile>`
             // compiles. Require an explicit `--version`.
@@ -382,6 +380,20 @@ mod tests {
     }
 
     #[test]
+    fn date_classifies_as_apply_local_after_r3_codex_p2() {
+        // codex R2 P2 (PR #30, 2026-04-24): `date -s STRING` /
+        // `date --set=STRING` sets system time (requires root /
+        // CAP_SYS_TIME, but the sandbox may allow it on elevated
+        // tiers). Removed from READ_ONLY_COMMANDS to close the
+        // budget escape; bare `date +%Y` now falls through to
+        // ApplyLocal.
+        assert_apply_local("date");
+        assert_apply_local("date +%Y-%m-%d");
+        assert_apply_local("date -s 2020-01-01");
+        assert_apply_local("date --set=2020-01-01");
+    }
+
+    #[test]
     fn leading_and_trailing_whitespace_is_tolerated() {
         assert_observe("   grep foo");
         assert_observe("ls   ");
@@ -461,10 +473,14 @@ mod tests {
     }
 
     #[test]
-    fn bare_git_and_cargo_classify_as_observe() {
-        // Bare `git` / `cargo` print usage — read-only.
+    fn bare_git_classifies_as_observe_after_r3_cargo_removal() {
+        // Bare `git` prints usage — still read-only.
         assert_observe("git");
-        assert_observe("cargo");
+        // Bare `cargo` used to print usage → Observe in R0–R2.
+        // R3 removed the cargo subcommand allowlist entirely
+        // (codex R2 P1 on `cargo check --target-dir`), so cargo
+        // now falls through to ApplyLocal.
+        assert_apply_local("cargo");
     }
 
     #[test]
@@ -476,15 +492,18 @@ mod tests {
     }
 
     #[test]
-    fn cargo_read_only_subcommands_classify_as_observe() {
-        assert_observe("cargo check");
-        assert_observe("cargo metadata --format-version 1");
-        assert_observe("cargo tree");
-        assert_observe("cargo version");
-    }
-
-    #[test]
-    fn cargo_write_subcommands_classify_as_apply_local() {
+    fn cargo_all_subcommands_classify_as_apply_local_after_r3() {
+        // codex R2 P1 (PR #30, 2026-04-24): `cargo check
+        // --target-dir <DIR>` writes artifacts to any path, and
+        // `cargo metadata` / `cargo tree` can update Cargo.lock
+        // in an unlocked workspace. Removed the cargo subcommand
+        // allowlist entirely in R3; cargo falls through to
+        // ApplyLocal via unknown-argv0 on every invocation.
+        assert_apply_local("cargo check");
+        assert_apply_local("cargo check --target-dir /tmp/evil");
+        assert_apply_local("cargo metadata --format-version 1");
+        assert_apply_local("cargo tree");
+        assert_apply_local("cargo version");
         assert_apply_local("cargo build");
         assert_apply_local("cargo test");
         assert_apply_local("cargo run");

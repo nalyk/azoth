@@ -816,6 +816,15 @@ impl<'a> TurnDriver<'a> {
                             // worst-case jail. See
                             // `tools/bash/classifier.rs` and
                             // `docs/budget_plan.md` § α.
+                            //
+                            // Unknown-tool fallback: ApplyLocal, not
+                            // Observe (gemini R2 MED on PR #30,
+                            // 2026-04-24). Hallucinated tool names
+                            // should pay the worst-case budget cost
+                            // so a model spamming non-existent tools
+                            // hits the wall instead of chewing
+                            // through turns at zero tax. `ToolError::
+                            // Unknown` still surfaces on dispatch.
                             let effect_class = self
                                 .dispatcher
                                 .tool(name)
@@ -823,7 +832,7 @@ impl<'a> TurnDriver<'a> {
                                     t.effect_class_for(input)
                                         .unwrap_or_else(|| t.effect_class())
                                 })
-                                .unwrap_or(EffectClass::Observe);
+                                .unwrap_or(EffectClass::ApplyLocal);
 
                             let path_hint = input.get("path").and_then(|v| v.as_str());
 

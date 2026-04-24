@@ -172,6 +172,34 @@ fn cargo_writes_are_apply_local() {
 }
 
 #[test]
+fn cargo_reads_are_apply_local_after_r3_codex_p1() {
+    // codex R2 P1 (PR #30, 2026-04-24): `cargo check --target-dir
+    // <DIR>` writes artifacts anywhere; `cargo metadata` / `cargo
+    // tree` can rewrite Cargo.lock in an unlocked workspace.
+    // Removed cargo subcommand allowlist entirely in R3; all
+    // cargo invocations now classify ApplyLocal.
+    assert_apply_local("cargo");
+    assert_apply_local("cargo check");
+    assert_apply_local("cargo check --target-dir /tmp/evil");
+    assert_apply_local("cargo metadata --format-version 1");
+    assert_apply_local("cargo tree");
+    assert_apply_local("cargo version");
+}
+
+#[test]
+fn date_is_apply_local_after_r3_codex_p2() {
+    // codex R2 P2 (PR #30, 2026-04-24): `date -s STRING` and
+    // `date --set=STRING` set system time. Bypass is environment-
+    // dependent (needs root / CAP_SYS_TIME) but still a budget
+    // escape on elevated sandbox tiers. Removed from
+    // READ_ONLY_COMMANDS.
+    assert_apply_local("date");
+    assert_apply_local("date +%Y-%m-%d");
+    assert_apply_local("date -s 2020-01-01");
+    assert_apply_local("date --set=2020-01-01");
+}
+
+#[test]
 fn empty_and_whitespace_are_apply_local() {
     assert_apply_local("");
     assert_apply_local(" ");
@@ -194,8 +222,8 @@ fn bare_allowlist_positives_survive_the_gauntlet() {
     assert_observe("git status");
     assert_observe("git diff main..HEAD");
     assert_observe("git config --get user.email");
-    assert_observe("cargo check");
-    assert_observe("cargo metadata --format-version 1");
+    // `cargo <anything>` is ApplyLocal after R3 (codex R2 P1 on
+    // --target-dir); see `cargo_reads_are_apply_local_after_r3_codex_p1`.
     assert_observe("rustc --version");
 }
 
