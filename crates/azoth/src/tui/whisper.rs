@@ -56,21 +56,26 @@ impl Whisper {
     /// 2. narration — the worker is actively doing something.
     /// 3. the most recent note (if <5s old).
     /// 4. zero-state hint.
-    pub fn render_line(
-        &self,
+    ///
+    /// Returns `Line<'a>` with `'a` bound to the shorter of `self` and
+    /// the optional `&'a ApprovalRequestMsg`. R2-2 gemini MED on PR #33
+    /// 2026-04-24: before the lifetime change, `req.tool_name.clone()`
+    /// produced a per-frame String allocation while the approval sheet
+    /// was up (PAPER R24/R26 violation). Borrowing instead of cloning
+    /// drops that alloc entirely — the returned line lives only as
+    /// long as the Paragraph it feeds, which ratatui renders and drops
+    /// within the same frame.
+    pub fn render_line<'a>(
+        &'a self,
         theme: &Theme,
-        latest_note: Option<&Note>,
-        pending_approval: Option<&azoth_core::authority::ApprovalRequestMsg>,
-    ) -> Line<'static> {
+        latest_note: Option<&'a Note>,
+        pending_approval: Option<&'a azoth_core::authority::ApprovalRequestMsg>,
+    ) -> Line<'a> {
         if let Some(req) = pending_approval {
-            // R1 gemini MED on PR #33 (PAPER R24/R26): avoid heap
-            // churn at 60fps. `effect_class.to_string()` + `format!`
-            // allocated two Strings per frame while the sheet was up.
-            // Splitting into borrowed spans drops both allocations —
-            // `as_snake()` returns `&'static str`, the tool name only
-            // needs a single Cow::Owned clone (field-owned String
-            // that outlives the borrow; same pattern used elsewhere
-            // per CLAUDE.md R24 sweep rule).
+            // R1 gemini MED (F1 fix): avoid heap churn at 60fps.
+            // `effect_class.as_snake()` is `&'static str`; the tool
+            // name is borrowed from the in-memory ApprovalRequestMsg
+            // via this function's 'a lifetime.
             let cls: &'static str = req.effect_class.as_snake();
             return Line::from(vec![
                 Span::raw("      "),
@@ -80,7 +85,7 @@ impl Whisper {
                 Span::raw(" "),
                 Span::styled("awaiting approval", theme.bold()),
                 Span::styled(" · ", theme.italic_dim()),
-                Span::styled(req.tool_name.clone(), theme.italic_dim()),
+                Span::styled(req.tool_name.as_str(), theme.italic_dim()),
                 Span::styled(" → ", theme.italic_dim()),
                 Span::styled(cls, theme.italic_dim()),
             ]);
@@ -95,7 +100,14 @@ impl Whisper {
                 Span::raw(" "),
                 Span::styled("azoth", theme.bold()),
                 Span::raw(" "),
-                Span::styled(text.clone(), theme.italic_dim()),
+                // R2-2: borrow from self.narration instead of cloning.
+                // `text` is `&'a String` (deref-coerces to `&'a str`)
+                // and 'a outlives the returned Line.
+                Span::styled(text.as_str(), theme.italic_dim()),
+                // Format string below is unavoidable — the f32 changes
+                // every frame, nothing to borrow from. One alloc per
+                // tick while narrating, which is intrinsic to "X.Ys"
+                // labels.
                 Span::styled(format!(" · {elapsed_f:.1}s"), theme.dim()),
             ]);
         }
@@ -112,7 +124,8 @@ impl Whisper {
                     Span::raw("      "),
                     Span::styled(prefix, style),
                     Span::raw(" "),
-                    Span::styled(note.text.clone(), theme.italic_dim()),
+                    // R2-2: borrow note.text via 'a — no clone.
+                    Span::styled(note.text.as_str(), theme.italic_dim()),
                 ]);
             }
         }
@@ -135,7 +148,7 @@ mod tests {
     use azoth_core::schemas::{ApprovalId, EffectClass, TurnId};
     use tokio::sync::oneshot;
 
-    fn flatten(line: &Line<'static>) -> String {
+    fn flatten<'a>(line: &Line<'a>) -> String {
         line.spans.iter().map(|s| s.content.as_ref()).collect()
     }
 
