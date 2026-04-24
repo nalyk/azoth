@@ -1107,14 +1107,6 @@ impl AppState {
     /// prominently; internal lifecycle events are suppressed or shown as
     /// compact one-liners so the conversation is readable.
     pub fn handle_session_event(&mut self, ev: SessionEvent) {
-        // F4 helper: parse a Chronon CP-1 RFC3339 string into SystemTime.
-        // Returns None on malformed input (pre-CP-1 sessions use None
-        // for `at`; we also defensively handle any future garbled value).
-        fn parse_rfc3339_to_system_time(s: &str) -> Option<std::time::SystemTime> {
-            time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339)
-                .ok()
-                .map(std::time::SystemTime::from)
-        }
         match ev {
             SessionEvent::ContractAccepted { contract, .. } => {
                 let goal = contract.goal.clone();
@@ -1727,6 +1719,20 @@ impl Drop for ActiveCancelGuard {
 /// `docs/draft_plan.md §Resume and session lifecycle` spec calls for
 /// contract id, last checkpoint id, and (committed, interrupted) counts.
 /// A pure function so we can test the formatting without booting a worker.
+/// Parse a Chronon CP-1 RFC3339 timestamp string into `SystemTime`.
+/// Returns `None` on malformed input (pre-CP-1 sessions carry `None`
+/// for `at` and legacy forward-compat replay must not panic).
+///
+/// R2-1 gemini MED on PR #33 2026-04-24: was a nested fn inside
+/// `handle_session_event`, logically re-defined on every event. Now a
+/// plain module-level helper — every match arm that needs it imports
+/// nothing, just calls it directly.
+fn parse_rfc3339_to_system_time(s: &str) -> Option<std::time::SystemTime> {
+    time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339)
+        .ok()
+        .map(std::time::SystemTime::from)
+}
+
 pub(crate) fn resume_summary(
     resuming: bool,
     as_of: Option<&str>,
