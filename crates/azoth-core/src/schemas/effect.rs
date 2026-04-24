@@ -99,7 +99,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn reset_for_new_contract_zeroes_bonus_and_run_amends_only() {
+    fn reset_for_new_contract_zeroes_bonus_only() {
         let mut c = EffectCounter {
             apply_local: 17,
             apply_repo: 4,
@@ -111,13 +111,20 @@ mod tests {
             amends_this_run: 5,
         };
         c.reset_for_new_contract();
-        // Zeroed: the contract-scoped amend state.
+        // Zeroed: the contract-scoped ceiling bonuses.
         assert_eq!(c.apply_local_ceiling_bonus, 0);
         assert_eq!(c.apply_repo_ceiling_bonus, 0);
         assert_eq!(c.network_reads_ceiling_bonus, 0);
-        assert_eq!(c.amends_this_run, 0);
-        // Preserved: effect tallies + per-turn counter (drive_turn
-        // handles amends_this_turn via its own reset on entry).
+        // Preserved: run-scoped brake counter — R5 fix. Resetting
+        // amends_this_run here would let a user bypass
+        // MAX_AMENDS_PER_RUN by cycling contracts in a single run.
+        assert_eq!(
+            c.amends_this_run, 5,
+            "run-scope brake MUST survive contract replacement"
+        );
+        // Preserved: effect tallies (pre-β scope) + per-turn counter
+        // (drive_turn handles amends_this_turn via its own reset on
+        // entry).
         assert_eq!(c.apply_local, 17);
         assert_eq!(c.apply_repo, 4);
         assert_eq!(c.network_reads, 2);
@@ -126,35 +133,42 @@ mod tests {
 }
 
 impl EffectCounter {
-    /// R4 (PR #31 codex P1): clear contract-scoped amend state that
-    /// must NOT leak across a mid-session `ContractAccepted`. Zeros
-    /// the three `*_ceiling_bonus` fields and `amends_this_run`; the
-    /// effect-count tallies (`apply_local`, `apply_repo`,
-    /// `network_reads`) and per-turn amend counter
-    /// (`amends_this_turn`, reset on `drive_turn` entry) are left
-    /// alone.
+    /// R4+R5 (PR #31 codex P1 ×2 + gemini MED): clear the
+    /// CONTRACT-SCOPED amend state. Zeros the three
+    /// `*_ceiling_bonus` fields only. Effect-count tallies
+    /// (`apply_local`, `apply_repo`, `network_reads`) and both amend
+    /// counters (`amends_this_turn` resets on `drive_turn` entry,
+    /// `amends_this_run` is RUN-scoped) are preserved.
+    ///
+    /// R5 correction: my R4 draft also zeroed `amends_this_run`.
+    /// That contradicted my own R2 fix in `JsonlReader::fold_progress`
+    /// that explicitly preserves `amends_this_run` across
+    /// `ContractAccepted` so a user can't bypass `MAX_AMENDS_PER_RUN`
+    /// by cycling contracts inside a single run. Both the gemini MED
+    /// thread on schemas/effect.rs:158 and the codex P1 on
+    /// schemas/effect.rs:157 caught the self-contradiction.
     ///
     /// Call site contract: a worker that accepts a fresh contract
     /// mid-session MUST call this on its owned `EffectCounter`
-    /// before reconstructing the `TurnDriver` — otherwise amend
-    /// bonuses granted under the prior contract would silently
-    /// inflate the new contract's effective ceiling and over-permit
-    /// effects (e.g., old contract amended by +20, new contract
-    /// max=5 evaluates as 25). The replay-side equivalent is in
-    /// `JsonlReader::fold_progress`, which resets the same fields on
+    /// before the next `drive_turn` — otherwise amend bonuses
+    /// granted under the prior contract silently inflate the new
+    /// contract's effective ceiling and over-permit effects (e.g.,
+    /// old contract amended by +20, new contract max=5 evaluates
+    /// as 25). The replay-side equivalent is
+    /// `JsonlReader::fold_progress`, which resets the same
+    /// ceiling-bonus fields (and preserves `amends_this_run`) on
     /// every `ContractAccepted` it walks; this method keeps the
     /// live-driver path symmetric.
     ///
-    /// β scope: the built-in TUI worker does NOT currently support
-    /// mid-session contract replacement (contracts are accepted once
-    /// at run start). This method exists so a future worker or
-    /// harness that DOES swap contracts can keep live enforcement in
-    /// lockstep with the replay projection.
+    /// Wired at `crates/azoth/src/tui/app.rs`'s `contract_rx` arm
+    /// (β R5). The `/contract <goal>` path is a real mid-session
+    /// replacement; my R4 memo incorrectly claimed otherwise.
     pub fn reset_for_new_contract(&mut self) {
         self.apply_local_ceiling_bonus = 0;
         self.apply_repo_ceiling_bonus = 0;
         self.network_reads_ceiling_bonus = 0;
-        self.amends_this_run = 0;
+        // amends_this_run intentionally preserved — see doc above
+        // and the sibling comment in JsonlReader::fold_progress.
     }
 }
 
