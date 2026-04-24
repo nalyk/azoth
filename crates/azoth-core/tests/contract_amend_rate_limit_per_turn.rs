@@ -26,6 +26,27 @@ fn amends_this_turn_at_limit_declines_to_prompt() {
 }
 
 #[test]
+fn zero_current_is_not_available_even_when_brakes_clear() {
+    // R1 (PR #31 codex P1): a contract with `max_X = 0` cannot be
+    // extended by an amend (2 × 0 = 0, clamp yields 0, grant would
+    // be a no-op). The engine MUST decline the offer before asking
+    // the user rather than prompting for a grant that bypasses the
+    // budget once.
+    let caps = CapabilityStore::new();
+    let engine = AuthorityEngine::new(&caps, ApprovalPolicyV1);
+    let counter = EffectCounter::default();
+    match engine.authorize_budget_extension("network_reads", 0, &counter) {
+        AuthorityDecision::NotAvailable { hint } => {
+            assert!(
+                hint.contains("zero ceiling"),
+                "expected zero-ceiling hint, got: {hint}"
+            );
+        }
+        other => panic!("expected NotAvailable for current=0, got {other:?}"),
+    }
+}
+
+#[test]
 fn amends_this_turn_below_limit_offers_extension() {
     let caps = CapabilityStore::new();
     let engine = AuthorityEngine::new(&caps, ApprovalPolicyV1);

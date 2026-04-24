@@ -137,6 +137,8 @@ Forbidden metachars in `has_forbidden_metachar`: `; | & > < \` $ ( ) \ \n \t \r 
 
 ### Session log
 
+- **2026-04-24 β.R1** — addressed 5 R0 findings (2 gemini HIGH + 1 gemini MED + 1 codex P1 + 1 codex P2). Core class bug: `fold_progress` accumulated `ContractAmended` deltas across contract-id boundaries, creating an asymmetry with `last_effective_contract` (which already scoped by contract_id). Fixed by tracking `current_contract_id` in `fold_progress` and resetting `apply_X_ceiling_bonus` + `amends_this_run` on each `ContractAccepted`. `last_effective_contract` rewritten as a single-pass (one `scan()`, one in-memory slice iteration) addressing gemini HIGH #1 inefficiency. `authorize_budget_extension` now rejects `current == 0` as `NotAvailable { hint: "amend cannot extend a zero ceiling" }` — prevents the codex P1 "zero-delta grant is a budget bypass" scenario. `BudgetExtensionRequest` doc updated to explain that `network_reads` is scaffolding matching `EffectBudget`'s three-field shape + that `current == 0` is structurally impossible at the TUI surface. +2 regression tests: `fold_progress_ignores_stale_amends_across_contract_replacement` + `zero_current_is_not_available_even_when_brakes_clear`. Full workspace 831/0 serial.
+
 - **2026-04-24 β.R0 build** — implemented β end-to-end in one commit series on `feat/budget-beta-amend`:
   - Schemas: `EffectBudgetDelta`, `SessionEvent::ContractAmended`, `EffectCounter` extension (6 new u32 fields, `Copy` preserved).
   - Authority: `AuthorityDecision::RequireBudgetExtension`, `ApprovalRequestMsg.budget_extension: Option<BudgetExtensionRequest>`, `authorize_budget_extension` enforcing the two brake constants `MAX_AMENDS_PER_TURN=2` + `MAX_AMENDS_PER_RUN=6` + `AMEND_PROPOSED_MULTIPLIER=2`.

@@ -563,22 +563,52 @@ impl JsonlReader {
     /// forensic-only and must not influence the live ceiling.
     ///
     /// Amends are matched against the accepted contract by `contract_id`
-    /// so a mid-session `ContractAccepted` supersedes prior amends: a
-    /// fresh contract starts with its own budget, unaffected by amends
-    /// issued against the previous contract id.
+    /// AND by position: only amends that appear AFTER the last
+    /// `ContractAccepted` event in the replayable stream are folded.
+    /// A mid-session contract replacement supersedes prior amends
+    /// regardless of id-collision: a fresh contract starts with its own
+    /// budget, unaffected by any amends issued against an earlier
+    /// acceptance of the same id (defense-in-depth).
+    ///
+    /// R1 (gemini PR #31 HIGH): single-pass implementation. The prior
+    /// version called `last_accepted_contract()` + `replayable()`,
+    /// each of which re-parsed the entire JSONL file. This now uses a
+    /// single `scan()` and walks the already-materialised replayable
+    /// projection once.
     pub fn last_effective_contract(
         &self,
     ) -> Result<Option<crate::schemas::Contract>, ProjectionError> {
-        let Some(mut contract) = self.last_accepted_contract()? else {
+        let replay = self.scan()?.replayable();
+        // First pass: find the last `ContractAccepted` index.
+        let last_accepted_idx =
+            replay
+                .iter()
+                .enumerate()
+                .rev()
+                .find_map(|(i, ReplayableEvent(ev))| match ev {
+                    SessionEvent::ContractAccepted { .. } => Some(i),
+                    _ => None,
+                });
+        let Some(start) = last_accepted_idx else {
             return Ok(None);
         };
-        let replay = self.replayable()?;
-        let amends: Vec<crate::schemas::EffectBudgetDelta> = replay
-            .into_iter()
+        let mut contract = match &replay[start].0 {
+            SessionEvent::ContractAccepted { contract, .. } => contract.clone(),
+            // Unreachable: `start` comes from a position we just
+            // classified as `ContractAccepted` above. The arm exists
+            // to keep the match exhaustive without an `if let`
+            // wrapper that fights the `.clone()` path.
+            _ => unreachable!("last_accepted_idx points to a ContractAccepted"),
+        };
+        // Second pass (over the slice AFTER the acceptance): collect
+        // amends whose contract_id matches. Slice is bounded — not
+        // a second file read.
+        let amends: Vec<crate::schemas::EffectBudgetDelta> = replay[start + 1..]
+            .iter()
             .filter_map(|ReplayableEvent(ev)| match ev {
                 SessionEvent::ContractAmended {
                     contract_id, delta, ..
-                } if contract_id == contract.id => Some(delta),
+                } if *contract_id == contract.id => Some(delta.clone()),
                 _ => None,
             })
             .collect();
@@ -622,14 +652,38 @@ impl JsonlReader {
     ) -> Result<(EffectCounter, u32), ProjectionError> {
         let mut effects = EffectCounter::default();
         let mut turns_completed: u32 = 0;
+        // R1 (gemini HIGH + codex P2): track the currently-active
+        // contract id so amends that target an older, superseded
+        // contract do NOT inflate the ceiling bonus for the new one.
+        // A mid-session `ContractAccepted` also resets the bonus +
+        // amends_this_run counter because the new contract starts
+        // with its own budget, unaffected by prior amends.
+        //
+        // `apply_local` / `apply_repo` tallies are intentionally NOT
+        // reset here — that is pre-existing behaviour (pre-β) and
+        // changing it would ripple into `resume_recomputes_effects_
+        // and_turns`. Separate concern from the β amend bug.
+        let mut current_contract_id: Option<crate::schemas::ContractId> = None;
         for ev in events {
             match ev {
+                SessionEvent::ContractAccepted { contract, .. } => {
+                    current_contract_id = Some(contract.id);
+                    effects.apply_local_ceiling_bonus = 0;
+                    effects.apply_repo_ceiling_bonus = 0;
+                    effects.network_reads_ceiling_bonus = 0;
+                    effects.amends_this_run = 0;
+                }
                 // β: fold ContractAmended deltas into the ceiling-bonus
-                // fields and bump the run-scoped amend counter. Live
-                // driver bumps these same fields at grant time; replay
-                // must converge to the same effective ceiling or resume
-                // will misjudge whether the next tool call fits.
-                SessionEvent::ContractAmended { delta, .. } => {
+                // fields and bump the run-scoped amend counter. Only
+                // folds amends that target the currently-active
+                // contract — defensive against mid-session contract
+                // replacement (gemini PR #31 R0 HIGH / codex P2).
+                SessionEvent::ContractAmended {
+                    contract_id, delta, ..
+                } => {
+                    if current_contract_id.as_ref() != Some(&contract_id) {
+                        continue;
+                    }
                     effects.apply_local_ceiling_bonus = effects
                         .apply_local_ceiling_bonus
                         .saturating_add(delta.apply_local);

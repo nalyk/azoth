@@ -124,6 +124,127 @@ fn replay_folds_ten_effects_plus_one_amend_into_expected_state() {
 }
 
 #[test]
+fn fold_progress_ignores_stale_amends_across_contract_replacement() {
+    // R1 (PR #31 gemini HIGH + codex P2): if a mid-session
+    // ContractAccepted supersedes the prior contract, a
+    // ContractAmended event that targeted the OLD contract_id must
+    // not inflate the ceiling_bonus counter returned by
+    // committed_run_progress. Otherwise a resuming driver would
+    // overstate the effective ceiling under the new contract and
+    // the gate-check math diverges from the live driver's.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("session.jsonl");
+    let mut w = JsonlWriter::open(&path).unwrap();
+
+    let run_id = RunId::from("run_stale".to_string());
+    let turn_old = TurnId::from("t_old".to_string());
+    let turn_new = TurnId::from("t_new".to_string());
+    let old = Contract {
+        id: ContractId::from("ctr_stale_old".to_string()),
+        ..contract()
+    };
+    let new = Contract {
+        id: ContractId::from("ctr_stale_new".to_string()),
+        ..contract()
+    };
+
+    w.append(&SessionEvent::RunStarted {
+        run_id: run_id.clone(),
+        contract_id: old.id.clone(),
+        timestamp: "2026-04-24T21:00:00Z".into(),
+    })
+    .unwrap();
+    w.append(&SessionEvent::ContractAccepted {
+        contract: old.clone(),
+        timestamp: "2026-04-24T21:00:01Z".into(),
+    })
+    .unwrap();
+    w.append(&SessionEvent::TurnStarted {
+        turn_id: turn_old.clone(),
+        run_id: run_id.clone(),
+        parent_turn: None,
+        timestamp: "2026-04-24T21:00:02Z".into(),
+    })
+    .unwrap();
+    // Amend against OLD contract.
+    w.append(&SessionEvent::ContractAmended {
+        contract_id: old.id.clone(),
+        turn_id: turn_old.clone(),
+        delta: EffectBudgetDelta {
+            apply_local: 50,
+            apply_repo: 0,
+            network_reads: 0,
+        },
+        at: "2026-04-24T21:00:03Z".into(),
+    })
+    .unwrap();
+    w.append(&SessionEvent::TurnCommitted {
+        turn_id: turn_old.clone(),
+        outcome: CommitOutcome::Success,
+        usage: Usage::default(),
+        user_input: None,
+        final_assistant: None,
+        at: Some("2026-04-24T21:00:04Z".into()),
+    })
+    .unwrap();
+    // NEW contract accepted → old amend becomes stale.
+    w.append(&SessionEvent::ContractAccepted {
+        contract: new.clone(),
+        timestamp: "2026-04-24T21:00:05Z".into(),
+    })
+    .unwrap();
+    // One real amend against the new contract.
+    w.append(&SessionEvent::TurnStarted {
+        turn_id: turn_new.clone(),
+        run_id: run_id.clone(),
+        parent_turn: None,
+        timestamp: "2026-04-24T21:00:06Z".into(),
+    })
+    .unwrap();
+    w.append(&SessionEvent::ContractAmended {
+        contract_id: new.id.clone(),
+        turn_id: turn_new.clone(),
+        delta: EffectBudgetDelta {
+            apply_local: 7,
+            apply_repo: 0,
+            network_reads: 0,
+        },
+        at: "2026-04-24T21:00:07Z".into(),
+    })
+    .unwrap();
+    w.append(&SessionEvent::TurnCommitted {
+        turn_id: turn_new.clone(),
+        outcome: CommitOutcome::Success,
+        usage: Usage::default(),
+        user_input: None,
+        final_assistant: None,
+        at: Some("2026-04-24T21:00:08Z".into()),
+    })
+    .unwrap();
+    drop(w);
+
+    let r = JsonlReader::open(&path);
+    let (effects, _) = r.committed_run_progress().unwrap();
+    assert_eq!(
+        effects.apply_local_ceiling_bonus, 7,
+        "only the new-contract amend delta (7) must count; \
+         the stale amend (50) against the superseded contract_id must be dropped"
+    );
+    assert_eq!(
+        effects.amends_this_run, 1,
+        "only one amend targets the current contract"
+    );
+
+    let effective = r.last_effective_contract().unwrap().expect("contract");
+    assert_eq!(effective.id, new.id);
+    assert_eq!(
+        effective.effect_budget.max_apply_local,
+        20 + 7,
+        "effective ceiling reflects only the new-contract amend"
+    );
+}
+
+#[test]
 fn replay_ignores_amend_for_different_contract_id() {
     // Scenario: a prior contract was amended, then a fresh contract is
     // accepted mid-session. The fresh contract MUST start with its own

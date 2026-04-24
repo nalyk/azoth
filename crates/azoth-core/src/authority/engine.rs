@@ -127,6 +127,22 @@ impl<'a> AuthorityEngine<'a> {
         current: u32,
         counter: &EffectCounter,
     ) -> AuthorityDecision {
+        // R1 (codex PR #31 P1): reject zero-current BEFORE prompting
+        // the user. A contract with `max_X = 0` has no budget to
+        // extend — `2 × 0 = 0`, and `apply_amend_clamped_against_base`
+        // correctly returns a zero delta, but a zero-delta grant that
+        // fell through to per-tool authorization would let the tool
+        // execute exactly once against a structurally-unextendable
+        // ceiling (budget bypass). Structurally unextendable ceilings
+        // are a known edge of the ≤2× multiplier rule — test
+        // `contract_amend_multiplier_cap::zero_current_stays_zero_after_clamp`
+        // already locks the invariant at the clamp layer; this arm
+        // stops the offer from being made in the first place.
+        if current == 0 {
+            return AuthorityDecision::NotAvailable {
+                hint: "amend cannot extend a zero ceiling (contract sets max_X = 0)",
+            };
+        }
         // Per-run brake checked first — hitting 6/run is the harder
         // signal to cross and takes precedence over the softer
         // per-turn limit for the error message.

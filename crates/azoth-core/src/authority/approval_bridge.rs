@@ -18,13 +18,31 @@ use tokio::sync::oneshot;
 /// TUI renderers opt in.
 #[derive(Debug, Clone)]
 pub struct BudgetExtensionRequest {
-    /// Budget class label — "apply_local", "apply_repo", or
-    /// "network_reads". `&'static str` because these names are
-    /// compile-time constants on `EffectBudget`; avoids allocation and
-    /// lets log formatters pass the pointer directly.
+    /// Budget class label — in β, only `"apply_local"` or
+    /// `"apply_repo"` flow through the driver's amend path. The
+    /// underlying `EffectBudget` struct also carries
+    /// `max_network_reads`, and `EffectBudgetDelta` mirrors that
+    /// three-field shape for cache-prefix / schema consistency, but
+    /// no v1-v2 `EffectClass` variant maps to network reads yet;
+    /// `network_reads` is scaffolding, not a live amend target.
+    ///
+    /// When a `NetworkReads` `EffectClass` lands in a future sprint,
+    /// the driver's budget-overflow branch picks it up by adding
+    /// one more arm to the class-to-(used, max, bonus, label) match
+    /// in `turn/mod.rs`; no schema change needed here.
+    ///
+    /// `&'static str` because these names are compile-time constants
+    /// on `EffectBudget`; avoids allocation and lets log formatters
+    /// pass the pointer directly.
     pub label: &'static str,
     /// The effective ceiling at the moment of the overflow — base
     /// contract value plus prior amends already in play.
+    ///
+    /// Cannot be `0`: `AuthorityEngine::authorize_budget_extension`
+    /// returns `NotAvailable` rather than `RequireBudgetExtension`
+    /// when `current == 0`, because `2 × 0 = 0` would mean any grant
+    /// is a no-op bypass. The zero case is locked by test
+    /// `zero_current_is_not_available_even_when_brakes_clear`.
     pub current: u32,
     /// The engine's proposed new ceiling after this amend. Always
     /// `current × 2` in β; future variants may propose a different
