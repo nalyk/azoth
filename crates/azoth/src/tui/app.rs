@@ -1055,6 +1055,14 @@ impl AppState {
     /// prominently; internal lifecycle events are suppressed or shown as
     /// compact one-liners so the conversation is readable.
     pub fn handle_session_event(&mut self, ev: SessionEvent) {
+        // F4 helper: parse a Chronon CP-1 RFC3339 string into SystemTime.
+        // Returns None on malformed input (pre-CP-1 sessions use None
+        // for `at`; we also defensively handle any future garbled value).
+        fn parse_rfc3339_to_system_time(s: &str) -> Option<std::time::SystemTime> {
+            time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339)
+                .ok()
+                .map(std::time::SystemTime::from)
+        }
         match ev {
             SessionEvent::ContractAccepted { contract, .. } => {
                 let goal = contract.goal.clone();
@@ -1068,8 +1076,19 @@ impl AppState {
                     .push(Note::info(format!("contract accepted · {goal}")));
                 self.current_contract_id = Some(contract.id);
             }
-            SessionEvent::TurnStarted { turn_id, .. } => {
-                self.cards.push(TurnCard::agent(turn_id.to_string()));
+            SessionEvent::TurnStarted {
+                turn_id, timestamp, ..
+            } => {
+                // F4 2026-04-24: hydrate started_wall from the event
+                // timestamp (Chronon CP-1). Previously I destructured
+                // with `..` and dropped the timestamp, so every
+                // resumed card anchored to SystemTime::now() and
+                // displayed "t+0.0s" regardless of original wall time.
+                let mut card = TurnCard::agent(turn_id.to_string());
+                if let Some(wall) = parse_rfc3339_to_system_time(&timestamp) {
+                    card.started_wall = wall;
+                }
+                self.cards.push(card);
                 self.tab_order_cache = None;
                 self.tab_cursor = None;
                 self.whisper.set("thinking");
@@ -1355,7 +1374,9 @@ impl AppState {
                 };
                 self.notes.push(Note::info(format!("approval · {label}")));
             }
-            SessionEvent::TurnCommitted { turn_id, usage, .. } => {
+            SessionEvent::TurnCommitted {
+                turn_id, usage, at, ..
+            } => {
                 self.last_input_tokens = usage.input_tokens;
                 if self.max_context_tokens > 0 {
                     self.ctx_pct = ((usage.input_tokens as u64 * 100)
@@ -1380,7 +1401,15 @@ impl AppState {
                     // labels. `committed_at` stays monotonic for the
                     // bloom animation; `committed_wall` is what the
                     // header cache reads.
-                    card.committed_wall = Some(std::time::SystemTime::now());
+                    // F4 2026-04-24: honour the event's `at` field
+                    // (Chronon CP-1) when present so resumed cards
+                    // show the original commit wall time. Pre-CP-1
+                    // sessions (or malformed timestamps) fall back
+                    // to now() — forward-compat replay stays clean.
+                    card.committed_wall = at
+                        .as_deref()
+                        .and_then(parse_rfc3339_to_system_time)
+                        .or_else(|| Some(std::time::SystemTime::now()));
                 }
                 self.committed_turns = self.committed_turns.saturating_add(1);
                 self.whisper.clear();
@@ -2481,6 +2510,81 @@ pub async fn run_app(resume: Option<String>, as_of: Option<String>) -> io::Resul
 mod tests {
     use super::*;
     use azoth_core::schemas::ContextPacketId;
+
+    #[test]
+    fn resume_hydrates_wall_clocks_from_turn_event_timestamps() {
+        // F4 2026-04-24: CLAUDE.md §"Dual-clock fields (R27 pattern)"
+        // warns that `committed_wall: SystemTime` must carry through
+        // JSONL so resumed cards show the original "t+Xs" elapsed.
+        // I destructured TurnStarted/TurnCommitted with `..` and
+        // dropped the timestamps — every resumed card anchored to
+        // SystemTime::now() at resume time, so every t+ read 0.0s.
+        use azoth_core::schemas::{CommitOutcome, Usage};
+        let mut state = AppState::new();
+        let tid = TurnId::new();
+        state.handle_session_event(SessionEvent::TurnStarted {
+            turn_id: tid.clone(),
+            run_id: RunId::new(),
+            parent_turn: None,
+            timestamp: "2026-04-24T20:00:00Z".into(),
+        });
+        state.handle_session_event(SessionEvent::TurnCommitted {
+            turn_id: tid,
+            outcome: CommitOutcome::Success,
+            usage: Usage::default(),
+            user_input: None,
+            final_assistant: None,
+            at: Some("2026-04-24T20:00:42Z".into()),
+        });
+        let card = state.cards.last().expect("card exists");
+        let sw = card.started_wall;
+        let cw = card
+            .committed_wall
+            .expect("committed_wall populated by TurnCommitted");
+        // The delta MUST reflect the 42s that elapsed on the
+        // original turn, not the ~µs between two synchronous test
+        // calls. If this assertion fails the TUI is anchoring to
+        // SystemTime::now() instead of the event timestamps.
+        let delta = cw
+            .duration_since(sw)
+            .expect("committed_wall ≥ started_wall");
+        assert_eq!(
+            delta.as_secs(),
+            42,
+            "wall-clock delta must survive resume; got {}s",
+            delta.as_secs()
+        );
+    }
+
+    #[test]
+    fn malformed_timestamp_falls_back_to_now_instead_of_panicking() {
+        // Regression guard: a pre-CP-1 session (missing `at`) or a
+        // mangled timestamp must not panic the hydrator. We fall
+        // back to SystemTime::now() — the old behaviour — so
+        // forward-compat replay stays clean.
+        use azoth_core::schemas::{CommitOutcome, Usage};
+        let mut state = AppState::new();
+        let tid = TurnId::new();
+        state.handle_session_event(SessionEvent::TurnStarted {
+            turn_id: tid.clone(),
+            run_id: RunId::new(),
+            parent_turn: None,
+            timestamp: "not-rfc3339".into(),
+        });
+        state.handle_session_event(SessionEvent::TurnCommitted {
+            turn_id: tid,
+            outcome: CommitOutcome::Success,
+            usage: Usage::default(),
+            user_input: None,
+            final_assistant: None,
+            at: None,
+        });
+        let card = state.cards.last().expect("card");
+        assert!(
+            card.committed_wall.is_some(),
+            "fallback must still set committed_wall (to now)"
+        );
+    }
 
     #[test]
     fn slash_continue_after_context_overflow_refuses_and_does_not_queue_turn() {
