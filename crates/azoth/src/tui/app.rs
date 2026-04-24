@@ -1801,7 +1801,15 @@ pub async fn run_app(resume: Option<String>, as_of: Option<String>) -> io::Resul
     // TUI can tell them apart from live ones and skip roster updates
     // on historical ApprovalGranted events (worker CapabilityStore
     // starts fresh each resume — historical tokens don't exist).
-    let (replay_tx, mut replay_rx) = mpsc::unbounded_channel::<SessionEvent>();
+    //
+    // R3-4 gemini MED on PR #33 2026-04-25: bounded at 256 (was
+    // unbounded). The scan is already materialised in the worker's
+    // `resume_scan: Vec<SessionEvent>` — an unbounded replay channel
+    // effectively doubled that memory until the consumer drained it.
+    // 256 is enough that the send loop rarely blocks for the
+    // handle_replayed_session_event cost profile (card/cell appends,
+    // usage updates — all O(1)), while capping resume peak memory.
+    let (replay_tx, mut replay_rx) = mpsc::channel::<SessionEvent>(256);
     let (error_tx, mut error_rx) = mpsc::channel::<String>(8);
     let (approval_req_tx, mut approval_req_rx) = mpsc::channel::<ApprovalRequestMsg>(8);
     let (approve_tx, mut approve_rx) = mpsc::channel::<String>(8);
@@ -1993,7 +2001,11 @@ pub async fn run_app(resume: Option<String>, as_of: Option<String>) -> io::Resul
         // and skips the roster-update arm on historical ApprovalGranted.
         if let Some(scan) = &resume_scan {
             for ev in scan.replayable() {
-                let _ = worker_replay_tx.send(ev.0);
+                // R3-4 2026-04-25: bounded channel send is async —
+                // await so we actually block for capacity (backpressure
+                // against a slow consumer) instead of silently dropping
+                // the future on the floor.
+                let _ = worker_replay_tx.send(ev.0).await;
             }
         }
 
@@ -2645,8 +2657,18 @@ pub async fn run_app(resume: Option<String>, as_of: Option<String>) -> io::Resul
                     }
                 }
             }
-            Some(ev) = session_rx.recv() => state.handle_session_event(ev),
+            // R3-1 codex P1 on PR #33 2026-04-25: replay MUST drain
+            // before live — my R2-4 commit put `session_rx` first.
+            // Under biased ordering, a live event that landed before
+            // the replay backlog fully drained would overtake the
+            // history, painting the transcript with new content
+            // interleaved against the resumed scrollback. Pushing
+            // `replay_rx` ahead in the biased list preserves the
+            // causal ordering: worker emitted all replay events
+            // BEFORE attaching the live tap, so until replay_rx is
+            // empty the consumer should ignore session_rx.
             Some(ev) = replay_rx.recv() => state.handle_replayed_session_event(ev),
+            Some(ev) = session_rx.recv() => state.handle_session_event(ev),
             Some(req) = approval_req_rx.recv() => {
                 state.set_card_awaiting_approval(&req.turn_id);
                 state.pending_approval = Some(req);
