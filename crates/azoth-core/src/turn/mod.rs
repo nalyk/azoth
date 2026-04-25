@@ -2069,6 +2069,20 @@ fn persist_tool_output(
 /// - Never fails — any IO error → `None` (preflight is best-
 ///   effort UX, not a security boundary; the tool's own guard is
 ///   the real enforcement).
+///
+/// **Why this list is not generalized to every path-validating tool.**
+/// gemini R1 on PR #34 asked whether `repo_read_file` /
+/// `repo_read_spans` should also be covered — they DO have identical
+/// `path escapes repo root` guards in their tool bodies.
+/// Architecturally they cannot benefit from this preflight: both
+/// read tools declare `EffectClass::Observe`, which the
+/// AuthorityEngine auto-approves (`Observe → AuthorityDecision::Auto`).
+/// They never reach the `RequireApproval` arm in the driver where
+/// this helper is invoked, so generalizing the tool list would add
+/// unreachable code paths without surfacing any user-facing
+/// warning. If a future read tool is reclassified to `ApplyLocal` /
+/// `ApplyRepo`, add it here AND to the test matrix in
+/// `compute_path_warning_tests`.
 fn compute_path_warning(
     tool_name: &str,
     input: &serde_json::Value,

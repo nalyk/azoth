@@ -1218,6 +1218,20 @@ impl AppState {
                 // after an amend even though their actual
                 // consumption was unchanged. First accept of a
                 // session sees `None` and falls through to 0.
+                //
+                // R1 (gemini MED #2 on PR #34): bot suggested
+                // `ContractAccepted` should carry authoritative
+                // `used` from the worker via a schema field. Premise
+                // is partially wrong — `ContractAccepted` is one-
+                // shot per session (initial accept only; amends
+                // emit `ContractAmended`), so the EffectRecord-vs-
+                // ContractAccepted race the bot described doesn't
+                // happen at this site. The REAL gap was that the
+                // TUI didn't handle `ContractAmended` at all —
+                // amended budgets stayed at the original `max`
+                // forever. Closed in this round: the
+                // `SessionEvent::ContractAmended` arm below
+                // applies the delta to both `max` slots.
                 let used_local = self
                     .inspector_data
                     .contract_budget_local
@@ -1243,6 +1257,39 @@ impl AppState {
                         .push(Note::info(format!("contract accepted · {goal}")));
                 }
                 self.current_contract_id = Some(contract.id);
+            }
+            SessionEvent::ContractAmended { delta, .. } => {
+                // R1 (gemini MED #2 on PR #34, 2026-04-25): the TUI
+                // had no handler for `ContractAmended`, so amended
+                // budgets stayed at the original cap indefinitely.
+                // Apply the delta to both `max` slots; `used`
+                // counters are untouched (consumption history
+                // doesn't change on a budget amend, only the
+                // ceiling moves). Worker emits this event after
+                // the user grants a budget extension — see
+                // `turn/mod.rs::SessionEvent::ContractAmended`
+                // emit site at L1178.
+                if let Some((used, max)) = self.inspector_data.contract_budget_local.as_mut() {
+                    *max = max.saturating_add(delta.apply_local);
+                    let _ = used; // explicit: do not touch consumed count
+                }
+                if let Some((used, max)) = self.inspector_data.contract_budget_repo.as_mut() {
+                    *max = max.saturating_add(delta.apply_repo);
+                    let _ = used;
+                }
+                if !is_replay && (delta.apply_local > 0 || delta.apply_repo > 0) {
+                    let mut parts = Vec::new();
+                    if delta.apply_local > 0 {
+                        parts.push(format!("+{} apply_local", delta.apply_local));
+                    }
+                    if delta.apply_repo > 0 {
+                        parts.push(format!("+{} apply_repo", delta.apply_repo));
+                    }
+                    self.notes.push(Note::info(format!(
+                        "budget extended · {}",
+                        parts.join(" · ")
+                    )));
+                }
             }
             SessionEvent::TurnStarted {
                 turn_id, timestamp, ..
@@ -4313,6 +4360,80 @@ mod tests {
             state.inspector_data.contract_budget_local,
             Some((1, 3)),
             "Observe is not budget-counted"
+        );
+    }
+
+    #[test]
+    fn contract_amended_extends_max_without_touching_used() {
+        // R1 (gemini MED #2 on PR #34, 2026-04-25): TUI was missing
+        // the ContractAmended handler. Amended budgets stayed at
+        // the original cap; users one apply_repo from the worker's
+        // amended ceiling saw a stale `5/5` even after their grant.
+        // Now the delta applies to `max` only — `used` is untouched
+        // because amend doesn't retroactively un-consume effects.
+        use azoth_core::schemas::EffectBudgetDelta;
+        let mut state = AppState::new();
+        state.inspector_data.contract_budget_local = Some((3, 20));
+        state.inspector_data.contract_budget_repo = Some((2, 5));
+        state.handle_session_event(SessionEvent::ContractAmended {
+            contract_id: azoth_core::schemas::ContractId::new(),
+            turn_id: TurnId::new(),
+            delta: EffectBudgetDelta {
+                apply_local: 10,
+                apply_repo: 3,
+                network_reads: 0,
+            },
+            at: "2026-04-25T00:00:00Z".into(),
+        });
+        assert_eq!(
+            state.inspector_data.contract_budget_local,
+            Some((3, 30)),
+            "apply_local max bumps by delta; used unchanged"
+        );
+        assert_eq!(
+            state.inspector_data.contract_budget_repo,
+            Some((2, 8)),
+            "apply_repo max bumps by delta; used unchanged"
+        );
+        // User-visible note should describe what changed.
+        assert!(
+            state
+                .notes
+                .iter()
+                .any(|n| n.text.contains("budget extended")
+                    && n.text.contains("+10 apply_local")
+                    && n.text.contains("+3 apply_repo")),
+            "budget-extend note must surface both deltas; got: {:?}",
+            state.notes
+        );
+    }
+
+    #[test]
+    fn contract_amended_on_replay_does_not_push_note() {
+        // Replay path keeps the same note-suppression invariant as
+        // ContractAccepted/ApprovalGranted/EffectRecord-error.
+        use azoth_core::schemas::EffectBudgetDelta;
+        let mut state = AppState::new();
+        state.inspector_data.contract_budget_local = Some((0, 20));
+        state.inspector_data.contract_budget_repo = Some((0, 5));
+        let pre_count = state.notes.len();
+        state.handle_replayed_session_event(SessionEvent::ContractAmended {
+            contract_id: azoth_core::schemas::ContractId::new(),
+            turn_id: TurnId::new(),
+            delta: EffectBudgetDelta {
+                apply_local: 5,
+                apply_repo: 0,
+                network_reads: 0,
+            },
+            at: "2026-04-25T00:00:00Z".into(),
+        });
+        // Max still updates on replay (deterministic reconstruction
+        // of state) but no live note is pushed.
+        assert_eq!(state.inspector_data.contract_budget_local, Some((0, 25)));
+        assert_eq!(
+            state.notes.len(),
+            pre_count,
+            "replay path must not push lifecycle note for ContractAmended"
         );
     }
 
