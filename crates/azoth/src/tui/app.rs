@@ -1169,6 +1169,36 @@ impl AppState {
     /// session accumulates several grants. `&str` lets the caller
     /// hand the owned string to the Vec only when we actually need
     /// storage.
+    /// R2 (gemini MED on PR #34, 2026-04-25): apply input-token
+    /// pressure from a terminal turn event (committed / aborted /
+    /// interrupted). Updates the banner field, the inspector
+    /// mirror, and — when a context cap is configured —
+    /// `ctx_pct` and the rolling 24-sample history.
+    ///
+    /// Skips when `input_tokens == 0` so a turn that aborted
+    /// before any model call doesn't blank the prior pressure.
+    /// The inspector should keep showing the last meaningful
+    /// number; a spurious zero would read as "context cleared"
+    /// when it actually means "this run never executed".
+    fn apply_input_token_pressure(&mut self, input_tokens: u32) {
+        if input_tokens == 0 {
+            return;
+        }
+        self.last_input_tokens = input_tokens;
+        // R1 fix: mirror outside the max_context gate so generic
+        // profiles still report the raw count.
+        self.inspector_data.last_input_tokens = input_tokens;
+        if self.max_context_tokens > 0 {
+            self.ctx_pct =
+                ((input_tokens as u64 * 100) / self.max_context_tokens as u64).min(100) as u8;
+            if self.inspector_data.ctx_history.len() >= 24 {
+                self.inspector_data.ctx_history.remove(0);
+            }
+            self.inspector_data.ctx_history.push(self.ctx_pct as u64);
+            self.inspector_data.ctx_pct = self.ctx_pct;
+        }
+    }
+
     fn record_session_approval(&mut self, tool: &str) {
         if !self.session_approvals.iter().any(|s| s == tool) {
             self.session_approvals.push(tool.to_string());
@@ -1665,25 +1695,16 @@ impl AppState {
             SessionEvent::TurnCommitted {
                 turn_id, usage, at, ..
             } => {
-                self.last_input_tokens = usage.input_tokens;
-                // R1 (gemini MED on PR #34, 2026-04-25): keep the
-                // raw `last_input_tokens` mirror to the inspector
-                // OUTSIDE the `max_context_tokens > 0` gate. A
-                // generic profile with no declared cap can still
-                // report token usage; previously the inspector
-                // would render stale token counts whenever the
-                // ctx-percent denominator was missing.
-                self.inspector_data.last_input_tokens = self.last_input_tokens;
-                if self.max_context_tokens > 0 {
-                    self.ctx_pct = ((usage.input_tokens as u64 * 100)
-                        / self.max_context_tokens as u64)
-                        .min(100) as u8;
-                    if self.inspector_data.ctx_history.len() >= 24 {
-                        self.inspector_data.ctx_history.remove(0);
-                    }
-                    self.inspector_data.ctx_history.push(self.ctx_pct as u64);
-                    self.inspector_data.ctx_pct = self.ctx_pct;
-                }
+                // R2 (gemini MED on PR #34, 2026-04-25): factored
+                // the ctx-pressure update into a helper so
+                // TurnCommitted, TurnAborted, and TurnInterrupted
+                // all converge on the same code. Pre-fix, only
+                // committed turns updated the inspector — a turn
+                // that streamed 8k tokens then aborted on
+                // validator failure left the inspector at the
+                // prior turn's numbers, masking the real context
+                // pressure of the failed run.
+                self.apply_input_token_pressure(usage.input_tokens);
                 let tid = turn_id.to_string();
                 let chip = UsageChip {
                     input_tokens: usage.input_tokens,
@@ -1714,9 +1735,16 @@ impl AppState {
                 turn_id,
                 reason,
                 detail,
+                usage,
                 at,
-                ..
             } => {
+                // R2 (gemini MED on PR #34, 2026-04-25): aborted
+                // turns carry usage; reflect their pressure in the
+                // inspector and ctx% so the user sees what the
+                // failed run consumed. `apply_input_token_pressure`
+                // no-ops on zero (turns that aborted before any
+                // model call shouldn't zero the prior pressure).
+                self.apply_input_token_pressure(usage.input_tokens);
                 let tid = turn_id.to_string();
                 let reason_str = format!("{reason:?}");
                 let detail_str = detail.unwrap_or_default();
@@ -1749,9 +1777,15 @@ impl AppState {
             SessionEvent::TurnInterrupted {
                 turn_id,
                 reason,
+                partial_usage,
                 at,
-                ..
             } => {
+                // R2 (gemini MED on PR #34, 2026-04-25): interrupted
+                // turns carry `partial_usage` (a UsageDelta).
+                // Reflect any input-token pressure observed before
+                // the interrupt fired so the inspector doesn't lie
+                // about ctx after a Ctrl+C cancel.
+                self.apply_input_token_pressure(partial_usage.input_tokens);
                 let tid = turn_id.to_string();
                 let reason_str = format!("{reason:?}");
                 if let Some(card) = self.card_by_turn_id_mut(&tid) {
@@ -4361,6 +4395,79 @@ mod tests {
             Some((1, 3)),
             "Observe is not budget-counted"
         );
+    }
+
+    #[test]
+    fn aborted_turn_updates_inspector_input_token_pressure() {
+        // R2 (gemini MED on PR #34, 2026-04-25): aborted turns
+        // carry usage; the inspector and ctx% must reflect
+        // pressure from the failed run, not stay frozen on the
+        // last successful one. Pre-fix the inspector would have
+        // reported the prior turn's tokens after a validator
+        // failure that consumed 8k input tokens — masking real
+        // pressure.
+        use azoth_core::schemas::{AbortReason, Usage};
+        let mut state = AppState::new();
+        state.max_context_tokens = 100_000;
+        state.handle_session_event(SessionEvent::TurnAborted {
+            turn_id: TurnId::new(),
+            reason: AbortReason::ValidatorFail,
+            detail: None,
+            usage: Usage {
+                input_tokens: 8_000,
+                output_tokens: 2_000,
+                ..Default::default()
+            },
+            at: None,
+        });
+        assert_eq!(state.last_input_tokens, 8_000);
+        assert_eq!(state.inspector_data.last_input_tokens, 8_000);
+        assert_eq!(state.ctx_pct, 8);
+    }
+
+    #[test]
+    fn interrupted_turn_updates_inspector_from_partial_usage() {
+        // R2: same shape via UsageDelta (partial_usage).
+        use azoth_core::schemas::{AbortReason, UsageDelta};
+        let mut state = AppState::new();
+        state.max_context_tokens = 100_000;
+        state.handle_session_event(SessionEvent::TurnInterrupted {
+            turn_id: TurnId::new(),
+            reason: AbortReason::UserCancel,
+            partial_usage: UsageDelta {
+                input_tokens: 3_500,
+                output_tokens: 1_200,
+            },
+            at: None,
+        });
+        assert_eq!(state.last_input_tokens, 3_500);
+        assert_eq!(state.inspector_data.last_input_tokens, 3_500);
+        assert_eq!(state.ctx_pct, 3);
+    }
+
+    #[test]
+    fn aborted_with_zero_usage_preserves_prior_pressure() {
+        // Edge case: turn aborted before any model call (e.g.
+        // approval denied, bridge closed). Usage is all-zeros.
+        // The inspector must NOT zero — that would read as
+        // "context cleared". Keep showing the last meaningful
+        // number from the prior committed turn.
+        use azoth_core::schemas::{AbortReason, Usage};
+        let mut state = AppState::new();
+        state.max_context_tokens = 100_000;
+        state.last_input_tokens = 5_000;
+        state.inspector_data.last_input_tokens = 5_000;
+        state.ctx_pct = 5;
+        state.handle_session_event(SessionEvent::TurnAborted {
+            turn_id: TurnId::new(),
+            reason: AbortReason::ApprovalDenied,
+            detail: Some("user denied approval".into()),
+            usage: Usage::default(),
+            at: None,
+        });
+        assert_eq!(state.last_input_tokens, 5_000);
+        assert_eq!(state.inspector_data.last_input_tokens, 5_000);
+        assert_eq!(state.ctx_pct, 5);
     }
 
     #[test]
