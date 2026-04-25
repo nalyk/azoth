@@ -62,6 +62,14 @@ pub struct ApprovalRequestMsg {
     /// (not a per-tool approval). TUI surfaces render this distinctly.
     /// `None` = legacy per-tool flow.
     pub budget_extension: Option<BudgetExtensionRequest>,
+    /// F4 (2026-04-25): driver-side preflight warning the sheet
+    /// should render before the user taps approve. Currently set
+    /// when the authorize path_hint canonicalizes outside
+    /// `ctx.repo_root` for fs_write / fs_delete — the tool's own
+    /// guard will reject the call even on approval, so the user is
+    /// about to waste a grant. `None` = no warning, render the
+    /// sheet normally.
+    pub path_warning: Option<String>,
 }
 
 #[derive(Debug)]

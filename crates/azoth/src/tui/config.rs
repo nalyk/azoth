@@ -42,7 +42,10 @@ pub fn built_in_profiles() -> Vec<ProfileEntry> {
             // F3 2026-04-24: see adapter/profile.rs::ollama_anthropic —
             // 32_768 was saturating after 3 retrieval turns.
             max_context_tokens: 131_072,
-            max_output_tokens: 8_192,
+            // F9 2026-04-25: 8_192 → 16_384 to absorb qwen3.5/3.6's
+            // chain-of-thought blow-ups. See adapter/profile.rs for the
+            // E2E evidence.
+            max_output_tokens: 16_384,
         },
         ProfileEntry {
             name: "ollama-qwen-openai".into(),
@@ -53,7 +56,8 @@ pub fn built_in_profiles() -> Vec<ProfileEntry> {
             tokenizer_family: TokenizerFamily::SentencepieceLlama,
             // F3 2026-04-24: same rationale.
             max_context_tokens: 131_072,
-            max_output_tokens: 8_192,
+            // F9 2026-04-25: see above.
+            max_output_tokens: 16_384,
         },
         ProfileEntry {
             name: "anthropic".into(),
@@ -108,7 +112,10 @@ pub fn resolve_profile() -> ProfileEntry {
                 api_key_env: None,
                 tokenizer_family: TokenizerFamily::SentencepieceLlama,
                 max_context_tokens: 32_768,
-                max_output_tokens: 8_192,
+                // F9 2026-04-25: fallback targets an ollama endpoint
+                // (localhost:11434, SentencepieceLlama) so it inherits
+                // the same qwen-chain-of-thought blow-up risk.
+                max_output_tokens: 16_384,
             }
         });
 

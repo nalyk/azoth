@@ -13,12 +13,42 @@ use super::theme::{Palette as Colors, Theme};
 pub struct InspectorData {
     pub ctx_pct: u8,
     pub ctx_history: Vec<u64>,
+    /// F7 (2026-04-25): raw last-turn input tokens kept alongside
+    /// `ctx_pct` so the renderer can distinguish genuine zero from
+    /// sub-integer usage. Without this, a 690-token turn on a 131k
+    /// context window rendered as `ctx 0%` (integer floor).
+    pub last_input_tokens: u32,
     pub packet_digest: Option<String>,
     pub turn_id: Option<String>,
     pub contract_goal: Option<String>,
-    pub contract_budget: Option<(u32, u32)>, // (consumed, max)
+    /// F3 (2026-04-25): split per EffectClass. Previously a single
+    /// `(used, max)` pair summed `apply_local + apply_repo` caps —
+    /// inspector read `budget 3/25` while the contract actually
+    /// enforced `apply_local ≤ 20 AND apply_repo ≤ 5` separately.
+    /// A user near the apply_repo=5 cap could not see they were one
+    /// repo edit away from a budget abort. Each class now has its
+    /// own `(used, max)` pair, rendered on its own line.
+    pub contract_budget_local: Option<(u32, u32)>,
+    pub contract_budget_repo: Option<(u32, u32)>,
     pub evidence_lanes: Vec<(String, String)>, // (lane, label)
     pub tools: Vec<String>,
+}
+
+/// F7 (2026-04-25): format context pressure as a display label.
+///
+/// - ≥1%: integer percent ("37%")
+/// - >0 tokens but <1%: literal "<1%"
+/// - no tokens tracked: "0%"
+///
+/// Shared by the status banner (render.rs) and the inspector so the
+/// two surfaces can never disagree about whether context is "empty"
+/// vs "0.5% full".
+pub fn ctx_pct_label(ctx_pct: u8, last_input_tokens: u32) -> String {
+    if ctx_pct == 0 && last_input_tokens > 0 {
+        "<1%".to_string()
+    } else {
+        format!("{ctx_pct}%")
+    }
 }
 
 pub fn render(f: &mut Frame, area: Rect, data: &InspectorData, theme: &Theme) {
@@ -43,7 +73,7 @@ pub fn render(f: &mut Frame, area: Rect, data: &InspectorData, theme: &Theme) {
     let ctx_line = Line::from(vec![
         Span::styled("ctx  ", theme.dim()),
         Span::styled(
-            format!("{}%", data.ctx_pct),
+            ctx_pct_label(data.ctx_pct, data.last_input_tokens),
             if data.ctx_pct >= 80 {
                 theme.ink(Colors::ABORT).add_modifier(Modifier::BOLD)
             } else {
@@ -96,15 +126,36 @@ pub fn render(f: &mut Frame, area: Rect, data: &InspectorData, theme: &Theme) {
         );
         y = y.saturating_add(1);
     }
-    if let Some((used, max)) = data.contract_budget {
+    // F3 (2026-04-25): render apply_local and apply_repo budgets on
+    // separate lines so the user can see each cap independently. The
+    // prior single-row `budget used/total` conflated the two and hid
+    // impending repo-cap exhaustion behind a generous local-cap sum.
+    if data.contract_budget_local.is_some() || data.contract_budget_repo.is_some() {
         f.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled("budget ", theme.dim()),
-                Span::styled(format!("{used}/{max}"), theme.ink(Colors::INK_1)),
-            ])),
+            Paragraph::new(Line::from(Span::styled("budget", theme.dim()))),
             Rect::new(inner.x, y, inner.width, 1),
         );
         y = y.saturating_add(1);
+        if let Some((used, max)) = data.contract_budget_local {
+            f.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled("  local  ", theme.dim()),
+                    Span::styled(format!("{used}/{max}"), theme.ink(Colors::INK_1)),
+                ])),
+                Rect::new(inner.x, y, inner.width, 1),
+            );
+            y = y.saturating_add(1);
+        }
+        if let Some((used, max)) = data.contract_budget_repo {
+            f.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled("  repo   ", theme.dim()),
+                    Span::styled(format!("{used}/{max}"), theme.ink(Colors::INK_1)),
+                ])),
+                Rect::new(inner.x, y, inner.width, 1),
+            );
+            y = y.saturating_add(1);
+        }
     }
     y = y.saturating_add(1);
 
@@ -172,3 +223,29 @@ fn render_section_header(f: &mut Frame, inner: Rect, y: u16, label: &'static str
 }
 
 use super::util::truncate;
+
+#[cfg(test)]
+mod label_tests {
+    use super::*;
+
+    #[test]
+    fn ctx_label_zero_when_no_tokens() {
+        assert_eq!(ctx_pct_label(0, 0), "0%");
+    }
+
+    #[test]
+    fn ctx_label_subpercent_for_small_positive_usage() {
+        // 690 / 131_072 = 0.52% → stored as ctx_pct=0 but 690 tokens.
+        assert_eq!(ctx_pct_label(0, 690), "<1%");
+    }
+
+    #[test]
+    fn ctx_label_integer_percent_for_normal_usage() {
+        assert_eq!(ctx_pct_label(37, 48_492), "37%");
+    }
+
+    #[test]
+    fn ctx_label_handles_full_pressure() {
+        assert_eq!(ctx_pct_label(100, 131_072), "100%");
+    }
+}
